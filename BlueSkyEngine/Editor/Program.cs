@@ -381,7 +381,7 @@ class Program
                 var camPos = _viewport.GetCameraPositionNumerics();
 
                 _viewportRenderer!.Render(cmd, view, proj, camPos,
-                    vpXPx, vpYPx, vpWPx, vpHPx, _deltaTime);
+                    (int)vpXPx, (int)vpYPx, (int)vpWPx, (int)vpHPx, _deltaTime);
 
                 // Reset viewport/scissor back to full window for UI
                 cmd.SetViewport(new NotBSRenderer.Viewport { X = 0, Y = 0, Width = w, Height = h, MinDepth = 0, MaxDepth = 1 });

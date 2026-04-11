@@ -364,6 +364,7 @@ struct EntityUniforms {
 struct MeshVertexIn {
     float3 position [[attribute(0)]];
     float3 normal   [[attribute(1)]];
+    float2 uv       [[attribute(2)]]; // Matches 32-byte vertex layout (even if unused)
 };
 
 struct MeshVaryings {
@@ -422,24 +423,81 @@ fragment float4 fs_shadow(ShadowVaryings in [[stage_in]])
     return float4(in.position.z);
 }
 
+// PBR constants
+constant float PI = 3.14159265359;
+
+// Optimized PBR BRDF
+float3 fresnelSchlick(float cosTheta, float3 F0) {
+    return F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0);
+}
+
+float distributionGGX(float NdotH, float roughness) {
+    float alpha = roughness * roughness;
+    float alpha2 = alpha * alpha;
+    float denom = NdotH * NdotH * (alpha2 - 1.0) + 1.0;
+    return alpha2 / (PI * denom * denom);
+}
+
+float geometrySmith(float NdotV, float NdotL, float roughness) {
+    float k = (roughness * roughness) / 2.0;
+    float ggx1 = NdotV / (NdotV * (1.0 - k) + k);
+    float ggx2 = NdotL / (NdotL * (1.0 - k) + k);
+    return ggx1 * ggx2;
+}
+
 fragment float4 fs_mesh(MeshVaryings in [[stage_in]],
                         constant ViewUniforms& view [[buffer(10)]],
                         depth2d<float> shadowMap [[texture(1)]])
 {
-    // Simple directional lighting
-    float3 lightDir = normalize(view.sunDirection);
-    float3 normal = normalize(in.normal);
+    // PBR Material properties (using color as albedo for now)
+    float3 albedo = in.color.rgb;
+    float metallic = 0.0;  // Ceramic teapot
+    float roughness = 0.3; // Slightly rough ceramic
+    float ao = 1.0;
     
-    // Ambient
-    float3 ambient = 0.2 * in.color.rgb;
+    // View and light vectors
+    float3 N = normalize(in.normal);
+    float3 V = normalize(view.cameraPos - in.worldPos);
+    float3 L = normalize(-view.sunDirection);
+    float3 H = normalize(V + L);
+    
+    float NdotV = max(dot(N, V), 0.0);
+    float NdotL = max(dot(N, L), 0.0);
+    float NdotH = max(dot(N, H), 0.0);
+    float HdotV = max(dot(H, V), 0.0);
+    
+    // PBR BRDF
+    float3 F0 = float3(0.04);
+    F0 = mix(F0, albedo, metallic);
+    
+    float3 F = fresnelSchlick(HdotV, F0);
+    float D = distributionGGX(NdotH, roughness);
+    float G = geometrySmith(NdotV, NdotL, roughness);
+    
+    // Specular
+    float3 numerator = D * G * F;
+    float denominator = 4.0 * NdotV * NdotL + 0.001;
+    float3 specular = numerator / denominator;
     
     // Diffuse
-    float NdotL = max(dot(normal, lightDir), 0.0);
-    float3 diffuse = NdotL * in.color.rgb;
+    float3 kS = F;
+    float3 kD = float3(1.0) - kS;
+    kD *= 1.0 - metallic;
+    float3 diffuse = kD * albedo / PI;
     
-    // Combine
+    // Sun color (warm white)
+    float3 sunColor = float3(1.0, 0.95, 0.8);
+    float3 sunIntensity = float3(3.0); // Bright sun
     
-    // Compute Shadow mapping
+    // Ambient (sky color)
+    float3 ambientColor = float3(0.2, 0.3, 0.5) * 0.5;
+    float3 ambient = ambientColor * albedo * ao;
+    
+    // Direct lighting
+    float3 radiance = sunIntensity * sunColor;
+    float3 Lo = (diffuse + specular) * radiance * NdotL;
+    
+    // Shadow mapping
     float3 projCoords = in.lightSpacePos.xyz / in.lightSpacePos.w;
     float2 shadowUV = projCoords.xy * 0.5 + 0.5;
     shadowUV.y = 1.0 - shadowUV.y;
@@ -448,7 +506,7 @@ fragment float4 fs_mesh(MeshVaryings in [[stage_in]],
     float shadow = 1.0;
     
     if (shadowUV.x >= 0.0 && shadowUV.x <= 1.0 && shadowUV.y >= 0.0 && shadowUV.y <= 1.0 && projCoords.z >= 0.0 && projCoords.z <= 1.0) {
-        float bias = max(0.005 * (1.0 - dot(normal, lightDir)), 0.001);
+        float bias = max(0.005 * (1.0 - dot(N, L)), 0.001);
         float currentDepth = projCoords.z - bias;
         float shadowSum = 0.0;
         
@@ -461,10 +519,27 @@ fragment float4 fs_mesh(MeshVaryings in [[stage_in]],
         shadow = shadowSum / 9.0;
     }
     
-    float3 finalColor = ambient + diffuse * mix(0.2, 1.0, shadow);
+    // Combine with shadow
+    float3 finalColor = ambient + Lo * mix(0.3, 1.0, shadow);
     
-    // Simple gamma correction
+    // Tone mapping (ACES approximation)
+    finalColor = finalColor / (finalColor + float3(1.0));
+    
+    // Gamma correction
     finalColor = pow(finalColor, float3(1.0 / 2.2));
     
     return float4(finalColor, in.color.a);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// WIREFRAME PASS — super thin outline for 3D depth perception
+// ═════════════════════════════════════════════════════════════════════════════
+
+fragment float4 fs_wireframe(MeshVaryings in [[stage_in]])
+{
+    // Super subtle dark gray wireframe — razor sharp but not cartoonish
+    // Alpha ~0.3 gives it that "technical drawing" look
+    float3 wireColor = float3(0.15, 0.15, 0.18); // Dark blue-gray
+    float alpha = 0.25; // Very subtle
+    return float4(wireColor, alpha);
 }

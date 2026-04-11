@@ -102,6 +102,8 @@ public struct RasterizerState
 {
     public CullMode CullMode;
     public FrontFace FrontFace;
+    public FillMode FillMode;
+    public float LineWidth;
     public bool DepthClampEnabled;
     public bool ScissorEnabled;
     
@@ -109,6 +111,8 @@ public struct RasterizerState
     {
         CullMode = CullMode.Back,
         FrontFace = FrontFace.CounterClockwise,
+        FillMode = FillMode.Solid,
+        LineWidth = 1.0f,
         DepthClampEnabled = false,
         ScissorEnabled = false
     };

@@ -21,6 +21,22 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
     # Copy to Editor/Shaders for dev runs
     cp BlueSkyEngine/Shaders/viewport_3d.metallib BlueSkyEngine/Editor/Shaders/viewport_3d.metallib
     
+    # PBR optimized shader (for old hardware)
+    echo "  - Compiling pbr_optimized.metal..."
+    xcrun -sdk macosx metal -c BlueSkyEngine/Editor/Shaders/pbr_optimized.metal -o BlueSkyEngine/Shaders/pbr_optimized.air
+    xcrun -sdk macosx metallib BlueSkyEngine/Shaders/pbr_optimized.air -o BlueSkyEngine/Shaders/pbr_optimized.metallib
+    rm BlueSkyEngine/Shaders/pbr_optimized.air
+    # Copy to Editor/Shaders for dev runs
+    cp BlueSkyEngine/Shaders/pbr_optimized.metallib BlueSkyEngine/Editor/Shaders/pbr_optimized.metallib
+    
+    # Horizon Lighting shader (feature-packed lighting system)
+    echo "  - Compiling horizon_lighting.metal..."
+    xcrun -sdk macosx metal -c BlueSkyEngine/Editor/Shaders/horizon_lighting.metal -o BlueSkyEngine/Shaders/horizon_lighting.air
+    xcrun -sdk macosx metallib BlueSkyEngine/Shaders/horizon_lighting.air -o BlueSkyEngine/Shaders/horizon_lighting.metallib
+    rm BlueSkyEngine/Shaders/horizon_lighting.air
+    # Copy to Editor/Shaders for dev runs
+    cp BlueSkyEngine/Shaders/horizon_lighting.metallib BlueSkyEngine/Editor/Shaders/horizon_lighting.metallib
+    
     echo "✅ Metal shaders built"
 fi
 

@@ -29,7 +29,7 @@ public sealed class ViewportRenderer : IDisposable
         private float    _pad; // total 16 bytes combined with above
     }
 
-    // ── Entity uniform structure (model matrix) ─────────────────────────
+    // ── Entity uniform structure (model matrix + material) ─────────────────────────
     [StructLayout(LayoutKind.Sequential)]
     private struct EntityUniforms
     {
@@ -76,6 +76,7 @@ public sealed class ViewportRenderer : IDisposable
     private          IRHIPipeline? _skyPipeline;
     private          IRHIPipeline? _gridPipeline;
     private          IRHIPipeline? _meshPipeline;
+    private          IRHIPipeline? _wireframePipeline;
     private          IRHIPipeline? _shadowPipeline;
     private          IRHITexture?  _shadowMap;
     private          IRHIBuffer?   _uniformBuffer;
@@ -150,14 +151,11 @@ public sealed class ViewportRenderer : IDisposable
         cmd.EndRenderPass();
     }
 
-    public void Render(IRHICommandBuffer cmd,
-                       System.Numerics.Matrix4x4 view, System.Numerics.Matrix4x4 proj,
-                       System.Numerics.Vector3 cameraPos,
-                       float viewportX, float viewportY,
-                       float viewportW, float viewportH,
-                       float deltaTime)
+    private static readonly System.Numerics.Vector3 DefaultAlbedo = new(0.8f, 0.3f, 0.2f); // Rust/orange color for visibility
+    
+    public void Render(IRHICommandBuffer cmd, System.Numerics.Matrix4x4 view, System.Numerics.Matrix4x4 proj,
+        System.Numerics.Vector3 cameraPos, int viewportX, int viewportY, int viewportW, int viewportH, float deltaTime)
     {
-
         _elapsedTime += deltaTime;
 
         // ── build uniforms ────────────────────────────────────────────────
@@ -265,7 +263,7 @@ public sealed class ViewportRenderer : IDisposable
             DebugName       = "ViewportGrid",
         });
 
-        // Mesh pipeline — for rendering entities
+        // Mesh pipeline — TEMP: use simple shader for debugging
         _meshPipeline = _device.CreateGraphicsPipeline(new GraphicsPipelineDesc
         {
             VertexShader   = MakeShader(ShaderStage.Vertex, "vs_mesh"),
@@ -274,13 +272,13 @@ public sealed class ViewportRenderer : IDisposable
             {
                 Attributes = new[]
                 {
-                    new VertexAttribute { Location = 0, Binding = 0, Format = TextureFormat.RGB32Float, Offset = 0 },  // Position
-                    new VertexAttribute { Location = 1, Binding = 0, Format = TextureFormat.RGB32Float, Offset = 12 }, // Normal
-                    new VertexAttribute { Location = 2, Binding = 0, Format = TextureFormat.RG32Float, Offset = 24 },  // UV
+                    new VertexAttribute { Location = 0, Binding = 0, Format = TextureFormat.RGB32Float, Offset = 0 },   // Position
+                    new VertexAttribute { Location = 1, Binding = 0, Format = TextureFormat.RGB32Float, Offset = 12 },  // Normal
+                    new VertexAttribute { Location = 2, Binding = 0, Format = TextureFormat.RG32Float, Offset = 24 }, // UV (unused but must match mesh data)
                 },
                 Bindings = new[]
                 {
-                    new VertexBinding { Binding = 0, Stride = 32, PerInstance = false },
+                    new VertexBinding { Binding = 0, Stride = 32, PerInstance = false }, // 32 bytes: pos+normal+uv
                 },
             },
             Topology          = PrimitiveTopology.TriangleList,
@@ -291,10 +289,47 @@ public sealed class ViewportRenderer : IDisposable
                 DepthWriteEnabled = true,
                 DepthCompareOp    = CompareOp.Less,
             },
-            RasterizerState = new RasterizerState { CullMode = CullMode.Back },
+            RasterizerState = new RasterizerState { CullMode = CullMode.None },
             ColorFormats    = new[] { TextureFormat.BGRA8Unorm },
             DepthFormat     = TextureFormat.Depth32Float,
-            DebugName       = "ViewportMesh",
+            DebugName       = "ViewportMesh_Simple",
+        });
+
+        // Wireframe pipeline — super thin outline for 3D depth perception
+        _wireframePipeline = _device.CreateGraphicsPipeline(new GraphicsPipelineDesc
+        {
+            VertexShader   = MakeShader(ShaderStage.Vertex, "vs_mesh"),
+            FragmentShader = MakeShader(ShaderStage.Fragment, "fs_wireframe"),
+            VertexLayout   = new VertexLayoutDesc
+            {
+                Attributes = new[]
+                {
+                    new VertexAttribute { Location = 0, Binding = 0, Format = TextureFormat.RGB32Float, Offset = 0 },
+                    new VertexAttribute { Location = 1, Binding = 0, Format = TextureFormat.RGB32Float, Offset = 12 },
+                    new VertexAttribute { Location = 2, Binding = 0, Format = TextureFormat.RG32Float, Offset = 24 },
+                },
+                Bindings = new[]
+                {
+                    new VertexBinding { Binding = 0, Stride = 32, PerInstance = false },
+                },
+            },
+            Topology          = PrimitiveTopology.TriangleList,
+            BlendState        = BlendState.AlphaBlend,
+            DepthStencilState = new DepthStencilState
+            {
+                DepthTestEnabled  = true,   // Test against depth
+                DepthWriteEnabled = false,  // Don't write to depth (draw on top)
+                DepthCompareOp    = CompareOp.LessOrEqual,
+            },
+            RasterizerState = new RasterizerState 
+            { 
+                CullMode = CullMode.None,
+                FillMode = FillMode.Wireframe, // Wireframe fill
+                LineWidth = 1.0f, // Super thin lines
+            },
+            ColorFormats    = new[] { TextureFormat.BGRA8Unorm },
+            DepthFormat     = TextureFormat.Depth32Float,
+            DebugName       = "ViewportWireframe",
         });
 
         // Shadow pipeline — writes only depth from light's perspective
@@ -399,11 +434,11 @@ public sealed class ViewportRenderer : IDisposable
     private void RenderEntities(IRHICommandBuffer cmd, System.Numerics.Matrix4x4 view, System.Numerics.Matrix4x4 proj)
     {
         cmd.SetPipeline(_meshPipeline!);
+        cmd.SetUniformBuffer(_uniformBuffer!, 10);
 
-        // Query for entities with TransformComponent AND StaticMeshComponent
         var query = _world.CreateQuery().All<TransformComponent>().All<BlueSky.Core.ECS.Builtin.StaticMeshComponent>().Build();
         var chunks = _world.GetQueryChunks(query);
-
+        
         foreach (var chunk in chunks)
         {
             int transformIndex = chunk.GetComponentIndex(typeof(TransformComponent));
@@ -460,22 +495,31 @@ public sealed class ViewportRenderer : IDisposable
 
                 if (gpuData != null)
                 {
+                    var model = transform.WorldMatrix;
                     cmd.SetVertexBuffer(gpuData.VertexBuffer!, 0);
                     cmd.SetIndexBuffer(gpuData.IndexBuffer!, IndexType.UInt16);
-                    
-                    var model = transform.WorldMatrix;
 
                     var entityUniforms = new EntityUniforms
                     {
                         Model = ToSystemMatrix4x4(model),
-                        Color = new System.Numerics.Vector4(0.8f, 0.8f, 0.8f, 1.0f) // Whitish object
+                        Color = new System.Numerics.Vector4(0.9f, 0.5f, 0.3f, 1.0f) // Warm clay/orange
                     };
 
                     var uniformSpan = MemoryMarshal.CreateSpan(ref entityUniforms, 1);
                     _device.UpdateBuffer(_entityUniformBuffer!, MemoryMarshal.AsBytes(uniformSpan));
 
-                    cmd.SetUniformBuffer(_entityUniformBuffer!, 30);
+                    cmd.SetUniformBuffer(_entityUniformBuffer!, 30); // Entity at slot 30
                     cmd.DrawIndexed((uint)gpuData.IndexCount);
+                    
+                    // Wireframe overlay — super thin outline for 3D depth perception
+                    cmd.SetPipeline(_wireframePipeline!);
+                    cmd.SetUniformBuffer(_uniformBuffer!, 10); // View at 10
+                    cmd.SetUniformBuffer(_entityUniformBuffer!, 30); // Entity at 30
+                    // Buffers already bound, just draw again in wireframe
+                    cmd.DrawIndexed((uint)gpuData.IndexCount);
+                    // Reset to solid pipeline for next entity
+                    cmd.SetPipeline(_meshPipeline!);
+                    cmd.SetUniformBuffer(_uniformBuffer!, 10);
                 }
             }
         }
@@ -489,6 +533,7 @@ public sealed class ViewportRenderer : IDisposable
         _skyPipeline?.Dispose();
         _gridPipeline?.Dispose();
         _meshPipeline?.Dispose();
+        _wireframePipeline?.Dispose();
         _shadowPipeline?.Dispose();
         _shadowMap?.Dispose();
         _uniformBuffer?.Dispose();

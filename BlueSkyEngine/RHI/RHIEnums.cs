@@ -122,6 +122,12 @@ public enum FrontFace
     CounterClockwise
 }
 
+public enum FillMode
+{
+    Solid,
+    Wireframe
+}
+
 public enum PresentMode
 {
     Immediate,

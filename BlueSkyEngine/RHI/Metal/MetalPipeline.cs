@@ -7,17 +7,20 @@ internal class MetalPipeline : IRHIPipeline
     private IntPtr _renderPipelineState;
     private IntPtr _depthStencilState;
     private ulong _cullMode;
+    private ulong _fillMode;
     private ulong _primitiveType;
     private bool _disposed;
     
     internal IntPtr Handle => _renderPipelineState;
     internal IntPtr DepthStencilState => _depthStencilState;
     internal ulong RasterizerCullMode => _cullMode;
+    internal ulong FillMode => _fillMode;
     internal ulong PrimitiveType => _primitiveType;
     
     public MetalPipeline(MetalDevice device, GraphicsPipelineDesc desc)
     {
         _cullMode = ToMTLCullMode(desc.RasterizerState.CullMode);
+        _fillMode = ToMTLFillMode(desc.RasterizerState.FillMode);
         _primitiveType = ToMTLPrimitiveType(desc.Topology);
         CreateRenderPipelineState(device, desc);
         CreateDepthStencilState(device, desc.DepthStencilState);
@@ -30,6 +33,16 @@ internal class MetalPipeline : IRHIPipeline
             NotBSRenderer.CullMode.None => 0,  // MTLCullModeNone
             NotBSRenderer.CullMode.Front => 1, // MTLCullModeFront
             NotBSRenderer.CullMode.Back => 2,  // MTLCullModeBack
+            _ => 0
+        };
+    }
+    
+    private static ulong ToMTLFillMode(NotBSRenderer.FillMode mode)
+    {
+        return mode switch
+        {
+            NotBSRenderer.FillMode.Solid => 0,      // MTLTriangleFillModeFill
+            NotBSRenderer.FillMode.Wireframe => 1,  // MTLTriangleFillModeLines
             _ => 0
         };
     }
@@ -163,60 +176,98 @@ internal class MetalPipeline : IRHIPipeline
     
     private IntPtr LoadShader(MetalDevice device, ShaderDesc shader)
     {
-        // Determine library name based on entry point
-        string libraryName;
-        if (shader.EntryPoint.StartsWith("vs_ui") || shader.EntryPoint.StartsWith("fs_ui"))
-            libraryName = "simple_ui.metallib";
-        else if (shader.EntryPoint.StartsWith("vs_sky") || shader.EntryPoint.StartsWith("fs_sky") ||
-                 shader.EntryPoint.StartsWith("vs_grid") || shader.EntryPoint.StartsWith("fs_grid") ||
-                 shader.EntryPoint.StartsWith("vs_mesh") || shader.EntryPoint.StartsWith("fs_mesh") ||
-                 shader.EntryPoint.StartsWith("vs_shadow") || shader.EntryPoint.StartsWith("fs_shadow"))
-            libraryName = "viewport_3d.metallib";
-        else
-            libraryName = "default.metallib";
-
-        // Load library from Shaders directory, fallback to Editor/Shaders for dev runs
-        var exeDir = System.AppContext.BaseDirectory;
-        var libraryPath = System.IO.Path.Combine(exeDir, "Shaders", libraryName);
+        IntPtr library;
         
-        if (!System.IO.File.Exists(libraryPath))
-            libraryPath = System.IO.Path.Combine(exeDir, "Editor", "Shaders", libraryName);
+        // If bytecode is provided, write to temp file and load from there
+        if (shader.Bytecode != null && shader.Bytecode.Length > 0)
+        {
+            // Write bytecode to temp file for reliable loading
+            var tempPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"bs_shader_{shader.EntryPoint}_{Guid.NewGuid()}.metallib");
+            System.IO.File.WriteAllBytes(tempPath, shader.Bytecode);
             
-        // Bundle fallback: check ../Resources/Editor/Shaders and ../Resources/Shaders
-        if (!System.IO.File.Exists(libraryPath))
+            try
+            {
+                // Load library from temp file
+                var urlClass = GetClass("NSURL");
+                var fileURLWithPathSel = GetSelector("fileURLWithPath:");
+                var pathNS = CreateNSString(tempPath);
+                var url = objc_msgSend_ptr(urlClass, fileURLWithPathSel, pathNS);
+                Release(pathNS);
+                
+                if (url == IntPtr.Zero)
+                    throw new Exception("Failed to create NSURL for temp shader library");
+                
+                var newLibraryWithURLSel = GetSelector("newLibraryWithURL:error:");
+                IntPtr error = IntPtr.Zero;
+                library = NewLibraryWithURL(device.Device, newLibraryWithURLSel, url, ref error);
+                
+                if (library == IntPtr.Zero)
+                {
+                    var errorMsg = GetNSErrorDescription(error);
+                    throw new Exception($"Failed to load Metal library from temp file: {errorMsg}");
+                }
+                
+            }
+            finally
+            {
+                // Clean up temp file
+                try { System.IO.File.Delete(tempPath); } catch { }
+            }
+        }
+        else
         {
-            var bundleResources = System.IO.Path.Combine(exeDir, "..", "Resources");
-            libraryPath = System.IO.Path.Combine(bundleResources, "Shaders", libraryName);
+            // Determine library name based on entry point
+            string libraryName;
+            if (shader.EntryPoint.StartsWith("vs_ui") || shader.EntryPoint.StartsWith("fs_ui"))
+                libraryName = "simple_ui.metallib";
+            else if (shader.EntryPoint.StartsWith("vs_sky") || shader.EntryPoint.StartsWith("fs_sky") ||
+                     shader.EntryPoint.StartsWith("vs_grid") || shader.EntryPoint.StartsWith("fs_grid") ||
+                     shader.EntryPoint.StartsWith("vs_mesh") || shader.EntryPoint.StartsWith("fs_mesh") ||
+                     shader.EntryPoint.StartsWith("vs_shadow") || shader.EntryPoint.StartsWith("fs_shadow") ||
+                     shader.EntryPoint.StartsWith("fs_wireframe"))
+                libraryName = "viewport_3d.metallib";
+            else
+                libraryName = "default.metallib";
+
+            // Load library from Shaders directory, fallback to Editor/Shaders for dev runs
+            var exeDir = System.AppContext.BaseDirectory;
+            var libraryPath = System.IO.Path.Combine(exeDir, "Shaders", libraryName);
+            
             if (!System.IO.File.Exists(libraryPath))
-                libraryPath = System.IO.Path.Combine(bundleResources, "Editor", "Shaders", libraryName);
+                libraryPath = System.IO.Path.Combine(exeDir, "Editor", "Shaders", libraryName);
+                
+            // Bundle fallback: check ../Resources/Editor/Shaders and ../Resources/Shaders
+            if (!System.IO.File.Exists(libraryPath))
+            {
+                var bundleResources = System.IO.Path.Combine(exeDir, "..", "Resources");
+                libraryPath = System.IO.Path.Combine(bundleResources, "Shaders", libraryName);
+                if (!System.IO.File.Exists(libraryPath))
+                    libraryPath = System.IO.Path.Combine(bundleResources, "Editor", "Shaders", libraryName);
+            }
+
+            if (!System.IO.File.Exists(libraryPath))
+                throw new Exception($"Metal library not found: {libraryPath}");
+            
+            var urlClass = GetClass("NSURL");
+            var fileURLWithPathSel = GetSelector("fileURLWithPath:");
+            var pathNS = CreateNSString(libraryPath);
+            var url = objc_msgSend_ptr(urlClass, fileURLWithPathSel, pathNS);
+            Release(pathNS);
+            
+            if (url == IntPtr.Zero)
+                throw new Exception("Failed to create NSURL for Metal library");
+            
+            var newLibraryWithURLSel = GetSelector("newLibraryWithURL:error:");
+            IntPtr error = IntPtr.Zero;
+            library = NewLibraryWithURL(device.Device, newLibraryWithURLSel, url, ref error);
+            
+            if (library == IntPtr.Zero)
+            {
+                var errorMsg = GetNSErrorDescription(error);
+                throw new Exception($"Failed to load Metal library: {errorMsg}");
+            }
+            
         }
-        
-        Console.WriteLine($"[MetalPipeline] Loading shader: {shader.EntryPoint} from {libraryPath}");
-        Console.WriteLine($"[MetalPipeline] File exists: {System.IO.File.Exists(libraryPath)}");
-        
-        if (!System.IO.File.Exists(libraryPath))
-            throw new Exception($"Metal library not found: {libraryPath}");
-        
-        var urlClass = GetClass("NSURL");
-        var fileURLWithPathSel = GetSelector("fileURLWithPath:");
-        var pathNS = CreateNSString(libraryPath);
-        var url = objc_msgSend_ptr(urlClass, fileURLWithPathSel, pathNS);
-        Release(pathNS);
-        
-        if (url == IntPtr.Zero)
-            throw new Exception("Failed to create NSURL for Metal library");
-        
-        var newLibraryWithURLSel = GetSelector("newLibraryWithURL:error:");
-        IntPtr error = IntPtr.Zero;
-        var library = NewLibraryWithURL(device.Device, newLibraryWithURLSel, url, ref error);
-        
-        if (library == IntPtr.Zero)
-        {
-            var errorMsg = GetNSErrorDescription(error);
-            throw new Exception($"Failed to load Metal library: {errorMsg}");
-        }
-        
-        Console.WriteLine($"[MetalPipeline] Library loaded successfully");
         
         // Get function by name
         var newFunctionSel = GetSelector("newFunctionWithName:");
@@ -228,9 +279,7 @@ internal class MetalPipeline : IRHIPipeline
         
         if (function == IntPtr.Zero)
             throw new Exception($"Failed to find shader function: {shader.EntryPoint}");
-        
-        Console.WriteLine($"[MetalPipeline] Shader function '{shader.EntryPoint}' loaded successfully");
-        
+
         return function;
     }
     

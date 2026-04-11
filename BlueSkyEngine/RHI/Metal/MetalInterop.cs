@@ -37,6 +37,12 @@ internal static class MetalInterop
     public static extern IntPtr objc_msgSend_ptr_ulong(IntPtr receiver, IntPtr selector, ulong arg1);
     
     [DllImport("/usr/lib/libobjc.A.dylib", EntryPoint = "objc_msgSend")]
+    public static extern IntPtr objc_msgSend_ptr_ptr(IntPtr receiver, IntPtr selector, IntPtr arg1, IntPtr arg2);
+    
+    [DllImport("/usr/lib/libobjc.A.dylib", EntryPoint = "objc_msgSend")]
+    public static extern IntPtr objc_msgSend_ptr_ref(IntPtr receiver, IntPtr selector, IntPtr arg1, ref IntPtr error);
+    
+    [DllImport("/usr/lib/libobjc.A.dylib", EntryPoint = "objc_msgSend")]
     public static extern ulong objc_msgSend_ret_ulong(IntPtr receiver, IntPtr selector);
     
     [DllImport("/usr/lib/libobjc.A.dylib", EntryPoint = "objc_msgSend")]

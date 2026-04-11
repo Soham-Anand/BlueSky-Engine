@@ -131,6 +131,9 @@ internal class MetalCommandBuffer : IRHICommandBuffer
         var setCullModeSel = GetSelector("setCullMode:");
         objc_msgSend_void_ulong(_renderEncoder, setCullModeSel, metalPipeline.RasterizerCullMode);
         
+        var setFillModeSel = GetSelector("setTriangleFillMode:");
+        objc_msgSend_void_ulong(_renderEncoder, setFillModeSel, metalPipeline.FillMode);
+        
         if (metalPipeline.DepthStencilState != IntPtr.Zero)
         {
             var setDepthStencilStateSel = GetSelector("setDepthStencilState:");

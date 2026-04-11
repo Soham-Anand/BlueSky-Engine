@@ -21,12 +21,6 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
     # Copy to Editor/Shaders for dev runs
     cp BlueSkyEngine/Shaders/viewport_3d.metallib BlueSkyEngine/Editor/Shaders/viewport_3d.metallib
     
-    # Test shaders
-    echo "  - Compiling triangle.metal..."
-    xcrun -sdk macosx metal -c BlueSky.RHI.Test/Shaders/triangle.metal -o BlueSky.RHI.Test/Shaders/triangle.air
-    xcrun -sdk macosx metallib BlueSky.RHI.Test/Shaders/triangle.air -o BlueSky.RHI.Test/Shaders/default.metallib
-    rm BlueSky.RHI.Test/Shaders/triangle.air
-    
     echo "✅ Metal shaders built"
 fi
 
@@ -55,11 +49,6 @@ if command -v fxc &> /dev/null; then
     
     # Copy to Editor/Shaders for dev runs
     cp BlueSkyEngine/Shaders/*.cso BlueSkyEngine/Editor/Shaders/
-    
-    # Test shaders
-    echo "  - Compiling triangle.hlsl..."
-    fxc /T vs_3_0 /E main /Fo BlueSky.RHI.Test/Shaders/triangle.vs.cso BlueSky.RHI.Test/Shaders/triangle.hlsl
-    fxc /T ps_3_0 /E main /Fo BlueSky.RHI.Test/Shaders/triangle.ps.cso BlueSky.RHI.Test/Shaders/triangle.hlsl
     
     echo "✅ HLSL shaders built"
 else

@@ -118,6 +118,27 @@ class Program
         
         if (!File.Exists(fontPath))
             fontPath = Path.Combine(Directory.GetCurrentDirectory(), "roboto.ttf");
+        
+        if (!File.Exists(fontPath))
+            fontPath = Path.Combine(Directory.GetCurrentDirectory(), "Editor", "roboto.ttf");
+        
+        // Fallback to system font if roboto.ttf is not found
+        if (!File.Exists(fontPath))
+        {
+            Console.WriteLine("[WARNING] roboto.ttf not found, using system font fallback");
+            if (OperatingSystem.IsMacOS())
+            {
+                fontPath = "/System/Library/Fonts/Helvetica.ttc";
+            }
+            else if (OperatingSystem.IsWindows())
+            {
+                fontPath = @"C:\Windows\Fonts\arial.ttf";
+            }
+            else
+            {
+                fontPath = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
+            }
+        }
             
         _uiRenderer.FontAtlas = new FontAtlas(_rhi, fontPath);
         _uiRenderer.Resize((int)_window.Size.X, (int)_window.Size.Y);
@@ -312,6 +333,13 @@ class Program
 
         // Always use depth buffer (UI pipeline also declares Depth32Float)
         EnsureDepthTexture(w, h);
+        // ── Shadow pass (render shadows to shadow map) ─────────────────────
+        if (_viewportRenderer != null && _viewport != null)
+        {
+            var sunDir = System.Numerics.Vector3.Normalize(new System.Numerics.Vector3(0.5f, 0.6f, 0.3f));
+            _viewportRenderer.PreRender(cmd, sunDir);
+        }
+
         cmd.BeginRenderPass(
             new[] { _swapchain.CurrentRenderTarget },
             _depthTexture,

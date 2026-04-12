@@ -449,86 +449,64 @@ fragment float4 fs_mesh(MeshVaryings in [[stage_in]],
                         constant ViewUniforms& view [[buffer(10)]],
                         depth2d<float> shadowMap [[texture(1)]])
 {
-    // PBR Material properties (using color as albedo for now)
-    float3 albedo = in.color.rgb;
-    float metallic = 0.0;  // Ceramic teapot
-    float roughness = 0.3; // Slightly rough ceramic
-    float ao = 1.0;
+    // Material color - bright orange/rust
+    float3 albedo = float3(0.95, 0.5, 0.2);
     
-    // View and light vectors
+    // Get normalized normal
     float3 N = normalize(in.normal);
-    float3 V = normalize(view.cameraPos - in.worldPos);
+    
+    // Light direction (sun from upper right)
     float3 L = normalize(-view.sunDirection);
-    float3 H = normalize(V + L);
     
-    float NdotV = max(dot(N, V), 0.0);
+    // View direction
+    float3 V = normalize(view.cameraPos - in.worldPos);
+    
+    // Diffuse lighting (Lambertian)
     float NdotL = max(dot(N, L), 0.0);
+    float3 diffuse = albedo * NdotL;
+    
+    // Hemisphere ambient lighting (sky + ground bounce)
+    float skyFactor = N.y * 0.5 + 0.5; // 0 = down, 1 = up
+    float3 skyLight = float3(0.6, 0.7, 0.9) * skyFactor;
+    float3 groundLight = float3(0.3, 0.25, 0.2) * (1.0 - skyFactor);
+    float3 ambient = (skyLight + groundLight) * albedo;
+    
+    // Specular highlight (Blinn-Phong)
+    float3 H = normalize(L + V);
     float NdotH = max(dot(N, H), 0.0);
-    float HdotV = max(dot(H, V), 0.0);
+    float specular = pow(NdotH, 32.0) * 0.3;
     
-    // PBR BRDF
-    float3 F0 = float3(0.04);
-    F0 = mix(F0, albedo, metallic);
-    
-    float3 F = fresnelSchlick(HdotV, F0);
-    float D = distributionGGX(NdotH, roughness);
-    float G = geometrySmith(NdotV, NdotL, roughness);
-    
-    // Specular
-    float3 numerator = D * G * F;
-    float denominator = 4.0 * NdotV * NdotL + 0.001;
-    float3 specular = numerator / denominator;
-    
-    // Diffuse
-    float3 kS = F;
-    float3 kD = float3(1.0) - kS;
-    kD *= 1.0 - metallic;
-    float3 diffuse = kD * albedo / PI;
-    
-    // Sun color (warm white)
-    float3 sunColor = float3(1.0, 0.95, 0.8);
-    float3 sunIntensity = float3(3.0); // Bright sun
-    
-    // Ambient (sky color)
-    float3 ambientColor = float3(0.2, 0.3, 0.5) * 0.5;
-    float3 ambient = ambientColor * albedo * ao;
-    
-    // Direct lighting
-    float3 radiance = sunIntensity * sunColor;
-    float3 Lo = (diffuse + specular) * radiance * NdotL;
+    // Rim lighting for edge definition
+    float rim = 1.0 - max(dot(N, V), 0.0);
+    rim = pow(rim, 3.0);
+    float3 rimLight = float3(0.4, 0.5, 0.7) * rim * 0.4;
     
     // Shadow mapping
+    float shadow = 1.0;
     float3 projCoords = in.lightSpacePos.xyz / in.lightSpacePos.w;
     float2 shadowUV = projCoords.xy * 0.5 + 0.5;
     shadowUV.y = 1.0 - shadowUV.y;
     
-    constexpr sampler shadowSampler(coord::normalized, filter::linear, address::clamp_to_edge, compare_func::less);
-    float shadow = 1.0;
-    
-    if (shadowUV.x >= 0.0 && shadowUV.x <= 1.0 && shadowUV.y >= 0.0 && shadowUV.y <= 1.0 && projCoords.z >= 0.0 && projCoords.z <= 1.0) {
-        float bias = max(0.005 * (1.0 - dot(N, L)), 0.001);
-        float currentDepth = projCoords.z - bias;
-        float shadowSum = 0.0;
-        
-        for (int x = -1; x <= 1; ++x) {
-            for (int y = -1; y <= 1; ++y) {
-                float2 offset = float2(x, y) / float2(shadowMap.get_width(), shadowMap.get_height());
-                shadowSum += shadowMap.sample_compare(shadowSampler, shadowUV + offset, currentDepth);
-            }
-        }
-        shadow = shadowSum / 9.0;
+    if (shadowUV.x >= 0.0 && shadowUV.x <= 1.0 && 
+        shadowUV.y >= 0.0 && shadowUV.y <= 1.0 && 
+        projCoords.z >= 0.0 && projCoords.z <= 1.0) {
+        constexpr sampler shadowSampler(coord::normalized, filter::linear, 
+                                       address::clamp_to_edge, compare_func::less);
+        float bias = 0.002;
+        shadow = shadowMap.sample_compare(shadowSampler, shadowUV, projCoords.z - bias);
+        shadow = mix(0.5, 1.0, shadow); // Soft shadows (50% minimum)
     }
     
-    // Combine with shadow
-    float3 finalColor = ambient + Lo * mix(0.3, 1.0, shadow);
+    // Combine lighting: ambient + (diffuse + specular) * shadow + rim
+    float3 finalColor = ambient + (diffuse * 2.5 + specular) * shadow + rimLight;
     
-    // Tone mapping (ACES approximation)
-    finalColor = finalColor / (finalColor + float3(1.0));
+    // Tone mapping (simple Reinhard)
+    finalColor = finalColor / (finalColor + float3(0.8));
     
     // Gamma correction
     finalColor = pow(finalColor, float3(1.0 / 2.2));
     
-    return float4(finalColor, in.color.a);
+    return float4(finalColor, 1.0);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

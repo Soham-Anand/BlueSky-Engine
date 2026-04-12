@@ -27,6 +27,9 @@ Icon
 *debug*.txt
 *output*.txt
 *.log
+
+# Metal shader intermediate files
+*.air
 # Cache assets (optional, but raw assets are in Assets/)
 # If .blueskyasset includes compiled shaders or heavily processed things, it shouldn't usually be committed,
 # but for now we'll allow it if small, though usually we ignore them:

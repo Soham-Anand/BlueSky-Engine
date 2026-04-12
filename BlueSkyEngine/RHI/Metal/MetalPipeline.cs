@@ -220,6 +220,8 @@ internal class MetalPipeline : IRHIPipeline
             string libraryName;
             if (shader.EntryPoint.StartsWith("vs_ui") || shader.EntryPoint.StartsWith("fs_ui"))
                 libraryName = "simple_ui.metallib";
+            else if (shader.EntryPoint.StartsWith("horizon_"))
+                libraryName = "horizon_lighting.metallib";
             else if (shader.EntryPoint.StartsWith("vs_sky") || shader.EntryPoint.StartsWith("fs_sky") ||
                      shader.EntryPoint.StartsWith("vs_grid") || shader.EntryPoint.StartsWith("fs_grid") ||
                      shader.EntryPoint.StartsWith("vs_mesh") || shader.EntryPoint.StartsWith("fs_mesh") ||

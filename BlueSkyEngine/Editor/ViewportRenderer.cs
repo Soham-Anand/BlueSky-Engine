@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using System.Numerics;
 using System.Runtime.InteropServices;
 using NotBSRenderer;
@@ -14,7 +15,7 @@ namespace BlueSky.Editor;
 /// </summary>
 public sealed class ViewportRenderer : IDisposable
 {
-    // ── Uniform structure (must match Metal ViewUniforms exactly) ────────
+    // ── Uniform structure (must match Metal ViewUniforms exactly for sky/grid) ────────
     [StructLayout(LayoutKind.Sequential)]
     private struct ViewUniforms
     {
@@ -28,6 +29,20 @@ public sealed class ViewportRenderer : IDisposable
         public System.Numerics.Vector3   SunDirection; // Vector3 is size 12
         private float    _pad; // total 16 bytes combined with above
     }
+    
+    // ── Horizon shader ViewUniforms (different structure for horizon_lighting.metal) ────────
+    [StructLayout(LayoutKind.Sequential)]
+    private struct HorizonViewUniforms
+    {
+        public System.Numerics.Matrix4x4 ViewProj;
+        public System.Numerics.Matrix4x4 View;
+        public System.Numerics.Matrix4x4 InvView;
+        public System.Numerics.Vector3   CameraPos;
+        public float     Time;
+        public System.Numerics.Vector2   ScreenSize;
+        public float     NearPlane;
+        public float     FarPlane;
+    }
 
     // ── Entity uniform structure (model matrix + material) ─────────────────────────
     [StructLayout(LayoutKind.Sequential)]
@@ -35,6 +50,61 @@ public sealed class ViewportRenderer : IDisposable
     {
         public System.Numerics.Matrix4x4 Model;
         public System.Numerics.Vector4   Color;
+    }
+    
+    // ── Shadow pass uniform structure ────────────────────────────────────────────
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ShadowUniforms
+    {
+        public System.Numerics.Matrix4x4 LightSpaceMatrix;
+    }
+    
+    // ── Material data for Horizon shader (must match Metal MaterialData) ───────────────
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MaterialData
+    {
+        public System.Numerics.Vector3 Albedo;
+        public float Metallic;
+        public float Roughness;
+        public float Ao;
+        public float Emission;
+        public int UseAlbedoTex;
+        public int UseNormalTex;
+        public int UseRMATex;
+        private float Pad1;
+        private float Pad2;
+    }
+    
+    // ── Light data for Horizon shader (must match Metal LightData) ────────────────────
+    [StructLayout(LayoutKind.Sequential)]
+    private struct LightData
+    {
+        public System.Numerics.Vector3 Position;
+        public float Range;
+        public System.Numerics.Vector3 Direction;
+        public float Intensity;
+        public System.Numerics.Vector3 Color;
+        public int Type;
+        public float InnerAngle;
+        public float OuterAngle;
+        public float Attenuation;
+        public int CastShadows;
+        public int Volumetric;
+        private float Pad1;
+        private float Pad2;
+    }
+    
+    // ── Lighting settings for Horizon shader ────────────────────────────────────────
+    [StructLayout(LayoutKind.Sequential)]
+    private struct LightingSettings
+    {
+        public int Quality;
+        public int MaxLights;
+        public int EnableIBL;
+        public int EnableVolumetrics;
+        public int EnableContactShadows;
+        public float Exposure;
+        public System.Numerics.Vector3 AmbientColor;
     }
 
     // ── Conversion helpers ───────────────────────────────────────────────
@@ -48,12 +118,21 @@ public sealed class ViewportRenderer : IDisposable
         );
     }
 
+    // ── Submesh info with material slot index ─────────────────────────────
+    public struct SubmeshInfo
+    {
+        public int IndexOffset;     // Starting index in the index buffer
+        public int IndexCount;      // Number of indices for this submesh
+        public int MaterialSlot;    // Material slot index (0-7)
+    }
+
     // ── Mesh GPU cache struct ─────────────────────────────────────────────
     public class MeshGPUData : IDisposable
     {
         public IRHIBuffer? VertexBuffer;
         public IRHIBuffer? IndexBuffer;
         public int IndexCount;
+        public List<SubmeshInfo> Submeshes = new(); // One per material slot
         
         public void Dispose()
         {
@@ -81,6 +160,13 @@ public sealed class ViewportRenderer : IDisposable
     private          IRHITexture?  _shadowMap;
     private          IRHIBuffer?   _uniformBuffer;
     private          IRHIBuffer?   _entityUniformBuffer;
+    
+    // Horizon Lighting buffers
+    private IRHIBuffer? _horizonViewUniformBuffer; // Separate buffer for Horizon shader
+    private IRHIBuffer? _lightBuffer;
+    private IRHIBuffer? _lightCountBuffer;
+    private IRHIBuffer? _lightSettingsBuffer;
+    private IRHIBuffer? _materialBuffer;
     
     private readonly Dictionary<string, MeshGPUData> _meshCache = new();
 
@@ -110,13 +196,13 @@ public sealed class ViewportRenderer : IDisposable
         
         cmd.SetPipeline(_shadowPipeline!);
         
-        var uniforms = new ViewUniforms
+        var shadowUniforms = new ShadowUniforms
         {
             LightSpaceMatrix = lightViewProj
         };
-        var viewUniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
-        _device.UpdateBuffer(_uniformBuffer!, MemoryMarshal.AsBytes(viewUniformSpan));
-        cmd.SetUniformBuffer(_uniformBuffer!, 10);
+        var shadowUniformSpan = MemoryMarshal.CreateSpan(ref shadowUniforms, 1);
+        _device.UpdateBuffer(_uniformBuffer!, MemoryMarshal.AsBytes(shadowUniformSpan));
+        cmd.SetUniformBuffer(_uniformBuffer!, 10); // LightSpaceMatrix at slot 10
 
         var query = _world.CreateQuery().All<TransformComponent>().All<BlueSky.Core.ECS.Builtin.StaticMeshComponent>().Build();
         var chunks = _world.GetQueryChunks(query);
@@ -131,6 +217,15 @@ public sealed class ViewportRenderer : IDisposable
                 var staticMesh = chunk.GetComponent<BlueSky.Core.ECS.Builtin.StaticMeshComponent>(i, meshIndex);
 
                 if (string.IsNullOrEmpty(staticMesh.MeshAssetId) || !_meshCache.TryGetValue(staticMesh.MeshAssetId, out var gpuData)) continue;
+                
+                // Ensure submeshes list is initialized
+                if (gpuData.Submeshes == null || gpuData.Submeshes.Count == 0)
+                {
+                    gpuData.Submeshes = new List<SubmeshInfo>
+                    {
+                        new SubmeshInfo { IndexOffset = 0, IndexCount = gpuData.IndexCount, MaterialSlot = 0 }
+                    };
+                }
 
                 cmd.SetVertexBuffer(gpuData.VertexBuffer!, 0);
                 cmd.SetIndexBuffer(gpuData.IndexBuffer!, IndexType.UInt16);
@@ -144,8 +239,14 @@ public sealed class ViewportRenderer : IDisposable
                 var uniformSpan = MemoryMarshal.CreateSpan(ref entityUniforms, 1);
                 _device.UpdateBuffer(_entityUniformBuffer!, MemoryMarshal.AsBytes(uniformSpan));
                 
-                cmd.SetUniformBuffer(_entityUniformBuffer!, 30);
-                cmd.DrawIndexed((uint)gpuData.IndexCount);
+                cmd.SetUniformBuffer(_entityUniformBuffer!, 30); // Model matrix at slot 30
+                
+                // Draw each submesh for shadow
+                foreach (var submesh in gpuData.Submeshes)
+                {
+                    if (submesh.IndexCount == 0) continue; // Skip empty submeshes
+                    cmd.DrawIndexed((uint)submesh.IndexCount, 1, (uint)submesh.IndexOffset, 0, 0);
+                }
             }
         }
         cmd.EndRenderPass();
@@ -158,7 +259,7 @@ public sealed class ViewportRenderer : IDisposable
     {
         _elapsedTime += deltaTime;
 
-        // ── build uniforms ────────────────────────────────────────────────
+        // ── build uniforms for sky/grid (old ViewUniforms) ────────────────────────────────
         var viewProj = view * proj;
         System.Numerics.Matrix4x4.Invert(viewProj, out var invViewProj);
         var sunDir = System.Numerics.Vector3.Normalize(new System.Numerics.Vector3(0.5f, 0.6f, 0.3f));
@@ -181,6 +282,94 @@ public sealed class ViewportRenderer : IDisposable
 
         var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
         _device.UpdateBuffer(_uniformBuffer!, MemoryMarshal.AsBytes(uniformSpan));
+
+        // ── build uniforms for Horizon Lighting (new HorizonViewUniforms) ─────────────────
+        System.Numerics.Matrix4x4.Invert(view, out var invView);
+        
+        var horizonUniforms = new HorizonViewUniforms
+        {
+            ViewProj = viewProj,
+            View = view,
+            InvView = invView,
+            CameraPos = cameraPos,
+            Time = _elapsedTime,
+            ScreenSize = new System.Numerics.Vector2(viewportW, viewportH),
+            NearPlane = 0.1f,
+            FarPlane = 1000f,
+        };
+
+        var horizonUniformSpan = MemoryMarshal.CreateSpan(ref horizonUniforms, 1);
+        _device.UpdateBuffer(_horizonViewUniformBuffer!, MemoryMarshal.AsBytes(horizonUniformSpan));
+
+        // ── Prepare Horizon Lighting buffers ─────────────────────────────
+        // Manually create a directional light (sun)
+        var lightDataArray = new LightData[64];
+        lightDataArray[0] = new LightData
+        {
+            Position = System.Numerics.Vector3.Zero,
+            Range = 1000f,
+            Direction = System.Numerics.Vector3.Normalize(new System.Numerics.Vector3(0.5f, 0.6f, 0.3f)),
+            Intensity = 3.0f,
+            Color = new System.Numerics.Vector3(1.0f, 0.95f, 0.8f),
+            Type = 0, // Directional
+            InnerAngle = 0f,
+            OuterAngle = 0f,
+            Attenuation = 1f,
+            CastShadows = 1,
+            Volumetric = 0,
+        };
+        
+        // Convert to byte array manually
+        int lightDataSize = Marshal.SizeOf<LightData>();
+        byte[] lightBytes = new byte[lightDataSize * 64];
+        for (int i = 0; i < 64; i++)
+        {
+            IntPtr ptr = Marshal.AllocHGlobal(lightDataSize);
+            try
+            {
+                Marshal.StructureToPtr(lightDataArray[i], ptr, false);
+                Marshal.Copy(ptr, lightBytes, i * lightDataSize, lightDataSize);
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(ptr);
+            }
+        }
+        _device.UpdateBuffer(_lightBuffer!, lightBytes);
+        
+        // Update light count
+        int lightCount = 1;
+        var lightCountSpan = MemoryMarshal.CreateSpan(ref lightCount, 1);
+        _device.UpdateBuffer(_lightCountBuffer!, MemoryMarshal.AsBytes(lightCountSpan));
+        
+        // Update lighting settings
+        var lightSettings = new LightingSettings
+        {
+            Quality = 2, // High
+            MaxLights = 64,
+            EnableIBL = 0, // Disabled until IBL textures are provided
+            EnableVolumetrics = 0,
+            EnableContactShadows = 1,
+            Exposure = 1.0f,
+            AmbientColor = new System.Numerics.Vector3(0.1f, 0.1f, 0.15f),
+        };
+        var lightSettingsSpan = MemoryMarshal.CreateSpan(ref lightSettings, 1);
+        _device.UpdateBuffer(_lightSettingsBuffer!, MemoryMarshal.AsBytes(lightSettingsSpan));
+        
+        // Update material data
+        var material = new MaterialData
+        {
+            Albedo = DefaultAlbedo,
+            Metallic = 0.1f,
+            Roughness = 0.7f,
+            Ao = 1.0f,
+            Emission = 0.0f,
+            UseAlbedoTex = 0,
+            UseNormalTex = 0,
+            UseRMATex = 0,
+        };
+        var materialSpan = MemoryMarshal.CreateSpan(ref material, 1);
+        _device.UpdateBuffer(_materialBuffer!, MemoryMarshal.AsBytes(materialSpan));
 
         // ── set viewport + scissor to the panel region ────────────────────
         cmd.SetViewport(new Viewport
@@ -209,7 +398,7 @@ public sealed class ViewportRenderer : IDisposable
         cmd.Draw(6); // fullscreen quad (2 tris)
 
         // ── 3. Entities ──────────────────────────────────────────────────
-        RenderEntities(cmd, view, proj);
+        RenderEntities(cmd, view, proj, cameraPos);
     }
 
     // ── Pipeline creation ───────────────────────────────────────────────
@@ -263,7 +452,7 @@ public sealed class ViewportRenderer : IDisposable
             DebugName       = "ViewportGrid",
         });
 
-        // Mesh pipeline — TEMP: use simple shader for debugging
+        // Mesh pipeline — Simple lighting (compatible with existing uniforms)
         _meshPipeline = _device.CreateGraphicsPipeline(new GraphicsPipelineDesc
         {
             VertexShader   = MakeShader(ShaderStage.Vertex, "vs_mesh"),
@@ -274,7 +463,7 @@ public sealed class ViewportRenderer : IDisposable
                 {
                     new VertexAttribute { Location = 0, Binding = 0, Format = TextureFormat.RGB32Float, Offset = 0 },   // Position
                     new VertexAttribute { Location = 1, Binding = 0, Format = TextureFormat.RGB32Float, Offset = 12 },  // Normal
-                    new VertexAttribute { Location = 2, Binding = 0, Format = TextureFormat.RG32Float, Offset = 24 }, // UV (unused but must match mesh data)
+                    new VertexAttribute { Location = 2, Binding = 0, Format = TextureFormat.RG32Float, Offset = 24 }, // UV
                 },
                 Bindings = new[]
                 {
@@ -292,7 +481,7 @@ public sealed class ViewportRenderer : IDisposable
             RasterizerState = new RasterizerState { CullMode = CullMode.None },
             ColorFormats    = new[] { TextureFormat.BGRA8Unorm },
             DepthFormat     = TextureFormat.Depth32Float,
-            DebugName       = "ViewportMesh_Simple",
+            DebugName       = "ViewportMesh_HorizonLighting",
         });
 
         // Wireframe pipeline — super thin outline for 3D depth perception
@@ -335,8 +524,8 @@ public sealed class ViewportRenderer : IDisposable
         // Shadow pipeline — writes only depth from light's perspective
         _shadowPipeline = _device.CreateGraphicsPipeline(new GraphicsPipelineDesc
         {
-            VertexShader   = MakeShader(ShaderStage.Vertex, "vs_shadow"),
-            FragmentShader = MakeShader(ShaderStage.Fragment, "fs_shadow"),
+            VertexShader   = MakeShader(ShaderStage.Vertex, "horizon_shadow_vertex"),
+            FragmentShader = MakeShader(ShaderStage.Fragment, "horizon_shadow_fragment"),
             VertexLayout   = new VertexLayoutDesc
             {
                 Attributes = new[]
@@ -378,6 +567,7 @@ public sealed class ViewportRenderer : IDisposable
             if (entryPoint.Contains("sky")) baseName += "_sky";
             else if (entryPoint.Contains("grid")) baseName += "_grid";
             else if (entryPoint.Contains("mesh")) baseName += "_mesh";
+            else if (entryPoint.Contains("horizon")) baseName = "horizon_lighting";
 
             string path = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Shaders", baseName + ext);
             
@@ -391,6 +581,28 @@ public sealed class ViewportRenderer : IDisposable
             else
             {
                 Console.WriteLine($"[ViewportRenderer] WARNING: DX9 bytecode not found at {path}. Viewport may not render on DX9.");
+            }
+        }
+        else if (_device.Backend == RHIBackend.Metal)
+        {
+            // For Metal, load the compiled .metallib
+            string baseName = "viewport_3d";
+            if (entryPoint.Contains("sky")) baseName = "viewport_3d";
+            else if (entryPoint.Contains("grid")) baseName = "viewport_3d";
+            else if (entryPoint.Contains("horizon")) baseName = "horizon_lighting";
+            
+            string path = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Shaders", baseName + ".metallib");
+            
+            if (!System.IO.File.Exists(path))
+                path = System.IO.Path.Combine(System.IO.Directory.GetCurrentDirectory(), "Editor", "Shaders", baseName + ".metallib");
+
+            if (System.IO.File.Exists(path))
+            {
+                bytecode = System.IO.File.ReadAllBytes(path);
+            }
+            else
+            {
+                Console.WriteLine($"[ViewportRenderer] WARNING: Metal library not found at {path}. Viewport may not render on Metal.");
             }
         }
 
@@ -428,12 +640,55 @@ public sealed class ViewportRenderer : IDisposable
             MemoryType = MemoryType.CpuToGpu,
             DebugName  = "Viewport.EntityUB",
         });
+        
+        // Horizon Lighting buffers
+        _horizonViewUniformBuffer = _device.CreateBuffer(new BufferDesc
+        {
+            Size       = (ulong)Marshal.SizeOf<HorizonViewUniforms>(),
+            Usage      = BufferUsage.Uniform,
+            MemoryType = MemoryType.CpuToGpu,
+            DebugName  = "Viewport.HorizonViewUB",
+        });
+        
+        _lightBuffer = _device.CreateBuffer(new BufferDesc
+        {
+            Size       = 5120, // Space for up to 64 lights (72 bytes each = 4608, rounded to 5120)
+            Usage      = BufferUsage.Uniform,
+            MemoryType = MemoryType.CpuToGpu,
+            DebugName  = "Viewport.LightBuffer",
+        });
+        
+        _lightSettingsBuffer = _device.CreateBuffer(new BufferDesc
+        {
+            Size       = 64, // Lighting settings
+            Usage      = BufferUsage.Uniform,
+            MemoryType = MemoryType.CpuToGpu,
+            DebugName  = "Viewport.LightSettings",
+        });
+        
+        _lightCountBuffer = _device.CreateBuffer(new BufferDesc
+        {
+            Size       = 16, // int with padding
+            Usage      = BufferUsage.Uniform,
+            MemoryType = MemoryType.CpuToGpu,
+            DebugName  = "Viewport.LightCount",
+        });
+        
+        _materialBuffer = _device.CreateBuffer(new BufferDesc
+        {
+            Size       = (ulong)Marshal.SizeOf<MaterialData>(),
+            Usage      = BufferUsage.Uniform,
+            MemoryType = MemoryType.CpuToGpu,
+            DebugName  = "Viewport.MaterialUB",
+        });
     }
 
 
-    private void RenderEntities(IRHICommandBuffer cmd, System.Numerics.Matrix4x4 view, System.Numerics.Matrix4x4 proj)
+    private void RenderEntities(IRHICommandBuffer cmd, System.Numerics.Matrix4x4 view, System.Numerics.Matrix4x4 proj, System.Numerics.Vector3 cameraPos)
     {
         cmd.SetPipeline(_meshPipeline!);
+        
+        // Use simple uniform buffer
         cmd.SetUniformBuffer(_uniformBuffer!, 10);
 
         var query = _world.CreateQuery().All<TransformComponent>().All<BlueSky.Core.ECS.Builtin.StaticMeshComponent>().Build();
@@ -483,7 +738,42 @@ public sealed class ViewportRenderer : IDisposable
                             });
                             _device.UpdateBuffer(ib, iData);
 
-                            gpuData = new MeshGPUData { VertexBuffer = vb, IndexBuffer = ib, IndexCount = iLen / 2 };
+                            // Read submesh data (material slots)
+                            var submeshes = new List<SubmeshInfo>();
+                            try
+                            {
+                                int submeshCount = reader.ReadInt32();
+                                for (int s = 0; s < submeshCount; s++)
+                                {
+                                    int indexOffset = reader.ReadInt32();
+                                    int indexCount = reader.ReadInt32();
+                                    int materialSlot = reader.ReadInt32();
+                                    submeshes.Add(new SubmeshInfo
+                                    {
+                                        IndexOffset = indexOffset,
+                                        IndexCount = indexCount,
+                                        MaterialSlot = materialSlot
+                                    });
+                                }
+                            }
+                            catch
+                            {
+                                // No submesh data - create single submesh with all indices
+                                submeshes.Add(new SubmeshInfo
+                                {
+                                    IndexOffset = 0,
+                                    IndexCount = iLen / 2,
+                                    MaterialSlot = 0
+                                });
+                            }
+
+                            gpuData = new MeshGPUData 
+                            { 
+                                VertexBuffer = vb, 
+                                IndexBuffer = ib, 
+                                IndexCount = iLen / 2,
+                                Submeshes = submeshes
+                            };
                             _meshCache[assetId] = gpuData;
                         }
                     }
@@ -495,31 +785,45 @@ public sealed class ViewportRenderer : IDisposable
 
                 if (gpuData != null)
                 {
+                    // Ensure submeshes list is initialized for cached meshes
+                    if (gpuData.Submeshes == null || gpuData.Submeshes.Count == 0)
+                    {
+                        gpuData.Submeshes = new List<SubmeshInfo>
+                        {
+                            new SubmeshInfo { IndexOffset = 0, IndexCount = gpuData.IndexCount, MaterialSlot = 0 }
+                        };
+                    }
+
+                    // Filter out empty submeshes
+                    var validSubmeshes = gpuData.Submeshes.Where(s => s.IndexCount > 0).ToList();
+                    if (validSubmeshes.Count == 0)
+                    {
+                        Console.WriteLine($"[Viewport] Warning: Mesh {assetId} has no valid submeshes with indices");
+                        continue;
+                    }
+
                     var model = transform.WorldMatrix;
                     cmd.SetVertexBuffer(gpuData.VertexBuffer!, 0);
                     cmd.SetIndexBuffer(gpuData.IndexBuffer!, IndexType.UInt16);
 
-                    var entityUniforms = new EntityUniforms
+                    // Draw each submesh with its material slot
+                    foreach (var submesh in validSubmeshes)
                     {
-                        Model = ToSystemMatrix4x4(model),
-                        Color = new System.Numerics.Vector4(0.9f, 0.5f, 0.3f, 1.0f) // Warm clay/orange
-                    };
+                        // Bright clay/ceramic color for visibility
+                        var color = new System.Numerics.Vector4(0.95f, 0.6f, 0.4f, 1.0f); // Light orange/peach
 
-                    var uniformSpan = MemoryMarshal.CreateSpan(ref entityUniforms, 1);
-                    _device.UpdateBuffer(_entityUniformBuffer!, MemoryMarshal.AsBytes(uniformSpan));
+                        var entityUniforms = new EntityUniforms
+                        {
+                            Model = ToSystemMatrix4x4(model),
+                            Color = color
+                        };
 
-                    cmd.SetUniformBuffer(_entityUniformBuffer!, 30); // Entity at slot 30
-                    cmd.DrawIndexed((uint)gpuData.IndexCount);
-                    
-                    // Wireframe overlay — super thin outline for 3D depth perception
-                    cmd.SetPipeline(_wireframePipeline!);
-                    cmd.SetUniformBuffer(_uniformBuffer!, 10); // View at 10
-                    cmd.SetUniformBuffer(_entityUniformBuffer!, 30); // Entity at 30
-                    // Buffers already bound, just draw again in wireframe
-                    cmd.DrawIndexed((uint)gpuData.IndexCount);
-                    // Reset to solid pipeline for next entity
-                    cmd.SetPipeline(_meshPipeline!);
-                    cmd.SetUniformBuffer(_uniformBuffer!, 10);
+                        var uniformSpan = MemoryMarshal.CreateSpan(ref entityUniforms, 1);
+                        _device.UpdateBuffer(_entityUniformBuffer!, MemoryMarshal.AsBytes(uniformSpan));
+
+                        cmd.SetUniformBuffer(_entityUniformBuffer!, 30); // Entity at slot 30
+                        cmd.DrawIndexed((uint)submesh.IndexCount, 1, (uint)submesh.IndexOffset, 0, 0);
+                    }
                 }
             }
         }
@@ -538,6 +842,11 @@ public sealed class ViewportRenderer : IDisposable
         _shadowMap?.Dispose();
         _uniformBuffer?.Dispose();
         _entityUniformBuffer?.Dispose();
+        _horizonViewUniformBuffer?.Dispose();
+        _lightBuffer?.Dispose();
+        _lightCountBuffer?.Dispose();
+        _lightSettingsBuffer?.Dispose();
+        _materialBuffer?.Dispose();
         
         foreach (var mesh in _meshCache.Values)
         {

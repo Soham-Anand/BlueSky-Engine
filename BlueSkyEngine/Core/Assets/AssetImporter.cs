@@ -364,11 +364,11 @@ public class MaterialImportHandler : IAssetImportHandler
 }
 
 /// <summary>
-/// Script import handler (.bluescript files).
+/// Script import handler (.bluescript, .cs, .tea files).
 /// </summary>
 public class ScriptImportHandler : IAssetImportHandler
 {
-    public string[] SupportedExtensions => new[] { ".bluescript", ".cs" };
+    public string[] SupportedExtensions => new[] { ".bluescript", ".cs", ".tea" };
     public AssetType AssetType => AssetType.Script;
 
     public ImportResult Import(string sourceFile, BlueAsset asset, ImportOptions? options)

@@ -1,0 +1,35 @@
+// Simple TeaScript example
+let counter = 0
+let message = "Hello from TeaScript!"
+
+fn start() {
+    log(message)
+    log("Counter initialized to: " + counter)
+}
+
+fn update() {
+    counter = counter + 1
+    
+    if (counter == 10) {
+        log("Counter reached 10!")
+    }
+    
+    if (counter == 20) {
+        log("Counter reached 20!")
+    }
+    
+    if (counter > 30) {
+        log("Stopping at 30")
+        gameOver()
+    }
+}
+
+fn add(a, b) {
+    return a + b
+}
+
+fn multiply(a, b) {
+    let result = a * b
+    log("Multiply result: " + result)
+    return result
+}

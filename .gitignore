@@ -1,45 +1,36 @@
-# .NET / C#
+# Build outputs
 bin/
 obj/
+*.dll
+*.exe
+*.pdb
+
+# User-specific files
 *.user
-*.userosscache
 *.suo
-*.userprefs
+*.userosscache
 *.sln.docstates
+
+# IDE
 .vs/
 .vscode/
+.idea/
 
-# MacOS
+# macOS
 .DS_Store
-.AppleDouble
-.LSOverride
-Icon
-._*
-.DocumentRevisions-V100
-.fseventsd
-.Spotlight-V100
-.TemporaryItems
-.Trashes
-.VolumeIcon.icns
-.com.apple.timemachine.donotpresent
 
-# BlueSky Engine generated
-*debug*.txt
-*output*.txt
+# Temporary files
+*.tmp
 *.log
+*.swp
+*~
 
-# Metal shader intermediate files
+# Backup files
+RenderBackup/
+
+# Compiled shaders (source .metal files are tracked)
 *.air
-# Cache assets (optional, but raw assets are in Assets/)
-# If .blueskyasset includes compiled shaders or heavily processed things, it shouldn't usually be committed,
-# but for now we'll allow it if small, though usually we ignore them:
-# *.blueskyasset
 
-# Dependencies
-# (None so far, but common to ignore)
-*.dylib
-*.dll
-*.so
-
-# Remove if we want to commit Windows/macOS binaries:
-# !publish-macos.sh
+# Temporary documentation
+COMMIT_MESSAGE.txt
+*.md.backup

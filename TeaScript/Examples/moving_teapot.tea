@@ -1,0 +1,41 @@
+// Automatic Teapot Movement Script
+// This script moves the teapot in a circular pattern
+
+// Movement parameters
+let radius = 5
+let speed = 2
+let time = 0
+let height = 1
+
+// Starting position
+let centerX = 0
+let centerZ = 0
+
+fn start() {
+    log("Teapot auto-movement started!")
+    log("Moving in a circle with radius: " + radius)
+    
+    // Set initial position
+    let x = centerX + radius
+    let z = centerZ
+    setPosition(x, height, z)
+}
+
+fn update() {
+    // Increment time based on delta time
+    let dt = getDeltaTime()
+    time = time + dt * speed
+    
+    // Calculate circular motion
+    // x = centerX + radius * cos(time)
+    // z = centerZ + radius * sin(time)
+    let x = centerX + radius * cos(time)
+    let z = centerZ + radius * sin(time)
+    
+    // Update position
+    setPosition(x, height, z)
+    
+    // Optional: Add bobbing motion
+    let bobHeight = height + sin(time * 3) * 0.2
+    setPosition(x, bobHeight, z)
+}

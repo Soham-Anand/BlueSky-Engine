@@ -1,0 +1,54 @@
+// Player movement script
+let speed = 10
+let posX = 0
+let posY = 0
+let health = 100
+
+fn start() {
+    log("Player initialized!")
+    log("Starting position: (0, 0)")
+    log("Health: " + health)
+}
+
+fn update() {
+    // Get input from engine
+    let deltaTime = getDeltaTime()
+    
+    // Update position based on input
+    if (getKey("right")) {
+        posX = posX + speed * deltaTime
+        movePlayer(posX, posY)
+    }
+    
+    if (getKey("left")) {
+        posX = posX - speed * deltaTime
+        movePlayer(posX, posY)
+    }
+    
+    // Check health
+    if (health < 20) {
+        log("Warning: Low health!")
+    }
+}
+
+fn takeDamage(amount) {
+    health = health - amount
+    log("Took damage: " + amount)
+    log("Health remaining: " + health)
+    
+    if (health <= 0) {
+        log("Player died!")
+        gameOver()
+    }
+    
+    return health
+}
+
+fn heal(amount) {
+    health = health + amount
+    if (health > 100) {
+        health = 100
+    }
+    log("Healed: " + amount)
+    return health
+}

@@ -15,6 +15,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\TeaScript\TeaScript.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
     <None Update="Shaders\**\*">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>

@@ -19,8 +19,7 @@ public static class RHIDiscovery
 
         if (OperatingSystem.IsWindows())
         {
-            // Note: DirectX 11/10 are not yet implemented in the engine, 
-            // so we prioritize the functional DirectX 9 backend.
+            // DirectX 9 is the only implemented DirectX backend
             if (IsDirectX9Supported()) return RHIBackend.DirectX9;
             if (IsVulkanSupported()) return RHIBackend.Vulkan;
             return RHIBackend.OpenGL;

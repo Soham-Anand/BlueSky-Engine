@@ -1,0 +1,88 @@
+// Advanced TeaScript Example
+// Demonstrates new language features
+
+// Variables and arrays
+let health = 100
+let maxHealth = 100
+let enemies = [10, 20, 30, 40, 50]
+let score = 0
+
+// Function with return value
+fn calculateDamage(baseDamage, multiplier) {
+    return baseDamage * multiplier
+}
+
+// Logical operators and comparisons
+fn isAlive() {
+    return health > 0 and health <= maxHealth
+}
+
+fn shouldHeal() {
+    return health < 50 or health == 0
+}
+
+// While loop example
+fn countDown(start) {
+    let counter = start
+    while (counter > 0) {
+        log("Countdown: " + counter)
+        counter = counter - 1
+    }
+    log("Blast off!")
+}
+
+// Array iteration with while loop
+fn processEnemies() {
+    let i = 0
+    while (i < 5) {
+        let enemyHealth = enemies[i]
+        log("Enemy " + i + " has " + enemyHealth + " health")
+        
+        if (enemyHealth > 25) {
+            log("  Strong enemy!")
+        } else {
+            log("  Weak enemy")
+        }
+        
+        i = i + 1
+    }
+}
+
+// Game loop functions
+fn start() {
+    log("=== Advanced TeaScript Demo ===")
+    log("Health: " + health)
+    log("Max Health: " + maxHealth)
+    
+    // Test logical operators
+    if (isAlive()) {
+        log("Player is alive!")
+    }
+    
+    if (shouldHeal()) {
+        log("Player needs healing")
+    } else {
+        log("Player health is good")
+    }
+    
+    // Test return values
+    let damage = calculateDamage(10, 2.5)
+    log("Calculated damage: " + damage)
+    
+    // Test while loop
+    countDown(5)
+    
+    // Test array iteration
+    processEnemies()
+}
+
+fn update() {
+    // Simulate combat
+    if (health > 0) {
+        health = health - 1
+        
+        if (health <= 0) {
+            log("Player died!")
+        }
+    }
+}

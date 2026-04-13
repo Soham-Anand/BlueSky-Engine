@@ -9,6 +9,8 @@ using BlueSky.Core.ECS;
 using BlueSky.Core.ECS.Builtin;
 using BlueSky.Core.Math;
 using BlueSky.Rendering;
+using BlueSky.Core.Scripting;
+using BlueSky.Core.Scene;
 using NotBSRenderer;
 
 namespace BlueSky.Editor;
@@ -37,6 +39,7 @@ class Program
     private static string _errorMsg = "";
     private static World? _world;
     private static DockingSystem? _dockingSystem;
+    private static BlueSky.Core.Scripting.TeaScriptSystem? _teaScriptSystem;
 
     // ── Interactive Selection State ─────────────────────────────────────
     private static uint _selectedEntityId = 0;
@@ -52,6 +55,28 @@ class Program
     private static bool _isDraggingAsset = false;
     private static uint _doubleClickTarget = 0;
     private static double _lastClickTime = 0;
+    
+    // ── Context Menu State ────────────────────────────────────────────
+    private static bool _showContextMenu = false;
+    private static float _contextMenuX = 0;
+    private static float _contextMenuY = 0;
+    private static string _contextMenuPath = "";
+    
+    // ── Script Editor State ───────────────────────────────────────────
+    private static bool _showScriptEditor = false;
+    private static string _editingScriptPath = "";
+    private static string _editingScriptContent = "";
+    private static string _editingScriptName = "";
+    private static int _scriptCursorLine = 0;
+    private static int _scriptCursorCol = 0;
+    private static bool _showRenameDialog = false;
+    private static string _renameTarget = "";
+    private static string _renameNewName = "";
+    
+    // ── Play State ────────────────────────────────────────────────────
+    private static bool _isPlaying = false;
+    private static bool _isPaused = false;
+    private static SceneSnapshot? _playModeSnapshot = null;
 
     // ── Import Dialog State ──────────────────────────────────────────────
     private static bool _showImportDialog = false;
@@ -148,10 +173,18 @@ class Program
         _swapchain.Resize((uint)fbSize.X, (uint)fbSize.Y);
 
         // ── Input binding ─────────────────────────────────────────────────
-        _input.CharInput += c => _frameTypedText += c;
+        _input.CharInput += c => 
+        {
+            _frameTypedText += c;
+            Console.WriteLine($"[CharInput] Received: '{c}' (code: {(int)c}) - frameTypedText now: '{_frameTypedText}'");
+        };
         _input.KeyDown += (k, m) =>
         {
-            if (k == KeyCode.Backspace) _frameBackspacePressed = true;
+            if (k == KeyCode.Backspace)
+            {
+                _frameBackspacePressed = true;
+                Console.WriteLine("[KeyDown] Backspace pressed");
+            }
             if (k == KeyCode.I && m.HasFlag(ModifierKeys.Super)) ImportFilesDialog();
         };
 
@@ -195,8 +228,15 @@ class Program
                 _viewport.Update(_deltaTime);
             }
 
+            // Update TeaScript system
+            if (_state == EditorState.Workspace && _teaScriptSystem != null && _isPlaying && !_isPaused)
+            {
+                _teaScriptSystem.Update(_deltaTime);
+            }
+
             RenderFrame();
 
+            // Clear input state AFTER rendering (so modals can use it)
             _frameTypedText = "";
             _frameBackspacePressed = false;
         }
@@ -353,7 +393,12 @@ class Program
         var mouseDown = _input.IsMouseButtonDown(MouseButton.Left);
         
         _ui!.Time = _stopwatch!.Elapsed.TotalSeconds;
-        _ui!.BeginFrame(mousePos, mouseDown, _frameTypedText, _frameBackspacePressed);
+        
+        // Don't pass input to UI system if a modal is open (script editor, rename dialog)
+        string uiTypedText = (_showScriptEditor || _showRenameDialog) ? "" : _frameTypedText;
+        bool uiBackspace = (_showScriptEditor || _showRenameDialog) ? false : _frameBackspacePressed;
+        
+        _ui!.BeginFrame(mousePos, mouseDown, uiTypedText, uiBackspace);
         
         if (!mouseDown && _isDraggingAsset)
         {
@@ -385,6 +430,7 @@ class Program
         _uiRenderer!.Render(cmd, _ui!);
 
         // ── Render 3D viewport content AFTER UI layout is calculated ───────
+        // The viewport uses scissor testing to only draw within its bounds
         if (_viewportNeedsRender && _viewport != null)
         {
             float vpX = _lastViewportRect.X;
@@ -408,10 +454,12 @@ class Program
                 var proj = _viewport.GetProjectionMatrixNumerics();
                 var camPos = _viewport.GetCameraPositionNumerics();
 
+                // Use depth testing to prevent viewport from drawing over UI
+                // The UI renderer should have written depth values
                 _viewportRenderer!.Render(cmd, view, proj, camPos,
                     (int)vpXPx, (int)vpYPx, (int)vpWPx, (int)vpHPx, _deltaTime);
 
-                // Reset viewport/scissor back to full window for UI
+                // Reset viewport/scissor back to full window
                 cmd.SetViewport(new NotBSRenderer.Viewport { X = 0, Y = 0, Width = w, Height = h, MinDepth = 0, MaxDepth = 1 });
                 cmd.SetScissor(new Scissor { X = 0, Y = 0, Width = w, Height = h });
             }
@@ -741,6 +789,10 @@ class Program
         _state = EditorState.Workspace;
         _world = new World();
 
+        // Initialize TeaScript system
+        _teaScriptSystem = new BlueSky.Core.Scripting.TeaScriptSystem(_world);
+        Console.WriteLine("[Editor] TeaScriptSystem initialized");
+
         // Create a simple cube entity with TransformComponent
         var entity1 = _world.CreateEntity();
         var transform1 = new TransformComponent
@@ -882,26 +934,67 @@ class Program
         float tcX = (w - tcW) / 2;
         float tcY = tlY; // Same Y as left buttons
 
-        _ui.ButtonEx(tcX, tcY, 44, btnH, "Play",
-            EditorTheme.ToolbarBtnNormal,
+        if (_ui.ButtonEx(tcX, tcY, 44, btnH, _isPlaying ? "▶" : "Play",
+            _isPlaying ? EditorTheme.PlayGreen : EditorTheme.ToolbarBtnNormal,
             EditorTheme.Lighten(EditorTheme.PlayGreen, 0.15f),
             EditorTheme.PlayGreen,
             new System.Numerics.Vector4(0,0,0,0),
-            EditorTheme.PlayGreen, 610);
+            _isPlaying ? EditorTheme.TextPrimary : EditorTheme.PlayGreen, 610))
+        {
+            if (!_isPlaying)
+            {
+                // Capture scene state before entering Play mode
+                if (_world != null)
+                {
+                    _playModeSnapshot = new SceneSnapshot();
+                    _playModeSnapshot.Capture(_world);
+                }
+                
+                _isPlaying = true;
+                _isPaused = false;
+                Log("▶ Play mode started - scripts running");
+            }
+        }
 
-        _ui.ButtonEx(tcX + 50, tcY, 44, btnH, "Pause",
-            EditorTheme.ToolbarBtnNormal,
+        if (_ui.ButtonEx(tcX + 50, tcY, 44, btnH, "Pause",
+            _isPaused ? EditorTheme.PauseYellow : EditorTheme.ToolbarBtnNormal,
             EditorTheme.Lighten(EditorTheme.PauseYellow, 0.15f),
             EditorTheme.PauseYellow,
             new System.Numerics.Vector4(0,0,0,0),
-            EditorTheme.PauseYellow, 611);
+            _isPaused ? EditorTheme.TextPrimary : EditorTheme.PauseYellow, 611))
+        {
+            if (_isPlaying)
+            {
+                _isPaused = !_isPaused;
+                Log(_isPaused ? "⏸ Paused" : "▶ Resumed");
+            }
+        }
 
-        _ui.ButtonEx(tcX + 100, tcY, 44, btnH, "Stop",
+        if (_ui.ButtonEx(tcX + 100, tcY, 44, btnH, "Stop",
             EditorTheme.ToolbarBtnNormal,
             EditorTheme.Lighten(EditorTheme.StopRed, 0.15f),
             EditorTheme.StopRed,
             new System.Numerics.Vector4(0,0,0,0),
-            EditorTheme.StopRed, 612);
+            EditorTheme.StopRed, 612))
+        {
+            if (_isPlaying)
+            {
+                _isPlaying = false;
+                _isPaused = false;
+                
+                // Restore scene state to pre-Play mode
+                if (_world != null && _playModeSnapshot != null)
+                {
+                    _playModeSnapshot.Restore(_world);
+                    _playModeSnapshot.Clear();
+                    _playModeSnapshot = null;
+                }
+                
+                Log("⏹ Stopped - scene restored to editor state");
+                // Reset all scripts
+                HotReloadScripts();
+            }
+        }
 
         _ui.SetCursor(w - 80, menuH + toolbarH / 2 - 6);
         _ui.Text("Ready", EditorTheme.Green);
@@ -924,6 +1017,21 @@ class Program
         if (_showImportDialog)
         {
             DrawImportDialog(_ui, w, h);
+        }
+        
+        if (_showScriptEditor)
+        {
+            DrawScriptEditor(_ui, w, h);
+        }
+        
+        if (_showRenameDialog)
+        {
+            DrawRenameDialog(_ui, w, h);
+        }
+        
+        if (_showContextMenu)
+        {
+            DrawContextMenu(_ui, _contextMenuX, _contextMenuY);
         }
 
         _ui.EndFrame();
@@ -1200,11 +1308,46 @@ class Program
         ui.Text("Mesh", EditorTheme.TextMuted);
         ui.SetCursor(valueCol, y + 2);
         ui.Text(hasMesh ? "Cube.mesh" : "None", hasMesh ? EditorTheme.AccentHover : EditorTheme.TextDisabled);
+        y += 26;
+        y += EditorTheme.PadLg;
+        
+        // TeaScript Section
+        bool hasScript = false;
+        string scriptPath = "None";
+        bool scriptEnabled = false;
+        
+        if (_world != null && _selectedEntityId > 0 && _selectedEntityId < 200)
+        {
+            var entity = _world.GetAllEntities().FirstOrDefault(e => e.Id == _selectedEntityId);
+            if (entity.Id != 0 && _world.TryGetComponent<TeaScriptComponent>(entity, out var scriptComp))
+            {
+                hasScript = true;
+                scriptPath = string.IsNullOrEmpty(scriptComp.ScriptAssetId) ? "None" : Path.GetFileName(scriptComp.ScriptAssetId);
+                scriptEnabled = scriptComp.IsEnabled;
+            }
+        }
+        
+        ui.Panel(rect.X + inset, y, rect.W - inset * 2, EditorTheme.SectionH, EditorTheme.Bg3);
+        ui.Panel(rect.X + inset, y, 3, EditorTheme.SectionH, EditorTheme.Green);
+        ui.SetCursor(labelCol + 6, y + 8);
+        ui.Text("▼ TeaScript", EditorTheme.TextPrimary);
+        y += EditorTheme.SectionH + EditorTheme.Pad;
+        
+        ui.SetCursor(labelCol, y + 2);
+        ui.Text("Script", EditorTheme.TextMuted);
+        ui.SetCursor(valueCol, y + 2);
+        ui.Text(scriptPath, hasScript ? EditorTheme.Green : EditorTheme.TextDisabled);
+        y += 26;
+        
+        ui.SetCursor(labelCol, y + 2);
+        ui.Text("Enabled", EditorTheme.TextMuted);
+        ui.SetCursor(valueCol, y + 2);
+        ui.Text(scriptEnabled ? "Yes" : "No", scriptEnabled ? EditorTheme.Green : EditorTheme.TextDisabled);
 
         // Component count pinned to bottom
         ui.Panel(rect.X + inset, rect.Y + rect.H - 28, rect.W - inset * 2, 1, EditorTheme.Border1);
         ui.SetCursor(labelCol, rect.Y + rect.H - 20);
-        int compCount = hasMesh ? 2 : 1;
+        int compCount = (hasMesh ? 1 : 0) + (hasScript ? 1 : 0) + 1; // +1 for transform
         ui.Text($"{compCount} components", EditorTheme.TextDisabled);
     }
 
@@ -1479,6 +1622,12 @@ class Program
                 bool isMesh = ext == ".obj" || ext == ".fbx" || ext == ".gltf";
                 bool isTexture = ext == ".png" || ext == ".jpg" || ext == ".jpeg";
                 bool isCode = ext == ".cs" || ext == ".blueprint";
+                bool isTeaScript = ext == ".tea";
+                
+                // Asset type info for tooltip
+                string assetType = "File";
+                string assetSubtype = "";
+                System.Numerics.Vector4 typeColor = textMuted;
 
                 uint cardId = 6000u + (uint)fileIdx;
                 bool isCardSel = _selectedAssetIndex == (int)cardId;
@@ -1493,6 +1642,21 @@ class Program
                 {
                     _selectedAssetIndex = (int)cardId;
                     Log($"Selected file: {Path.GetFileName(file)}");
+                    
+                    // Double-click detection for .tea files
+                    double now = ui.Time;
+                    if (_doubleClickTarget == cardId && (now - _lastClickTime) < 0.3)
+                    {
+                        if (isTeaScript)
+                        {
+                            OpenScriptEditor(file);
+                        }
+                    }
+                    else
+                    {
+                        _doubleClickTarget = cardId;
+                        _lastClickTime = now;
+                    }
                 }
 
                 // --- Drag and Drop initiation ---
@@ -1503,7 +1667,7 @@ class Program
                     // If moving distance > 5
                     if (System.Numerics.Vector2.Distance(ui.MousePosition, _dragPos) > 5 && !_isDraggingAsset)
                     {
-                        if (isBlueAsset)
+                        if (isBlueAsset || isTeaScript)
                         {
                             _isDraggingAsset = true;
                             _draggedAssetPath = file;
@@ -1516,6 +1680,7 @@ class Program
                 if (isCardSel) typeBorder = accentBlueLight;
                 else if (isMesh) typeBorder = accentBlue;
                 else if (isTexture) typeBorder = accentPurple;
+                else if (isTeaScript) typeBorder = accentGreen;
                 else if (isBlueAsset) typeBorder = accentBlueLight;
                 ui.Panel(cx, cy, itemW, 2, typeBorder);
 
@@ -1537,13 +1702,58 @@ class Program
                     {
                         displayLabel = header.AssetName;
                         
-                        if (header.Type == BlueSky.Core.Assets.AssetType.StaticMesh || 
-                            header.Type == BlueSky.Core.Assets.AssetType.SkeletalMesh)
+                        if (header.Type == BlueSky.Core.Assets.AssetType.StaticMesh)
                         {
-                            isMesh = true; // Use mesh icon
+                            isMesh = true;
+                            assetType = "Static Mesh";
+                            assetSubtype = "3D Model (Static)";
+                            typeColor = new System.Numerics.Vector4(0.3f, 0.6f, 1.0f, 1f); // Blue
+                        }
+                        else if (header.Type == BlueSky.Core.Assets.AssetType.SkeletalMesh)
+                        {
+                            isMesh = true;
+                            assetType = "Skeletal Mesh";
+                            assetSubtype = "3D Model (Animated)";
+                            typeColor = new System.Numerics.Vector4(0.5f, 0.8f, 1.0f, 1f); // Light blue
+                        }
+                        else if (header.Type == BlueSky.Core.Assets.AssetType.Material)
+                        {
+                            assetType = "Material";
+                            assetSubtype = "Rendering Material";
+                            typeColor = new System.Numerics.Vector4(0.8f, 0.5f, 1.0f, 1f); // Purple
+                        }
+                        else if (header.Type == BlueSky.Core.Assets.AssetType.Texture)
+                        {
+                            assetType = "Texture";
+                            assetSubtype = "Image Asset";
+                            typeColor = new System.Numerics.Vector4(0.9f, 0.6f, 1.0f, 1f); // Light purple
                         }
                         badge = header.Type.ToString();
                     }
+                }
+                else if (isMesh)
+                {
+                    assetType = "Mesh File";
+                    assetSubtype = ext.ToUpper() + " 3D Model";
+                    typeColor = new System.Numerics.Vector4(0.3f, 0.6f, 1.0f, 1f); // Blue
+                }
+                else if (isTexture)
+                {
+                    assetType = "Texture";
+                    assetSubtype = ext.ToUpper() + " Image";
+                    typeColor = new System.Numerics.Vector4(0.8f, 0.5f, 1.0f, 1f); // Purple
+                }
+                else if (isTeaScript)
+                {
+                    assetType = "TeaScript";
+                    assetSubtype = "Gameplay Script";
+                    typeColor = new System.Numerics.Vector4(0.4f, 0.8f, 0.5f, 1f); // Green
+                }
+                else if (isCode)
+                {
+                    assetType = "Code";
+                    assetSubtype = "Source File";
+                    typeColor = new System.Numerics.Vector4(0.5f, 0.9f, 0.7f, 1f); // Light green
                 }
 
                 if (isMesh)
@@ -1570,6 +1780,20 @@ class Program
                     ui.Panel(ix + 2, iy + 2, 6, 2, accentPurple);
                     ui.Panel(ix + 2, iy + 2, 2, 6, accentPurple);
                 }
+                else if (isTeaScript)
+                {
+                    // TeaScript icon - scroll with tea cup
+                    ui.Shadow(ix + 2, iy + 3, 36, 40, 2, 2, 0.2f);
+                    ui.Panel(ix, iy, 36, 38, new System.Numerics.Vector4(0.95f, 0.90f, 0.80f, 1f)); // Parchment color
+                    // Tea cup icon
+                    ui.Panel(ix + 10, iy + 12, 16, 12, new System.Numerics.Vector4(0.40f, 0.70f, 0.50f, 1f));
+                    ui.Panel(ix + 12, iy + 14, 12, 8, new System.Numerics.Vector4(0.60f, 0.85f, 0.65f, 1f));
+                    // Handle
+                    ui.Panel(ix + 24, iy + 16, 4, 6, new System.Numerics.Vector4(0.40f, 0.70f, 0.50f, 1f));
+                    // Code lines
+                    ui.Panel(ix + 6, iy + 28, 24, 2, new System.Numerics.Vector4(0.40f, 0.70f, 0.50f, 0.6f));
+                    ui.Panel(ix + 6, iy + 32, 20, 2, new System.Numerics.Vector4(0.40f, 0.70f, 0.50f, 0.4f));
+                }
                 else if (isCode)
                 {
                     // Clean document icon
@@ -1593,10 +1817,49 @@ class Program
                 ui.SetCursor(cx + 8, cy + 6);
                 ui.Text(badge, isBlueAsset ? accentBlueGlow : textDark);
 
+                // Colored type indicator at bottom (3px thick line)
+                ui.Panel(cx, cy + itemH - 3, itemW, 3, typeColor);
+
                 // Filename
                 ui.SetCursor(cx + 10, cy + itemH - 24);
                 if (displayLabel.Length > 14) displayLabel = displayLabel[..12] + "..";
                 ui.Text(displayLabel, (isBlueAsset || isCardSel) ? accentBlueGlow : textSecondary);
+
+                // Hover tooltip
+                if (ui.IsHovering(cx, cy, itemW, itemH))
+                {
+                    // Tooltip background - positioned above the card
+                    float tooltipW = 160;
+                    float tooltipH = 44;
+                    float tooltipX = cx + (itemW - tooltipW) / 2;
+                    float tooltipY = cy - tooltipH - 8;
+                    
+                    // Clamp to screen bounds
+                    if (tooltipX < contentX + 8) tooltipX = contentX + 8;
+                    if (tooltipX + tooltipW > contentX + contentW - 8) tooltipX = contentX + contentW - tooltipW - 8;
+                    if (tooltipY < contentY + 8) tooltipY = cy + itemH + 8; // Show below if no room above
+                    
+                    // Shadow
+                    ui.Shadow(tooltipX, tooltipY, tooltipW, tooltipH, 2, 4, 0.4f);
+                    
+                    // Background
+                    ui.Panel(tooltipX, tooltipY, tooltipW, tooltipH, new System.Numerics.Vector4(0.12f, 0.12f, 0.14f, 0.98f));
+                    
+                    // Border with type color
+                    ui.Panel(tooltipX, tooltipY, tooltipW, 2, typeColor);
+                    ui.Panel(tooltipX, tooltipY + tooltipH - 1, tooltipW, 1, borderSubtle);
+                    ui.Panel(tooltipX, tooltipY, 1, tooltipH, borderSubtle);
+                    ui.Panel(tooltipX + tooltipW - 1, tooltipY, 1, tooltipH, borderSubtle);
+                    
+                    // Type indicator dot
+                    ui.Panel(tooltipX + 8, tooltipY + 10, 6, 6, typeColor);
+                    
+                    // Text content
+                    ui.SetCursor(tooltipX + 18, tooltipY + 8);
+                    ui.Text(assetType, textPrimary);
+                    ui.SetCursor(tooltipX + 18, tooltipY + 24);
+                    ui.Text(assetSubtype, textMuted);
+                }
 
                 cx += itemW + gap;
                 fileIdx++;
@@ -1649,6 +1912,23 @@ class Program
 
         ui.SetCursor(rect.X + rect.W - 90, sy + 6);
         ui.Text("● Ready", accentGreen);
+        
+        // ── RIGHT-CLICK CONTEXT MENU ───────────────────────────────────────
+        // Detect right-click in content area
+        if (_input!.IsMouseButtonDown(MouseButton.Right) && 
+            ui.IsHovering(contentX, contentY, contentW, contentH))
+        {
+            _showContextMenu = true;
+            _contextMenuX = ui.MousePosition.X;
+            _contextMenuY = ui.MousePosition.Y;
+            _contextMenuPath = _currentBrowserDir;
+        }
+        
+        // Draw context menu
+        if (_showContextMenu)
+        {
+            DrawContextMenu(ui, _contextMenuX, _contextMenuY);
+        }
     }
 
     private static void DrawConsolePanel(NotBSUI ui, DockRect rect)
@@ -1985,6 +2265,75 @@ class Program
     {
         if (_world == null) return;
         
+        string ext = Path.GetExtension(assetPath).ToLower();
+        
+        // Handle TeaScript files
+        if (ext == ".tea")
+        {
+            // Find selected entity or create new one
+            Entity targetEntity;
+            
+            if (_selectedEntityId > 0 && _selectedEntityId < 200)
+            {
+                // Use selected entity
+                var entities = _world.GetAllEntities().ToList();
+                targetEntity = entities.FirstOrDefault(e => e.Id == _selectedEntityId);
+                
+                if (targetEntity.Id == 0)
+                {
+                    Log("✗ No valid entity selected. Creating new entity.");
+                    targetEntity = _world.CreateEntity();
+                    
+                    var transform = new TransformComponent
+                    {
+                        Position = new BlueSky.Core.Math.Vector3(0, 1, 0),
+                        Rotation = BlueSky.Core.Math.Quaternion.Identity,
+                        Scale = BlueSky.Core.Math.Vector3.One
+                    };
+                    _world.AddComponent(targetEntity, transform);
+                }
+            }
+            else
+            {
+                // Create new entity
+                targetEntity = _world.CreateEntity();
+                
+                var transform = new TransformComponent
+                {
+                    Position = new BlueSky.Core.Math.Vector3(0, 1, 0),
+                    Rotation = BlueSky.Core.Math.Quaternion.Identity,
+                    Scale = BlueSky.Core.Math.Vector3.One
+                };
+                _world.AddComponent(targetEntity, transform);
+            }
+            
+            // Add or update TeaScriptComponent
+            var scriptComponent = new TeaScriptComponent
+            {
+                ScriptAssetId = assetPath,
+                IsEnabled = true,
+                IsInitialized = false,
+                RuntimeInstance = 0
+            };
+            
+            if (_world.HasComponent<TeaScriptComponent>(targetEntity))
+            {
+                // Update existing
+                ref var existing = ref _world.GetComponent<TeaScriptComponent>(targetEntity);
+                existing = scriptComponent;
+                Log($"✓ Updated TeaScript on Entity_{targetEntity.Id}: {Path.GetFileName(assetPath)}");
+            }
+            else
+            {
+                // Add new
+                _world.AddComponent(targetEntity, scriptComponent);
+                Log($"✓ Added TeaScript to Entity_{targetEntity.Id}: {Path.GetFileName(assetPath)}");
+            }
+            
+            return;
+        }
+        
+        // Handle mesh assets
         var header = BlueSky.Core.Assets.BlueAsset.LoadHeader(assetPath);
         if (header != null && (header.Type == BlueSky.Core.Assets.AssetType.StaticMesh || header.Type == BlueSky.Core.Assets.AssetType.SkeletalMesh))
         {
@@ -2009,7 +2358,515 @@ class Program
         }
         else
         {
-            Log($"✗ Asset {System.IO.Path.GetFileName(assetPath)} is not a placeable Mesh.");
+            Log($"✗ Asset {System.IO.Path.GetFileName(assetPath)} is not a placeable asset.");
+        }
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════
+    //  CONTEXT MENU
+    // ═══════════════════════════════════════════════════════════════════════
+    
+    private static void DrawContextMenu(NotBSUI ui, float x, float y)
+    {
+        float menuW = 180;
+        float menuH = 160;
+        float itemH = 28;
+        
+        // Background
+        ui.Shadow(x, y, menuW, menuH, 4, 6, 0.4f);
+        ui.Panel(x, y, menuW, menuH, EditorTheme.Bg2);
+        ui.Panel(x, y, menuW, 1, EditorTheme.Border1);
+        ui.Panel(x, y + menuH - 1, menuW, 1, EditorTheme.Border1);
+        ui.Panel(x, y, 1, menuH, EditorTheme.Border1);
+        ui.Panel(x + menuW - 1, y, 1, menuH, EditorTheme.Border1);
+        
+        float itemY = y + 4;
+        
+        // New TeaScript
+        uint menuId1 = 9100;
+        if (ui.ClickableCard(x + 4, itemY, menuW - 8, itemH, menuId1,
+            EditorTheme.Bg2,
+            EditorTheme.HoverBg,
+            EditorTheme.SelectionBg))
+        {
+            CreateNewTeaScript();
+            _showContextMenu = false;
+        }
+        ui.SetCursor(x + 12, itemY + 8);
+        ui.Text("📜 New TeaScript", EditorTheme.TextPrimary);
+        itemY += itemH;
+        
+        // New Folder
+        uint menuId2 = 9101;
+        if (ui.ClickableCard(x + 4, itemY, menuW - 8, itemH, menuId2,
+            EditorTheme.Bg2,
+            EditorTheme.HoverBg,
+            EditorTheme.SelectionBg))
+        {
+            CreateNewFolder();
+            _showContextMenu = false;
+        }
+        ui.SetCursor(x + 12, itemY + 8);
+        ui.Text("📁 New Folder", EditorTheme.TextPrimary);
+        itemY += itemH;
+        
+        // Separator
+        ui.Panel(x + 8, itemY + 4, menuW - 16, 1, EditorTheme.Border1);
+        itemY += 12;
+        
+        // Rename (if something is selected)
+        if (_selectedAssetIndex >= 0)
+        {
+            uint menuId4 = 9103;
+            if (ui.ClickableCard(x + 4, itemY, menuW - 8, itemH, menuId4,
+                EditorTheme.Bg2,
+                EditorTheme.HoverBg,
+                EditorTheme.SelectionBg))
+            {
+                // Find selected file/folder
+                var dirs = Directory.GetDirectories(_currentBrowserDir);
+                var files = Directory.GetFiles(_currentBrowserDir);
+                
+                int folderCount = dirs.Length;
+                if (_selectedAssetIndex >= 5000 && _selectedAssetIndex < 5000 + folderCount)
+                {
+                    int folderIdx = _selectedAssetIndex - 5000;
+                    _renameTarget = dirs[folderIdx];
+                    _renameNewName = Path.GetFileName(_renameTarget);
+                    _showRenameDialog = true;
+                }
+                else if (_selectedAssetIndex >= 6000)
+                {
+                    int fileIdx = _selectedAssetIndex - 6000;
+                    if (fileIdx < files.Length)
+                    {
+                        _renameTarget = files[fileIdx];
+                        _renameNewName = Path.GetFileNameWithoutExtension(_renameTarget);
+                        _showRenameDialog = true;
+                    }
+                }
+                
+                _showContextMenu = false;
+            }
+            ui.SetCursor(x + 12, itemY + 8);
+            ui.Text("✏️ Rename", EditorTheme.TextPrimary);
+            itemY += itemH;
+        }
+        
+        // Refresh
+        uint menuId3 = 9102;
+        if (ui.ClickableCard(x + 4, itemY, menuW - 8, itemH, menuId3,
+            EditorTheme.Bg2,
+            EditorTheme.HoverBg,
+            EditorTheme.SelectionBg))
+        {
+            Log("Refreshed content browser");
+            _showContextMenu = false;
+        }
+        ui.SetCursor(x + 12, itemY + 8);
+        ui.Text("🔄 Refresh", EditorTheme.TextPrimary);
+        
+        // Close menu if clicked outside
+        if (_input!.IsMouseButtonDown(MouseButton.Left))
+        {
+            if (!ui.IsHovering(x, y, menuW, menuH))
+            {
+                _showContextMenu = false;
+            }
+        }
+    }
+    
+    private static void CreateNewTeaScript()
+    {
+        if (string.IsNullOrEmpty(_contextMenuPath)) return;
+        
+        string scriptName = "NewScript";
+        int counter = 1;
+        string scriptPath = Path.Combine(_contextMenuPath, $"{scriptName}.tea");
+        
+        // Find unique name
+        while (File.Exists(scriptPath))
+        {
+            scriptPath = Path.Combine(_contextMenuPath, $"{scriptName}{counter}.tea");
+            counter++;
+        }
+        
+        // Create default script
+        var asset = BlueSky.Core.Assets.TeaScriptAsset.Create(Path.GetFileNameWithoutExtension(scriptPath));
+        asset.SaveToFile(scriptPath);
+        
+        Log($"✓ Created TeaScript: {Path.GetFileName(scriptPath)}");
+        
+        // Open in editor
+        OpenScriptEditor(scriptPath);
+    }
+    
+    private static void CreateNewFolder()
+    {
+        if (string.IsNullOrEmpty(_contextMenuPath)) return;
+        
+        string folderName = "NewFolder";
+        int counter = 1;
+        string folderPath = Path.Combine(_contextMenuPath, folderName);
+        
+        // Find unique name
+        while (Directory.Exists(folderPath))
+        {
+            folderPath = Path.Combine(_contextMenuPath, $"{folderName}{counter}");
+            counter++;
+        }
+        
+        Directory.CreateDirectory(folderPath);
+        Log($"✓ Created folder: {Path.GetFileName(folderPath)}");
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════
+    //  SCRIPT EDITOR
+    // ═══════════════════════════════════════════════════════════════════════
+    
+    private static void OpenScriptEditor(string scriptPath)
+    {
+        if (!File.Exists(scriptPath)) return;
+        
+        _editingScriptPath = scriptPath;
+        _editingScriptName = Path.GetFileName(scriptPath);
+        _editingScriptContent = File.ReadAllText(scriptPath);
+        _showScriptEditor = true;
+        
+        Log($"Opened script: {_editingScriptName}");
+    }
+    
+    private static void DrawScriptEditor(NotBSUI ui, float screenW, float screenH)
+    {
+        float editorW = 800;
+        float editorH = 600;
+        float editorX = (screenW - editorW) / 2;
+        float editorY = (screenH - editorH) / 2;
+        
+        // Modal overlay
+        ui.Panel(0, 0, screenW, screenH, new System.Numerics.Vector4(0, 0, 0, 0.5f));
+        
+        // Editor window
+        ui.Shadow(editorX, editorY, editorW, editorH, 6, 10, 0.5f);
+        ui.Panel(editorX, editorY, editorW, editorH, EditorTheme.Bg1);
+        ui.Panel(editorX, editorY, editorW, 1, EditorTheme.Border0);
+        
+        // Title bar
+        float titleH = 36;
+        ui.Panel(editorX, editorY, editorW, titleH, EditorTheme.Bg2);
+        ui.Panel(editorX, editorY + titleH - 1, editorW, 1, EditorTheme.Border1);
+        ui.SetCursor(editorX + 12, editorY + 10);
+        ui.Text($"📜 {_editingScriptName}", EditorTheme.TextPrimary);
+        
+        // Close button
+        uint closeId = 9200;
+        if (ui.ButtonEx(editorX + editorW - 70, editorY + 6, 60, 24, "Close",
+            EditorTheme.ToolbarBtnNormal,
+            EditorTheme.ToolbarBtnHover,
+            EditorTheme.AccentDim,
+            new System.Numerics.Vector4(0, 0, 0, 0.3f),
+            EditorTheme.TextSecondary, closeId))
+        {
+            _showScriptEditor = false;
+        }
+        
+        // Toolbar
+        float toolbarY = editorY + titleH;
+        float toolbarH = 32;
+        ui.Panel(editorX, toolbarY, editorW, toolbarH, EditorTheme.Bg3);
+        ui.Panel(editorX, toolbarY + toolbarH - 1, editorW, 1, EditorTheme.Border1);
+        
+        // Save button
+        uint saveId = 9201;
+        if (ui.ButtonEx(editorX + 8, toolbarY + 4, 60, 24, "💾 Save",
+            EditorTheme.Accent,
+            EditorTheme.AccentHover,
+            EditorTheme.AccentDim,
+            new System.Numerics.Vector4(0, 0, 0, 0.3f),
+            EditorTheme.TextPrimary, saveId))
+        {
+            SaveScript();
+        }
+        
+        // Hot Reload button
+        uint reloadId = 9202;
+        if (ui.ButtonEx(editorX + 76, toolbarY + 4, 90, 24, "🔥 Hot Reload",
+            EditorTheme.Orange,
+            EditorTheme.Lighten(EditorTheme.Orange, 0.15f),
+            EditorTheme.Orange,
+            new System.Numerics.Vector4(0, 0, 0, 0.3f),
+            EditorTheme.TextPrimary, reloadId))
+        {
+            SaveScript();
+            HotReloadScripts();
+        }
+        
+        // Clear button
+        uint clearId = 9203;
+        if (ui.ButtonEx(editorX + 174, toolbarY + 4, 60, 24, "Clear",
+            EditorTheme.ToolbarBtnNormal,
+            EditorTheme.ToolbarBtnHover,
+            EditorTheme.AccentDim,
+            new System.Numerics.Vector4(0, 0, 0, 0.3f),
+            EditorTheme.TextSecondary, clearId))
+        {
+            _editingScriptContent = "";
+            Log("Cleared script content");
+        }
+        
+        // Text editor area
+        float textY = toolbarY + toolbarH + 8;
+        float textH = editorH - titleH - toolbarH - 60;
+        float textW = editorW - 16;
+        
+        ui.Panel(editorX + 8, textY, textW, textH, EditorTheme.Bg0);
+        ui.Panel(editorX + 8, textY, textW, 1, EditorTheme.Border1);
+        
+        // Debug: Show what input we're receiving
+        if (!string.IsNullOrEmpty(_frameTypedText))
+        {
+            Console.WriteLine($"[ScriptEditor] Received input: '{_frameTypedText}' (length: {_frameTypedText.Length})");
+        }
+        
+        // Always capture input when script editor is open
+        if (!string.IsNullOrEmpty(_frameTypedText))
+        {
+            // Filter out control characters except newline
+            foreach (char c in _frameTypedText)
+            {
+                if (!char.IsControl(c) || c == '\n' || c == '\r' || c == '\t')
+                {
+                    if (c == '\r') continue; // Skip carriage return
+                    _editingScriptContent += c;
+                    Console.WriteLine($"[ScriptEditor] Added char: '{c}' (code: {(int)c})");
+                }
+            }
+        }
+        
+        if (_frameBackspacePressed && _editingScriptContent.Length > 0)
+        {
+            _editingScriptContent = _editingScriptContent.Substring(0, _editingScriptContent.Length - 1);
+            Console.WriteLine($"[ScriptEditor] Backspace - new length: {_editingScriptContent.Length}");
+        }
+        
+        // Handle Enter key for new lines (in case CharInput doesn't send it)
+        if (_input!.IsKeyDown(KeyCode.Enter))
+        {
+            // Check if we haven't already added a newline from CharInput
+            if (!_editingScriptContent.EndsWith("\n"))
+            {
+                _editingScriptContent += "\n";
+                Console.WriteLine("[ScriptEditor] Added newline from Enter key");
+            }
+        }
+        
+        // Display text with line numbers
+        ui.SetCursor(editorX + 16, textY + 8);
+        
+        string[] lines = _editingScriptContent.Split('\n');
+        float lineY = textY + 8;
+        int lineNum = 1;
+        
+        // Debug: Show content length
+        if (lineNum == 1)
+        {
+            Console.WriteLine($"[ScriptEditor] Displaying content length: {_editingScriptContent.Length}, lines: {lines.Length}");
+        }
+        
+        foreach (var line in lines)
+        {
+            if (lineY > textY + textH - 20) break;
+            
+            // Line number
+            ui.SetCursor(editorX + 16, lineY);
+            ui.Text($"{lineNum,3}", EditorTheme.TextDisabled);
+            
+            // Code
+            ui.SetCursor(editorX + 50, lineY);
+            ui.Text(line.TrimEnd('\r'), EditorTheme.TextPrimary);
+            
+            lineY += 18;
+            lineNum++;
+        }
+        
+        // Cursor blink indicator on last line
+        if (ui.Time % 1.0 < 0.5)
+        {
+            string lastLine = lines.Length > 0 ? lines[^1] : "";
+            float cursorX = editorX + 50 + lastLine.Length * 7.2f;
+            float cursorY = textY + 8 + (lines.Length - 1) * 18;
+            if (cursorY >= textY + 8 && cursorY < textY + textH - 20)
+            {
+                ui.Panel(cursorX, cursorY, 2, 16, EditorTheme.Accent);
+            }
+        }
+        
+        // Status bar
+        float statusY = editorY + editorH - 28;
+        ui.Panel(editorX, statusY, editorW, 28, EditorTheme.Bg2);
+        ui.Panel(editorX, statusY, editorW, 1, EditorTheme.Border1);
+        ui.SetCursor(editorX + 12, statusY + 8);
+        ui.Text($"Lines: {lines.Length}  |  Chars: {_editingScriptContent.Length}  |  {Path.GetFileName(_editingScriptPath)}", EditorTheme.TextMuted);
+        
+        // Hint
+        ui.SetCursor(editorX + editorW - 380, statusY + 8);
+        ui.Text("Type to edit • Enter for newline • Backspace to delete • Save to persist", EditorTheme.TextDisabled);
+    }
+    
+    private static void SaveScript()
+    {
+        try
+        {
+            File.WriteAllText(_editingScriptPath, _editingScriptContent);
+            Log($"✓ Saved: {_editingScriptName}");
+        }
+        catch (Exception ex)
+        {
+            Log($"✗ Failed to save script: {ex.Message}");
+        }
+    }
+    
+    private static void HotReloadScripts()
+    {
+        if (_world == null || _teaScriptSystem == null) return;
+        
+        try
+        {
+            // Reload all scripts with matching path
+            var query = _world.CreateQuery()
+                .All<TeaScriptComponent>()
+                .All<TransformComponent>()
+                .Build();
+            
+            var chunks = _world.GetQueryChunks(query);
+            int reloadCount = 0;
+            
+            foreach (var chunk in chunks)
+            {
+                int scriptIndex = chunk.GetComponentIndex(typeof(TeaScriptComponent));
+                int transformIndex = chunk.GetComponentIndex(typeof(TransformComponent));
+                var entities = chunk.GetEntities();
+                
+                for (int i = 0; i < chunk.Count; i++)
+                {
+                    var entity = entities[i];
+                    ref var script = ref chunk.GetComponent<TeaScriptComponent>(i, scriptIndex);
+                    ref var transform = ref chunk.GetComponent<TransformComponent>(i, transformIndex);
+                    
+                    // Reset and reinitialize
+                    script.IsInitialized = false;
+                    script.RuntimeInstance = 0;
+                    reloadCount++;
+                }
+            }
+            
+            Log($"🔥 Hot reloaded {reloadCount} script(s)");
+        }
+        catch (Exception ex)
+        {
+            Log($"✗ Hot reload failed: {ex.Message}");
+        }
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════
+    //  RENAME DIALOG
+    // ═══════════════════════════════════════════════════════════════════════
+    
+    private static void DrawRenameDialog(NotBSUI ui, float screenW, float screenH)
+    {
+        float dialogW = 400;
+        float dialogH = 150;
+        float dialogX = (screenW - dialogW) / 2;
+        float dialogY = (screenH - dialogH) / 2;
+        
+        // Modal overlay
+        ui.Panel(0, 0, screenW, screenH, new System.Numerics.Vector4(0, 0, 0, 0.5f));
+        
+        // Dialog window
+        ui.Shadow(dialogX, dialogY, dialogW, dialogH, 6, 10, 0.5f);
+        ui.Panel(dialogX, dialogY, dialogW, dialogH, EditorTheme.Bg1);
+        ui.Panel(dialogX, dialogY, dialogW, 1, EditorTheme.Border0);
+        
+        // Title
+        ui.SetCursor(dialogX + 12, dialogY + 12);
+        ui.Text("Rename", EditorTheme.TextPrimary);
+        
+        // Input area
+        float inputY = dialogY + 50;
+        ui.Panel(dialogX + 12, inputY, dialogW - 24, 32, EditorTheme.Bg0);
+        ui.Panel(dialogX + 12, inputY, dialogW - 24, 1, EditorTheme.Border1);
+        
+        // Handle text input
+        if (!string.IsNullOrEmpty(_frameTypedText))
+        {
+            _renameNewName += _frameTypedText;
+        }
+        
+        if (_frameBackspacePressed && _renameNewName.Length > 0)
+        {
+            _renameNewName = _renameNewName.Substring(0, _renameNewName.Length - 1);
+        }
+        
+        // Display current name
+        ui.SetCursor(dialogX + 20, inputY + 10);
+        ui.Text(_renameNewName, EditorTheme.TextPrimary);
+        
+        // Buttons
+        float btnY = dialogY + dialogH - 44;
+        
+        // Cancel
+        uint cancelId = 9300;
+        if (ui.ButtonEx(dialogX + dialogW - 160, btnY, 70, 28, "Cancel",
+            EditorTheme.ToolbarBtnNormal,
+            EditorTheme.ToolbarBtnHover,
+            EditorTheme.AccentDim,
+            new System.Numerics.Vector4(0, 0, 0, 0.3f),
+            EditorTheme.TextSecondary, cancelId))
+        {
+            _showRenameDialog = false;
+        }
+        
+        // Rename
+        uint renameId = 9301;
+        if (ui.ButtonEx(dialogX + dialogW - 82, btnY, 70, 28, "Rename",
+            EditorTheme.Accent,
+            EditorTheme.AccentHover,
+            EditorTheme.AccentDim,
+            new System.Numerics.Vector4(0, 0, 0, 0.3f),
+            EditorTheme.TextPrimary, renameId))
+        {
+            PerformRename();
+            _showRenameDialog = false;
+        }
+    }
+    
+    private static void PerformRename()
+    {
+        if (string.IsNullOrWhiteSpace(_renameNewName) || string.IsNullOrEmpty(_renameTarget))
+            return;
+        
+        try
+        {
+            string dir = Path.GetDirectoryName(_renameTarget) ?? "";
+            string ext = Path.GetExtension(_renameTarget);
+            string newPath = Path.Combine(dir, _renameNewName + ext);
+            
+            if (File.Exists(_renameTarget))
+            {
+                File.Move(_renameTarget, newPath);
+                Log($"✓ Renamed file: {Path.GetFileName(_renameTarget)} → {Path.GetFileName(newPath)}");
+            }
+            else if (Directory.Exists(_renameTarget))
+            {
+                Directory.Move(_renameTarget, newPath);
+                Log($"✓ Renamed folder: {Path.GetFileName(_renameTarget)} → {Path.GetFileName(newPath)}");
+            }
+            
+            _selectedAssetIndex = -1;
+        }
+        catch (Exception ex)
+        {
+            Log($"✗ Rename failed: {ex.Message}");
         }
     }
 }

@@ -809,8 +809,31 @@ public sealed class ViewportRenderer : IDisposable
                     // Draw each submesh with its material slot
                     foreach (var submesh in validSubmeshes)
                     {
-                        // Bright clay/ceramic color for visibility
-                        var color = new System.Numerics.Vector4(0.95f, 0.6f, 0.4f, 1.0f); // Light orange/peach
+                        // Default color (light orange/peach)
+                        var color = new System.Numerics.Vector4(0.95f, 0.6f, 0.4f, 1.0f);
+
+                        // Load material if assigned
+                        if (!string.IsNullOrEmpty(staticMesh.MaterialAssetId))
+                        {
+                            try
+                            {
+                                var materialAsset = BlueSky.Core.Assets.MaterialAsset.Load(staticMesh.MaterialAssetId);
+                                if (materialAsset != null)
+                                {
+                                    // Use material's albedo color
+                                    color = new System.Numerics.Vector4(
+                                        materialAsset.Albedo.X,
+                                        materialAsset.Albedo.Y,
+                                        materialAsset.Albedo.Z,
+                                        materialAsset.Opacity
+                                    );
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                Console.WriteLine($"[Viewport] Failed to load material: {ex.Message}");
+                            }
+                        }
 
                         var entityUniforms = new EntityUniforms
                         {

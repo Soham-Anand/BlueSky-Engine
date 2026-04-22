@@ -449,8 +449,8 @@ fragment float4 fs_mesh(MeshVaryings in [[stage_in]],
                         constant ViewUniforms& view [[buffer(10)]],
                         depth2d<float> shadowMap [[texture(1)]])
 {
-    // Material color - bright orange/rust
-    float3 albedo = float3(0.95, 0.5, 0.2);
+    // Material color from entity uniform (passed through vertex shader)
+    float3 albedo = in.color.rgb;
     
     // Get normalized normal
     float3 N = normalize(in.normal);

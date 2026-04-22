@@ -1389,11 +1389,102 @@ class Program
         ui.Text("▼ Static Mesh", EditorTheme.TextPrimary);
         y += EditorTheme.SectionH + EditorTheme.Pad;
 
+        // Mesh row
         ui.SetCursor(labelCol, y + 2);
         ui.Text("Mesh", EditorTheme.TextMuted);
         ui.SetCursor(valueCol, y + 2);
-        ui.Text(hasMesh ? "Cube.mesh" : "None", hasMesh ? EditorTheme.AccentHover : EditorTheme.TextDisabled);
+        
+        string meshName = "None";
+        string assignedMaterialPath = "";
+        if (_world != null && _selectedEntityId > 0 && _selectedEntityId < 200)
+        {
+            var meshEntity = _world.GetAllEntities().FirstOrDefault(e => e.Id == _selectedEntityId);
+            if (meshEntity.Id != 0 && _world.TryGetComponent<BlueSky.Core.ECS.Builtin.StaticMeshComponent>(meshEntity, out var meshComp))
+            {
+                hasMesh = true;
+                meshName = string.IsNullOrEmpty(meshComp.MeshAssetId) ? "None" : Path.GetFileNameWithoutExtension(meshComp.MeshAssetId);
+                assignedMaterialPath = meshComp.MaterialAssetId ?? "";
+            }
+        }
+        ui.Text(meshName, hasMesh ? EditorTheme.AccentHover : EditorTheme.TextDisabled);
         y += 26;
+
+        // Material slot row — drag-drop target
+        ui.SetCursor(labelCol, y + 2);
+        ui.Text("Material", EditorTheme.TextMuted);
+
+        float matSlotX = valueCol;
+        float matSlotW = rect.W - inset - (valueCol - rect.X) - 28;
+        float matSlotH = 22;
+        bool hasMaterial = !string.IsNullOrEmpty(assignedMaterialPath);
+        string matDisplayName = hasMaterial ? Path.GetFileNameWithoutExtension(assignedMaterialPath) : "None (drop material here)";
+
+        // Highlight slot if a material asset is being dragged over it
+        bool isDraggingMaterialOver = _isDraggingAsset && _draggedAssetPath != null &&
+            _draggedAssetPath.EndsWith(".blueskyasset") &&
+            ui.IsHovering(matSlotX, y, matSlotW, matSlotH);
+
+        var slotBg = isDraggingMaterialOver
+            ? EditorTheme.WithAlpha(EditorTheme.Purple, 0.4f)
+            : hasMaterial
+                ? EditorTheme.WithAlpha(EditorTheme.Purple, 0.15f)
+                : EditorTheme.Bg0;
+        var slotBorder = isDraggingMaterialOver ? EditorTheme.Purple
+            : hasMaterial ? EditorTheme.WithAlpha(EditorTheme.Purple, 0.5f)
+            : EditorTheme.Border1;
+
+        ui.Panel(matSlotX, y, matSlotW, matSlotH, slotBg);
+        ui.Panel(matSlotX, y, matSlotW, 1, slotBorder);
+        ui.Panel(matSlotX, y + matSlotH - 1, matSlotW, 1, slotBorder);
+        ui.Panel(matSlotX, y, 1, matSlotH, slotBorder);
+        ui.Panel(matSlotX + matSlotW - 1, y, 1, matSlotH, slotBorder);
+
+        ui.SetCursor(matSlotX + 6, y + 5);
+        string matLabel = matDisplayName.Length > 18 ? matDisplayName[..16] + ".." : matDisplayName;
+        ui.Text(matLabel, hasMaterial ? EditorTheme.Purple : EditorTheme.TextDisabled);
+
+        // Drop material onto slot when drag released here
+        if (!_input!.IsMouseButtonDown(MouseButton.Left) && isDraggingMaterialOver && _draggedAssetPath != null)
+        {
+            AssignMaterialToSelected(_draggedAssetPath);
+        }
+
+        // Clear button (×) next to slot
+        if (hasMaterial)
+        {
+            uint clearMatId = 9500u + _selectedEntityId;
+            if (ui.ButtonEx(matSlotX + matSlotW + 4, y, 22, matSlotH, "×",
+                EditorTheme.WithAlpha(EditorTheme.Red, 0.2f),
+                EditorTheme.WithAlpha(EditorTheme.Red, 0.4f),
+                EditorTheme.Red,
+                new System.Numerics.Vector4(0, 0, 0, 0),
+                EditorTheme.Red, clearMatId))
+            {
+                AssignMaterialToSelected("");
+            }
+        }
+
+        // Double-click slot to open material editor
+        uint matSlotClickId = 9600u + _selectedEntityId;
+        if (hasMaterial && ui.ClickableCard(matSlotX, y, matSlotW, matSlotH, matSlotClickId,
+            EditorTheme.WithAlpha(EditorTheme.Purple, 0f),
+            EditorTheme.WithAlpha(EditorTheme.Purple, 0.1f),
+            EditorTheme.WithAlpha(EditorTheme.Purple, 0.2f)))
+        {
+            double now = _ui!.Time;
+            if (_doubleClickTarget == matSlotClickId && (now - _lastClickTime) < 0.3)
+            {
+                OpenMaterialEditor(assignedMaterialPath);
+                _doubleClickTarget = 0;
+            }
+            else
+            {
+                _doubleClickTarget = matSlotClickId;
+                _lastClickTime = now;
+            }
+        }
+
+        y += matSlotH + 4;
         y += EditorTheme.PadLg;
         
         // TeaScript Section
@@ -1776,6 +1867,7 @@ class Program
                         {
                             _isDraggingAsset = true;
                             _draggedAssetPath = file;
+                            Console.WriteLine($"[DragDrop] Started dragging: {Path.GetFileName(file)}");
                         }
                     }
                 }
@@ -2440,6 +2532,24 @@ class Program
             return;
         }
         
+        // Handle material assets — assign to selected entity
+        if (ext == ".blueskyasset")
+        {
+            var matHeader = BlueSky.Core.Assets.BlueAsset.LoadHeader(assetPath);
+            if (matHeader != null && matHeader.Type == BlueSky.Core.Assets.AssetType.Material)
+            {
+                if (_selectedEntityId > 0 && _selectedEntityId < 200)
+                {
+                    AssignMaterialToSelected(assetPath);
+                }
+                else
+                {
+                    Log("⚠ Select an entity first to assign a material");
+                }
+                return;
+            }
+        }
+
         // Handle mesh assets
         var header = BlueSky.Core.Assets.BlueAsset.LoadHeader(assetPath);
         if (header != null && (header.Type == BlueSky.Core.Assets.AssetType.StaticMesh || header.Type == BlueSky.Core.Assets.AssetType.SkeletalMesh))
@@ -2469,6 +2579,31 @@ class Program
         }
     }
     
+    private static void AssignMaterialToSelected(string materialPath)
+    {
+        if (_world == null || _selectedEntityId == 0 || _selectedEntityId >= 200) return;
+
+        var entity = _world.GetAllEntities().FirstOrDefault(e => e.Id == _selectedEntityId);
+        if (entity.Id == 0) return;
+
+        if (!_world.TryGetComponent<BlueSky.Core.ECS.Builtin.StaticMeshComponent>(entity, out _))
+        {
+            // Auto-add a StaticMeshComponent if the entity doesn't have one yet
+            var newMesh = new BlueSky.Core.ECS.Builtin.StaticMeshComponent { MaterialAssetId = materialPath };
+            _world.AddComponent(entity, newMesh);
+        }
+        else
+        {
+            ref var mesh = ref _world.GetComponent<BlueSky.Core.ECS.Builtin.StaticMeshComponent>(entity);
+            mesh.MaterialAssetId = materialPath;
+        }
+
+        if (string.IsNullOrEmpty(materialPath))
+            Log($"✓ Cleared material on Entity_{entity.Id}");
+        else
+            Log($"✓ Assigned {Path.GetFileNameWithoutExtension(materialPath)} → Entity_{entity.Id}");
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     //  CONTEXT MENU
     // ═══════════════════════════════════════════════════════════════════════

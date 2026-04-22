@@ -162,6 +162,78 @@ public class NotBSUI
         return isActive && isHot && _mouseReleased;
     }
 
+    public bool Slider(ref float value, float min = 0f, float max = 1f, float width = 200, float height = 20)
+    {
+        uint id = ++_idCounter;
+        Vector2 pos = _cursorPos;
+        Vector2 size = new Vector2(width, height);
+
+        bool isHot = IsMouseOver(pos, size);
+        bool isActive = _activeItem == id;
+
+        if (isHot && _mousePressed)
+        {
+            _activeItem = id;
+            isActive = true;
+        }
+        else if (!_mouseDown)
+        {
+            if (_activeItem == id)
+                _activeItem = 0;
+            isActive = false;
+        }
+
+        // Update value if dragging
+        if (isActive)
+        {
+            float relativeX = _mousePos.X - pos.X;
+            relativeX = Math.Clamp(relativeX, 0, width);
+            value = min + (relativeX / width) * (max - min);
+        }
+
+        // Draw slider track
+        _drawCommands.Add(new DrawCommand
+        {
+            Type = DrawCommandType.RectFilled,
+            Position = pos,
+            Size = size,
+            Color = new Vector4(0.15f, 0.15f, 0.16f, 1.0f)
+        });
+
+        // Draw filled portion
+        float fillWidth = ((value - min) / (max - min)) * width;
+        _drawCommands.Add(new DrawCommand
+        {
+            Type = DrawCommandType.RectFilled,
+            Position = pos,
+            Size = new Vector2(fillWidth, height),
+            Color = new Vector4(0.3f, 0.5f, 0.7f, 1.0f)
+        });
+
+        // Draw handle
+        float handleX = pos.X + fillWidth - 4;
+        _drawCommands.Add(new DrawCommand
+        {
+            Type = DrawCommandType.RectFilled,
+            Position = new Vector2(handleX, pos.Y),
+            Size = new Vector2(8, height),
+            Color = isActive ? new Vector4(0.6f, 0.8f, 1.0f, 1.0f) : new Vector4(0.4f, 0.6f, 0.8f, 1.0f)
+        });
+
+        // Draw border
+        _drawCommands.Add(new DrawCommand
+        {
+            Type = DrawCommandType.Rect,
+            Position = pos,
+            Size = size,
+            Color = new Vector4(0.3f, 0.3f, 0.35f, 1.0f)
+        });
+
+        _cursorPos.Y += height + 10;
+
+        return isActive;
+    }
+
     public bool TextField(ref string text, float width = 300, float height = 30)
     {
         uint id = ++_idCounter;

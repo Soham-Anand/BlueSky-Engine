@@ -7,7 +7,7 @@ using System.Numerics;
 namespace BlueSky.Core.Assets;
 
 /// <summary>
-/// Material asset (.blueskymaterial) format for PBR materials.
+/// Material asset (.blueskyasset) format for PBR materials.
 /// Stores material properties and texture references.
 /// </summary>
 public class MaterialAsset
@@ -123,24 +123,40 @@ public class MaterialAsset
     public Guid ParentMaterial { get; set; } = Guid.Empty; // For material instances
     
     /// <summary>
-    /// Save material to .blueskymaterial file.
+    /// Save material to .blueskyasset file in BlueAsset format.
     /// </summary>
     public bool Save(string path)
     {
         try
         {
-            if (!path.EndsWith(".blueskymaterial"))
-                path += ".blueskymaterial";
+            if (!path.EndsWith(".blueskyasset"))
+                path += ".blueskyasset";
             
-            var options = new JsonSerializerOptions
+            // Create a BlueAsset wrapper for the material
+            var blueAsset = new BlueAsset
+            {
+                AssetId = MaterialId,
+                AssetName = MaterialName,
+                Type = AssetType.Material,
+                SourceFile = path,
+                ImportDate = DateTime.UtcNow,
+                Metadata = new Dictionary<string, string>
+                {
+                    ["materialType"] = MaterialType.ToString(),
+                    ["shader"] = Shader ?? "pbr_optimized"
+                }
+            };
+            
+            // Serialize material properties as JSON in the PayloadData field
+            var jsonOptions = new JsonSerializerOptions
             {
                 WriteIndented = true,
                 DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
             };
             
-            var json = JsonSerializer.Serialize(this, options);
-            File.WriteAllText(path, json);
-            return true;
+            blueAsset.PayloadData = JsonSerializer.SerializeToUtf8Bytes(this, jsonOptions);
+            
+            return blueAsset.Save(path);
         }
         catch (Exception ex)
         {
@@ -150,7 +166,7 @@ public class MaterialAsset
     }
     
     /// <summary>
-    /// Load material from .blueskymaterial file.
+    /// Load material from .blueskyasset file.
     /// </summary>
     public static MaterialAsset? Load(string path)
     {
@@ -159,6 +175,15 @@ public class MaterialAsset
             if (!File.Exists(path))
                 return null;
             
+            // Try loading as BlueAsset first
+            var blueAsset = BlueAsset.Load(path);
+            if (blueAsset != null && blueAsset.Type == AssetType.Material && blueAsset.HasPayload)
+            {
+                // Deserialize material data from BlueAsset payload
+                return JsonSerializer.Deserialize<MaterialAsset>(blueAsset.PayloadData);
+            }
+            
+            // Fallback: try loading as plain JSON (old format)
             var json = File.ReadAllText(path);
             return JsonSerializer.Deserialize<MaterialAsset>(json);
         }

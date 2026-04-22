@@ -1,44 +1,48 @@
-# BlueSky Engine
+# BlueSky Engine ☁️
 
-A high-performance, cross-platform 3D game engine built from scratch in C# with custom windowing, ECS architecture, multi-backend rendering, and **TeaScript** - a custom scripting language for gameplay programming.
+A modern, cross-platform 3D game engine built from scratch in C# with custom ECS architecture, multi-backend rendering, and **TeaScript** - a custom scripting language designed for gameplay programming.
 
 ![BlueSky Engine](https://img.shields.io/badge/Platform-macOS%20%7C%20Windows%20%7C%20Linux-blue)
 ![.NET](https://img.shields.io/badge/.NET-8.0-purple)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
+---
+
 ## ✨ Features
 
-### 🎮 Scripting with TeaScript
-- **Custom Scripting Language** - Easy-to-learn syntax designed for game development
+### 🎮 TeaScript - Custom Scripting Language
+- **Easy to Learn** - Simple syntax designed for game development
 - **Hot Reload** - Update scripts without restarting the engine
 - **ECS Integration** - Direct access to entities, components, and transforms
 - **Play Mode Isolation** - Test scripts without modifying your scene
-- **Built-in Functions** - Math, transforms, time, input, and debug logging
-- **Visual Feedback** - Green indicator shows script-enabled entities
+- **Built-in Functions** - Math, transforms, time, and debug logging
 
-👉 **[Get Started with TeaScript](TeaScripting_GettingStarted.md)**
+👉 **[Get Started with TeaScript](TEASCRIPT_GETTING_STARTED.md)**
 
 ### 🏗️ Core Engine
-- **Custom ECS (Entity Component System)** - High-performance archetype-based entity management
-- **Cross-Platform Windowing** - Native backends for macOS (Cocoa), Windows (Win32), Linux (Wayland)
-- **RHI (Render Hardware Interface)** - Abstracted rendering supporting Metal (macOS) and DirectX 9 (Windows)
-- **Asset Pipeline** - Import OBJ models, textures, and materials with binary caching
+- **Custom ECS** - High-performance archetype-based entity management
+- **Cross-Platform** - Native backends for macOS (Cocoa), Windows (Win32), Linux (Wayland)
+- **Multi-Backend Rendering** - Metal (macOS), DirectX 9 (Windows), Vulkan (planned)
+- **Asset Pipeline** - Import OBJ models, textures, and materials with `.blueskyasset` format
 - **Scene Snapshots** - Unity-style Play/Pause/Stop that preserves editor state
 
-### 🎨 Editor
-- **Docking System** - Flexible panel layout with drag-and-drop docking
-- **3D Viewport** - Interactive scene view with camera controls and grid
+### 🎨 Modern Editor
+- **Docking System** - Flexible panel layout with drag-and-drop
+- **3D Viewport** - Interactive scene view with camera controls
 - **Content Browser** - Asset management with type indicators and drag-drop
-- **Outliner** - Hierarchical entity list with selection
-- **Details Panel** - Component inspector and editor
-- **Script Editor** - Built-in editor for TeaScript files with syntax highlighting
+- **Material Editor** - Visual PBR material editing with real-time preview
+- **Script Editor** - Built-in editor for TeaScript files
+- **Animated UI** - Smooth transitions and toast notifications
+- **Performance Monitor** - Real-time FPS and frame time tracking (press F3)
 
 ### 🌟 Rendering
 - **PBR Lighting** - Physically-based rendering with metallic/roughness workflow
-- **Shadow Mapping** - High-resolution directional shadows with PCF filtering
-- **Procedural Sky** - Beautiful atmospheric sky with clouds
-- **Grid Overlay** - Editor grid with axis coloring (X=red, Z=blue)
-- **Metal Backend** - Native Metal rendering on macOS for optimal performance
+- **Shadow Mapping** - High-resolution directional shadows
+- **Procedural Sky** - Atmospheric sky with clouds
+- **Material System** - Full PBR materials with texture support
+- **Grid Overlay** - Editor grid with axis coloring
+
+---
 
 ## 🚀 Quick Start
 
@@ -54,17 +58,8 @@ A high-performance, cross-platform 3D game engine built from scratch in C# with 
 git clone https://github.com/yourusername/bluesky-engine.git
 cd bluesky-engine
 
-# macOS: One-command launch (compiles shaders, builds, and runs)
-./launch-bluesky.sh
-
-# Or for quick launches after first time:
-./quick-launch.sh
-
-# Windows: Manual steps
-cd BlueSkyEngine/Editor/Shaders
-compile_shaders.bat
-cd ../../..
-dotnet build
+# Build and run
+dotnet build BlueSkyEngine/BlueSkyEngine.csproj
 dotnet run --project BlueSkyEngine/BlueSkyEngine.csproj
 ```
 
@@ -95,15 +90,18 @@ fn update() {
 }
 ```
 
-5. **Drag the script** onto the teapot entity in the viewport
-6. **Press Play** ▶️ and watch your teapot move in a circle!
+5. **Drag the script** onto an entity in the viewport
+6. **Press Play** ▶️ and watch it move!
 7. **Press Stop** ⏹️ to return to editor mode
+
+---
 
 ## 📚 Documentation
 
-- **[TeaScript Getting Started Guide](TeaScripting_GettingStarted.md)** - Complete tutorial for scripting
+- **[TeaScript Getting Started](TEASCRIPT_GETTING_STARTED.md)** - Complete tutorial for scripting
 - **[TeaScript Language Reference](TeaScript/README.md)** - Full language documentation
-- **[Example Scripts](TeaScript/Examples/)** - Learn from working examples
+
+---
 
 ## 🎯 Example Scripts
 
@@ -153,7 +151,7 @@ fn update() {
 }
 ```
 
-More examples in `TeaScript/Examples/`!
+---
 
 ## 🏗️ Project Structure
 
@@ -173,8 +171,12 @@ BlueSkyEngine/
 │   ├── Metal/            # Metal rendering backend (macOS)
 │   ├── DirectX9/         # DirectX 9 backend (Windows)
 │   └── Validation/       # Debug validation layer
+├── Rendering/
+│   ├── Materials/        # PBR material system
+│   ├── Viewport.cs       # 3D viewport rendering
+│   └── GI/               # Global illumination (WIP)
 ├── Editor/
-│   ├── UI/               # Docking system and UI renderer
+│   ├── UI/               # Modern UI system with animations
 │   ├── Shaders/          # Editor shaders (.metal, .hlsl)
 │   └── Program.cs        # Main editor application
 └── Physics/              # Physics simulation (WIP)
@@ -183,13 +185,10 @@ TeaScript/
 ├── Frontend/             # Lexer, parser, AST
 ├── Runtime/              # Interpreter and environment
 ├── Bridge/               # Engine integration
-├── Examples/             # Example scripts
-│   ├── simple.tea        # Basic syntax
-│   ├── advanced.tea      # Arrays, loops, logic
-│   ├── moving_teapot.tea # Circular motion
-│   └── player.tea        # Player controller
-└── README.md             # Language documentation
+└── Examples/             # Example scripts
 ```
+
+---
 
 ## 🎮 Editor Controls
 
@@ -201,10 +200,14 @@ TeaScript/
 
 ### Editor Shortcuts
 - **Cmd+I** (macOS) / **Ctrl+I** (Windows) - Import assets
+- **F3** - Toggle performance overlay
 - **Play ▶️** - Start simulation (scripts run)
 - **Pause ⏸️** - Pause simulation
 - **Stop ⏹️** - Stop and restore editor state
 - **Double-click .tea** - Open script editor
+- **Double-click .blueskyasset (Material)** - Open material editor
+
+---
 
 ## 🔧 Development Status
 
@@ -213,12 +216,14 @@ TeaScript/
 - Cross-platform windowing (macOS, Windows)
 - Metal rendering backend (macOS)
 - DirectX 9 rendering backend (Windows)
-- Asset import pipeline (OBJ, textures)
-- Editor UI with docking system
+- Asset import pipeline (OBJ, textures, materials)
+- Modern editor UI with animations
 - **TeaScript language and runtime**
 - **Play mode with scene snapshots**
+- **Material editor with PBR support**
 - Content browser with drag-drop
 - 3D viewport with camera controls
+- Toast notifications and performance monitoring
 
 ### 🚧 In Progress
 - Physics simulation
@@ -232,6 +237,27 @@ TeaScript/
 - Post-processing effects
 - Profiler and debugging tools
 - Linux support (Vulkan)
+- Networking
+
+---
+
+## 🎨 UI Features
+
+### Modern Interface
+- **Smooth Animations** - Eased transitions on all interactions
+- **Toast Notifications** - Success, error, warning, and info messages
+- **Performance Overlay** - Real-time FPS, frame time, and draw call tracking
+- **Animated Buttons** - Hover effects, press feedback, and glow
+- **Professional Theme** - 5-layer color system with semantic colors
+
+### Asset Management
+- **Content Browser** - Visual asset browser with icons and badges
+- **Material Editor** - Real-time PBR material editing
+- **Script Editor** - Built-in TeaScript editor with live editing
+- **Drag & Drop** - Drag assets onto entities to attach them
+- **Context Menus** - Right-click for quick actions
+
+---
 
 ## 🤝 Contributing
 
@@ -244,6 +270,8 @@ This is a learning project, but contributions are welcome! Whether you want to:
 
 Feel free to open issues or pull requests!
 
+---
+
 ## 📖 Learning Resources
 
 ### For Engine Developers
@@ -253,12 +281,16 @@ Feel free to open issues or pull requests!
 
 ### For Game Developers
 - `TeaScript/Examples/` - Learn scripting by example
-- `TeaScripting_GettingStarted.md` - Step-by-step tutorial
+- `TEASCRIPT_GETTING_STARTED.md` - Step-by-step tutorial
 - `TeaScript/README.md` - Complete language reference
+
+---
 
 ## 📝 License
 
 MIT License - See LICENSE file for details
+
+---
 
 ## 🙏 Credits
 

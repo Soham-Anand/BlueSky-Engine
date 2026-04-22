@@ -1,0 +1,35 @@
+// Audio Demo - Plays sounds based on events
+let footstepTimer = 0.0
+let footstepInterval = 0.5
+
+fn start() {
+    log("Audio demo started")
+    playMusic("background_music", 0.6, true)
+}
+
+fn update() {
+    let dt = getDeltaTime()
+    
+    // Get velocity to check if moving
+    let velX = getVelocityX()
+    let velZ = getVelocityZ()
+    let speed = sqrt(velX * velX + velZ * velZ)
+    
+    // Play footstep sounds while moving
+    if (speed > 0.1) {
+        footstepTimer = footstepTimer + dt
+        
+        if (footstepTimer >= footstepInterval) {
+            playSound("footstep", 0.8, false)
+            footstepTimer = 0.0
+        }
+    } else {
+        footstepTimer = 0.0
+    }
+    
+    // Play jump sound when jumping
+    let velY = getVelocityY()
+    if (velY > 5.0) {
+        playSound("jump", 1.0, false)
+    }
+}

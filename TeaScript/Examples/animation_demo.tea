@@ -1,0 +1,38 @@
+// Animation Demo - Plays different animations based on state
+let isMoving = false
+let currentAnim = "idle"
+
+fn start() {
+    log("Animation demo started")
+    playAnimation("idle")
+    setAnimationLoop(true)
+}
+
+fn update() {
+    let dt = getDeltaTime()
+    
+    // Check if entity is moving
+    let velX = getVelocityX()
+    let velZ = getVelocityZ()
+    let speed = sqrt(velX * velX + velZ * velZ)
+    
+    if (speed > 0.1) {
+        if (currentAnim != "walk") {
+            playAnimation("walk")
+            currentAnim = "walk"
+            log("Playing walk animation")
+        }
+    } else {
+        if (currentAnim != "idle") {
+            playAnimation("idle")
+            currentAnim = "idle"
+            log("Playing idle animation")
+        }
+    }
+    
+    // Adjust animation speed based on movement speed
+    if (speed > 0.1) {
+        let animSpeed = speed / 5.0
+        setAnimationSpeed(animSpeed)
+    }
+}

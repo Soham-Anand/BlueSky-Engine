@@ -1,0 +1,159 @@
+// Complete Character Controller - Uses Physics, Animation, Audio, and AI
+let moveSpeed = 5.0
+let jumpForce = 8.0
+let isGrounded = false
+let currentState = "idle"
+let footstepTimer = 0.0
+
+fn start() {
+    log("Complete character controller initialized")
+    playAnimation("idle")
+    setAnimationLoop(true)
+    
+    // Initialize AI blackboard
+    setBB("health", 100)
+    setBB("stamina", 100)
+    setBB("state", "idle")
+}
+
+fn update() {
+    let dt = getDeltaTime()
+    
+    // Check if grounded using raycast
+    let x = getPositionX()
+    let y = getPositionY()
+    let z = getPositionZ()
+    
+    let hit = raycast(x, y, z, 0, -1, 0, 1.5)
+    isGrounded = hit
+    
+    // Get current velocity
+    let velX = getVelocityX()
+    let velY = getVelocityY()
+    let velZ = getVelocityZ()
+    let horizontalSpeed = sqrt(velX * velX + velZ * velZ)
+    
+    // State machine
+    updateState(horizontalSpeed, velY)
+    
+    // Update animation based on state
+    updateAnimation(horizontalSpeed)
+    
+    // Update audio
+    updateAudio(dt, horizontalSpeed)
+    
+    // Update AI blackboard
+    updateBlackboard(horizontalSpeed)
+}
+
+fn updateState(speed, velY) {
+    if (not isGrounded) {
+        if (velY > 0) {
+            currentState = "jumping"
+        } else {
+            currentState = "falling"
+        }
+    } else if (speed > 0.1) {
+        if (speed > 8.0) {
+            currentState = "running"
+        } else {
+            currentState = "walking"
+        }
+    } else {
+        currentState = "idle"
+    }
+    
+    setBB("state", currentState)
+}
+
+fn updateAnimation(speed) {
+    if (currentState == "idle") {
+        if (not isAnimationPlaying() or getBB("lastAnim") != "idle") {
+            playAnimation("idle")
+            setBB("lastAnim", "idle")
+        }
+    } else if (currentState == "walking") {
+        if (getBB("lastAnim") != "walk") {
+            playAnimation("walk")
+            setBB("lastAnim", "walk")
+        }
+        setAnimationSpeed(speed / 3.0)
+    } else if (currentState == "running") {
+        if (getBB("lastAnim") != "run") {
+            playAnimation("run")
+            setBB("lastAnim", "run")
+        }
+        setAnimationSpeed(speed / 6.0)
+    } else if (currentState == "jumping") {
+        if (getBB("lastAnim") != "jump") {
+            playAnimation("jump")
+            setAnimationLoop(false)
+            setBB("lastAnim", "jump")
+        }
+    } else if (currentState == "falling") {
+        if (getBB("lastAnim") != "fall") {
+            playAnimation("fall")
+            setBB("lastAnim", "fall")
+        }
+    }
+}
+
+fn updateAudio(dt, speed) {
+    // Footsteps while moving on ground
+    if (isGrounded and speed > 0.1) {
+        footstepTimer = footstepTimer + dt
+        
+        let interval = 0.5
+        if (currentState == "running") {
+            interval = 0.3
+        }
+        
+        if (footstepTimer >= interval) {
+            playSound("footstep", 0.7, false)
+            footstepTimer = 0.0
+        }
+    } else {
+        footstepTimer = 0.0
+    }
+    
+    // Jump sound
+    if (currentState == "jumping" and getBB("lastState") != "jumping") {
+        playSound("jump", 1.0, false)
+    }
+    
+    // Landing sound
+    if (isGrounded and getBB("lastState") == "falling") {
+        playSound("land", 0.9, false)
+    }
+    
+    setBB("lastState", currentState)
+}
+
+fn updateBlackboard(speed) {
+    // Update stamina based on movement
+    let stamina = getBB("stamina")
+    
+    if (currentState == "running") {
+        stamina = stamina - 10 * getDeltaTime()
+    } else if (currentState == "idle") {
+        stamina = stamina + 20 * getDeltaTime()
+    }
+    
+    // Clamp stamina
+    if (stamina < 0) {
+        stamina = 0
+    }
+    if (stamina > 100) {
+        stamina = 100
+    }
+    
+    setBB("stamina", stamina)
+    setBB("speed", speed)
+}
+
+// Helper function for jumping (can be called from input system)
+fn jump() {
+    if (isGrounded) {
+        addImpulse(0, jumpForce, 0)
+    }
+}

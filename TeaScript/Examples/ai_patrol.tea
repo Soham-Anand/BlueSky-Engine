@@ -1,0 +1,70 @@
+// AI Patrol Behavior - Patrols between waypoints
+let waypoints = [
+    [-10, 0, 0],
+    [10, 0, 0],
+    [10, 0, 10],
+    [-10, 0, 10]
+]
+let currentWaypoint = 0
+let speed = 3.0
+let reachDistance = 1.0
+
+fn start() {
+    log("AI Patrol started")
+    setBB("state", "patrol")
+    setBB("alertLevel", 0)
+}
+
+fn canExecute() {
+    // This behavior can always execute
+    return true
+}
+
+fn onEnter() {
+    log("Entering patrol behavior")
+}
+
+fn execute(dt) {
+    let state = getBB("state")
+    
+    if (state == "patrol") {
+        patrol(dt)
+    }
+}
+
+fn patrol(dt) {
+    // Get current position
+    let x = getPositionX()
+    let y = getPositionY()
+    let z = getPositionZ()
+    
+    // Get target waypoint
+    let target = waypoints[currentWaypoint]
+    let tx = target[0]
+    let ty = target[1]
+    let tz = target[2]
+    
+    // Calculate direction
+    let dx = tx - x
+    let dz = tz - z
+    let distance = sqrt(dx * dx + dz * dz)
+    
+    if (distance < reachDistance) {
+        // Reached waypoint, move to next
+        currentWaypoint = (currentWaypoint + 1) % 4
+        log("Reached waypoint, moving to next")
+    } else {
+        // Move towards waypoint
+        let dirX = dx / distance
+        let dirZ = dz / distance
+        
+        let newX = x + dirX * speed * dt
+        let newZ = z + dirZ * speed * dt
+        
+        setPosition(newX, y, newZ)
+    }
+}
+
+fn onExit() {
+    log("Exiting patrol behavior")
+}

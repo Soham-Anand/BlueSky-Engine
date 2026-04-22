@@ -73,6 +73,13 @@ class Program
     private static string _renameTarget = "";
     private static string _renameNewName = "";
     
+    // ── Material Editor State ─────────────────────────────────────────
+    private static bool _showMaterialEditor = false;
+    private static string _editingMaterialPath = "";
+    private static Core.Assets.MaterialAsset? _editingMaterial;
+    private static Entity _previewSphereEntity;
+    private static float _previewRotation = 0f;
+    
     // ── Play State ────────────────────────────────────────────────────
     private static bool _isPlaying = false;
     private static bool _isPaused = false;
@@ -103,6 +110,11 @@ class Program
 
     private static string _frameTypedText = "";
     private static bool _frameBackspacePressed = false;
+
+    // ── UI Enhancement Systems ────────────────────────────────────────
+    private static NotificationSystem? _notificationSystem;
+    private static UIPerformanceMonitor? _perfMonitor;
+    private static bool _showPerformanceOverlay = false;
 
     // ─────────────────────────────────────────────────────────────────────
     public static void Main(string[] args)
@@ -168,6 +180,11 @@ class Program
         _uiRenderer.FontAtlas = new FontAtlas(_rhi, fontPath);
         _uiRenderer.Resize((int)_window.Size.X, (int)_window.Size.Y);
 
+        // ── Enhanced UI Systems ───────────────────────────────────────────
+        _notificationSystem = new NotificationSystem();
+        _perfMonitor = new UIPerformanceMonitor();
+        Console.WriteLine("[Editor] Enhanced UI systems initialized");
+
         // Immediately resize swapchain to actual pixel dimensions (Retina)
         var fbSize = _window.FramebufferSize;
         _swapchain.Resize((uint)fbSize.X, (uint)fbSize.Y);
@@ -186,6 +203,7 @@ class Program
                 Console.WriteLine("[KeyDown] Backspace pressed");
             }
             if (k == KeyCode.I && m.HasFlag(ModifierKeys.Super)) ImportFilesDialog();
+            if (k == KeyCode.F3) _showPerformanceOverlay = !_showPerformanceOverlay; // Toggle perf overlay
         };
 
         // ── resize handler ────────────────────────────────────────────────
@@ -279,6 +297,16 @@ class Program
         _consoleLogs.Add(logEntry);
         Console.WriteLine(logEntry);
         
+        // Show notification based on message content
+        if (message.Contains("✓") || message.Contains("Success") || message.Contains("Imported") || message.Contains("Created") || message.Contains("Saved"))
+            _notificationSystem?.ShowSuccess(message, duration: 2.5f);
+        else if (message.Contains("✗") || message.Contains("Failed") || message.Contains("Error"))
+            _notificationSystem?.ShowError(message, duration: 4f);
+        else if (message.Contains("⚠") || message.Contains("Warning"))
+            _notificationSystem?.ShowWarning(message, duration: 3f);
+        else if (message.Contains("Selected") || message.Contains("Opened"))
+            _notificationSystem?.ShowInfo(message, duration: 2f);
+        
         // Keep only last 100 messages
         if (_consoleLogs.Count > 100)
             _consoleLogs.RemoveAt(0);
@@ -354,6 +382,8 @@ class Program
 
     private static void RenderFrame()
     {
+        _perfMonitor?.BeginFrame();
+        
         _swapchain!.AcquireNextImage();
 
         var cmd = _rhi!.CreateCommandBuffer();
@@ -394,6 +424,10 @@ class Program
         
         _ui!.Time = _stopwatch!.Elapsed.TotalSeconds;
         
+        // Update animation systems
+        AnimatedButton.UpdateGlobalTime(_deltaTime);
+        _notificationSystem?.Update(_deltaTime);
+        
         // Don't pass input to UI system if a modal is open (script editor, rename dialog)
         string uiTypedText = (_showScriptEditor || _showRenameDialog) ? "" : _frameTypedText;
         bool uiBackspace = (_showScriptEditor || _showRenameDialog) ? false : _frameBackspacePressed;
@@ -427,11 +461,43 @@ class Program
             BuildWorkspaceUI();
         }
 
+        // ── Render notifications and performance overlay ──────────────────
+        _notificationSystem?.Render(_ui!, logW, logH);
+        
+        if (_showPerformanceOverlay && _perfMonitor != null)
+        {
+            // Performance overlay in top-right corner
+            float overlayW = 400f;
+            float overlayH = 120f;
+            float overlayX = logW - overlayW - 10f;
+            float overlayY = 10f;
+            
+            _ui.Panel(overlayX, overlayY, overlayW, overlayH, ModernTheme.WithAlpha(ModernTheme.Bg2, 0.9f));
+            _ui.Panel(overlayX, overlayY, overlayW, 2, ModernTheme.Accent);
+            
+            _ui.SetCursor(overlayX + 10, overlayY + 10);
+            _ui.Text($"FPS: {_perfMonitor.FPS:F1}", ModernTheme.Green);
+            
+            _ui.SetCursor(overlayX + 10, overlayY + 30);
+            _ui.Text($"Frame: {_perfMonitor.CurrentFrameTime:F2}ms (avg: {_perfMonitor.AverageFrameTime:F2}ms)", ModernTheme.TextSecondary);
+            
+            _ui.SetCursor(overlayX + 10, overlayY + 50);
+            _ui.Text($"Draw Calls: {_perfMonitor.DrawCallCount}", ModernTheme.TextSecondary);
+            
+            _ui.SetCursor(overlayX + 10, overlayY + 70);
+            _ui.Text($"Panels: {_perfMonitor.PanelCount} | Text: {_perfMonitor.TextCount}", ModernTheme.TextMuted);
+            
+            _ui.SetCursor(overlayX + 10, overlayY + 90);
+            _ui.Text("Press F3 to hide", ModernTheme.TextDisabled);
+        }
+
         _uiRenderer!.Render(cmd, _ui!);
 
-        // ── Render 3D viewport content AFTER UI layout is calculated ───────
-        // The viewport uses scissor testing to only draw within its bounds
-        if (_viewportNeedsRender && _viewport != null)
+        // ── Render 3D viewport content AFTER UI but with proper depth testing ───────
+        // Skip 3D rendering only when FULLSCREEN modals are open (not context menus)
+        bool fullscreenModalOpen = _showMaterialEditor || _showScriptEditor || _showImportDialog || _showRenameDialog;
+        
+        if (_viewportNeedsRender && _viewport != null && !fullscreenModalOpen)
         {
             float vpX = _lastViewportRect.X;
             float vpY = _lastViewportRect.Y; // dock rect already includes header offset
@@ -454,8 +520,8 @@ class Program
                 var proj = _viewport.GetProjectionMatrixNumerics();
                 var camPos = _viewport.GetCameraPositionNumerics();
 
-                // Use depth testing to prevent viewport from drawing over UI
-                // The UI renderer should have written depth values
+                // Render 3D viewport - scissor test keeps it within bounds
+                // Modals are skipped by the anyModalOpen check above
                 _viewportRenderer!.Render(cmd, view, proj, camPos,
                     (int)vpXPx, (int)vpYPx, (int)vpWPx, (int)vpHPx, _deltaTime);
 
@@ -469,6 +535,8 @@ class Program
         _rhi.Submit(cmd, _swapchain);
         _swapchain.Present();
         cmd.Dispose();
+        
+        _perfMonitor?.EndFrame();
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -792,6 +860,10 @@ class Program
         // Initialize TeaScript system
         _teaScriptSystem = new BlueSky.Core.Scripting.TeaScriptSystem(_world);
         Console.WriteLine("[Editor] TeaScriptSystem initialized");
+        
+        // Welcome notification
+        string projectName = Path.GetFileName(ProjectManager.CurrentProjectDir) ?? "Project";
+        _notificationSystem?.ShowSuccess($"Welcome to {projectName}!", duration: 3f);
 
         // Create a simple cube entity with TransformComponent
         var entity1 = _world.CreateEntity();
@@ -934,12 +1006,9 @@ class Program
         float tcX = (w - tcW) / 2;
         float tcY = tlY; // Same Y as left buttons
 
-        if (_ui.ButtonEx(tcX, tcY, 44, btnH, _isPlaying ? "▶" : "Play",
-            _isPlaying ? EditorTheme.PlayGreen : EditorTheme.ToolbarBtnNormal,
-            EditorTheme.Lighten(EditorTheme.PlayGreen, 0.15f),
-            EditorTheme.PlayGreen,
-            new System.Numerics.Vector4(0,0,0,0),
-            _isPlaying ? EditorTheme.TextPrimary : EditorTheme.PlayGreen, 610))
+        // Play button with animated success style
+        if (AnimatedButton.RenderSuccess(_ui, tcX, tcY, 44, btnH, _isPlaying ? "▶" : "Play", 610, 
+            enabled: !_isPlaying, icon: _isPlaying ? "" : "▶"))
         {
             if (!_isPlaying)
             {
@@ -953,29 +1022,29 @@ class Program
                 _isPlaying = true;
                 _isPaused = false;
                 Log("▶ Play mode started - scripts running");
+                _notificationSystem?.ShowSuccess("Play mode started", duration: 2f);
             }
         }
 
-        if (_ui.ButtonEx(tcX + 50, tcY, 44, btnH, "Pause",
-            _isPaused ? EditorTheme.PauseYellow : EditorTheme.ToolbarBtnNormal,
-            EditorTheme.Lighten(EditorTheme.PauseYellow, 0.15f),
-            EditorTheme.PauseYellow,
-            new System.Numerics.Vector4(0,0,0,0),
-            _isPaused ? EditorTheme.TextPrimary : EditorTheme.PauseYellow, 611))
+        // Pause button with animated warning style
+        if (AnimatedButton.Render(_ui, tcX + 50, tcY, 44, btnH, _isPaused ? "▶" : "⏸", 611,
+            normalColor: ModernTheme.WithAlpha(ModernTheme.Orange, 0.2f),
+            hoverColor: ModernTheme.WithAlpha(ModernTheme.Orange, 0.4f),
+            pressColor: ModernTheme.Orange,
+            textColor: ModernTheme.Orange,
+            enabled: _isPlaying))
         {
             if (_isPlaying)
             {
                 _isPaused = !_isPaused;
                 Log(_isPaused ? "⏸ Paused" : "▶ Resumed");
+                _notificationSystem?.ShowInfo(_isPaused ? "Paused" : "Resumed", duration: 1.5f);
             }
         }
 
-        if (_ui.ButtonEx(tcX + 100, tcY, 44, btnH, "Stop",
-            EditorTheme.ToolbarBtnNormal,
-            EditorTheme.Lighten(EditorTheme.StopRed, 0.15f),
-            EditorTheme.StopRed,
-            new System.Numerics.Vector4(0,0,0,0),
-            EditorTheme.StopRed, 612))
+        // Stop button with animated danger style
+        if (AnimatedButton.RenderDanger(_ui, tcX + 100, tcY, 44, btnH, "⏹", 612, 
+            enabled: _isPlaying, icon: ""))
         {
             if (_isPlaying)
             {
@@ -991,6 +1060,7 @@ class Program
                 }
                 
                 Log("⏹ Stopped - scene restored to editor state");
+                _notificationSystem?.ShowInfo("Stopped - scene restored", duration: 2f);
                 // Reset all scripts
                 HotReloadScripts();
             }
@@ -1023,7 +1093,12 @@ class Program
         {
             DrawScriptEditor(_ui, w, h);
         }
-        
+
+        if (_showMaterialEditor)
+        {
+            DrawMaterialEditorWindow(_ui, w, h);
+        }
+
         if (_showRenameDialog)
         {
             DrawRenameDialog(_ui, w, h);
@@ -1042,6 +1117,16 @@ class Program
     private static void DrawViewportPanel(NotBSUI ui, DockRect rect)
     {
         _lastViewportRect = rect;
+
+        // Skip 3D rendering when modals are open
+        if (_showMaterialEditor || _showScriptEditor || _showImportDialog || _showRenameDialog)
+        {
+            ui.Panel(rect.X, rect.Y, rect.W, rect.H, EditorTheme.Bg0);
+            float cx = rect.X + rect.W / 2, cy = rect.Y + rect.H / 2;
+            ui.SetCursor(cx - 60, cy - 8);
+            ui.Text("Viewport paused (modal open)", EditorTheme.TextDisabled);
+            return;
+        }
 
         // --- Drag Preview Visuals ---
         if (_isDraggingAsset && _draggedAssetPath != null)
@@ -1414,6 +1499,18 @@ class Program
             ImportFilesDialog();
         }
 
+        // Create Material Button — right-aligned in toolbar
+        uint createMaterialBtnId = 8002;
+        if (ui.ButtonEx(rect.X + rect.W - 180, rect.Y + (toolbarH - 22) / 2, 80, 22, "+ Material",
+            accentPurple,
+            new System.Numerics.Vector4(0.6f, 0.4f, 1.0f, 1f), // hover
+            new System.Numerics.Vector4(0.5f, 0.3f, 0.9f, 1f), // pressed
+            new System.Numerics.Vector4(0, 0, 0, 0.4f), // shadow
+            textPrimary, createMaterialBtnId))
+        {
+            CreateNewMaterial();
+        }
+
         // ── SIDEBAR ─────────────────────────────────────────────────────────
         float sidebarX = rect.X;
         float sidebarY = rect.Y + toolbarH;
@@ -1643,13 +1740,21 @@ class Program
                     _selectedAssetIndex = (int)cardId;
                     Log($"Selected file: {Path.GetFileName(file)}");
                     
-                    // Double-click detection for .tea files
+                    // Double-click detection for .tea files and Material assets
                     double now = ui.Time;
                     if (_doubleClickTarget == cardId && (now - _lastClickTime) < 0.3)
                     {
                         if (isTeaScript)
                         {
                             OpenScriptEditor(file);
+                        }
+                        else if (isBlueAsset)
+                        {
+                            var header = BlueSky.Core.Assets.BlueAsset.LoadHeader(file);
+                            if (header != null && header.Type == BlueSky.Core.Assets.AssetType.Material)
+                            {
+                                OpenMaterialEditor(file);
+                            }
                         }
                     }
                     else
@@ -2005,6 +2110,8 @@ class Program
     // ─────────────────────────────────────────────────────────────────────
     private static void Cleanup()
     {
+        AnimatedButton.ClearStates();
+        _notificationSystem?.Clear();
         _viewportRenderer?.Dispose();
         _viewport?.Dispose();
         _depthTexture?.Dispose();
@@ -2451,6 +2558,20 @@ class Program
             ui.SetCursor(x + 12, itemY + 8);
             ui.Text("✏️ Rename", EditorTheme.TextPrimary);
             itemY += itemH;
+            
+            // Delete (if something is selected)
+            uint menuId5 = 9104;
+            if (ui.ClickableCard(x + 4, itemY, menuW - 8, itemH, menuId5,
+                EditorTheme.Bg2,
+                new System.Numerics.Vector4(0.8f, 0.3f, 0.3f, 0.3f), // Red hover
+                new System.Numerics.Vector4(0.7f, 0.2f, 0.2f, 0.5f))) // Red press
+            {
+                DeleteSelectedAsset();
+                _showContextMenu = false;
+            }
+            ui.SetCursor(x + 12, itemY + 8);
+            ui.Text("🗑️ Delete", EditorTheme.Red);
+            itemY += itemH;
         }
         
         // Refresh
@@ -2527,15 +2648,115 @@ class Program
     private static void OpenScriptEditor(string scriptPath)
     {
         if (!File.Exists(scriptPath)) return;
-        
+
         _editingScriptPath = scriptPath;
         _editingScriptName = Path.GetFileName(scriptPath);
         _editingScriptContent = File.ReadAllText(scriptPath);
         _showScriptEditor = true;
-        
+
         Log($"Opened script: {_editingScriptName}");
     }
-    
+
+    private static void OpenMaterialEditor(string assetPath)
+    {
+        _editingMaterialPath = assetPath;
+
+        // Load material from .blueskyasset file
+        if (assetPath.EndsWith(".blueskyasset"))
+        {
+            // Try to load as MaterialAsset first
+            _editingMaterial = Core.Assets.MaterialAsset.Load(assetPath);
+            
+            // If that fails, try loading as BlueAsset and convert
+            if (_editingMaterial == null)
+            {
+                var blueAsset = Core.Assets.BlueAsset.Load(assetPath);
+                if (blueAsset != null && blueAsset.Type == Core.Assets.AssetType.Material)
+                {
+                    // Create a MaterialAsset from the BlueAsset
+                    _editingMaterial = new Core.Assets.MaterialAsset
+                    {
+                        MaterialId = blueAsset.AssetId,
+                        MaterialName = blueAsset.AssetName
+                    };
+                }
+            }
+        }
+        else if (assetPath.EndsWith(".blueskyasset"))
+        {
+            _editingMaterial = Core.Assets.MaterialAsset.Load(assetPath);
+        }
+        else if (assetPath.EndsWith(".blueskyasset"))
+        {
+            // Load from BlueAsset and convert to MaterialAsset
+            var blueAsset = Core.Assets.BlueAsset.Load(assetPath);
+            if (blueAsset != null && blueAsset.Type == Core.Assets.AssetType.Material)
+            {
+                // Create a MaterialAsset from the BlueAsset
+                _editingMaterial = new Core.Assets.MaterialAsset
+                {
+                    MaterialId = blueAsset.AssetId,
+                    MaterialName = blueAsset.AssetName
+                };
+            }
+        }
+
+        if (_editingMaterial == null)
+        {
+            Log("✗ Failed to load material asset");
+            return;
+        }
+
+        _showMaterialEditor = true;
+        Log($"Opened material: {_editingMaterial.MaterialName}");
+    }
+
+    private static void CreateNewMaterial()
+    {
+        // Create a new MaterialAsset with default values
+        var newMaterial = new Core.Assets.MaterialAsset
+        {
+            MaterialId = Guid.NewGuid(),
+            MaterialName = "NewMaterial",
+            MaterialType = Core.Assets.MaterialType.PBR,
+            Shader = "pbr_optimized",
+            Albedo = new Core.Assets.Vector3Data(1.0f, 1.0f, 1.0f),
+            Metallic = 0.0f,
+            Roughness = 0.5f,
+            Emission = new Core.Assets.Vector3Data(0.0f, 0.0f, 0.0f),
+            Opacity = 1.0f,
+            NormalStrength = 1.0f
+        };
+
+        // Generate a unique filename
+        string assetsDir = ProjectManager.AssetsDir ?? "Assets";
+        string baseName = "NewMaterial";
+        string fileName = baseName;
+        int counter = 1;
+
+        while (File.Exists(Path.Combine(assetsDir, fileName + ".blueskyasset")))
+        {
+            fileName = $"{baseName}_{counter}";
+            counter++;
+        }
+
+        string filePath = Path.Combine(assetsDir, fileName + ".blueskyasset");
+        newMaterial.MaterialName = fileName;
+
+        try
+        {
+            newMaterial.Save(filePath);
+            Log($"✓ Created new material: {fileName}");
+            
+            // Open it in the Material Editor
+            OpenMaterialEditor(filePath);
+        }
+        catch (Exception ex)
+        {
+            Log($"✗ Failed to create material: {ex.Message}");
+        }
+    }
+
     private static void DrawScriptEditor(NotBSUI ui, float screenW, float screenH)
     {
         float editorW = 800;
@@ -2725,7 +2946,273 @@ class Program
             Log($"✗ Failed to save script: {ex.Message}");
         }
     }
-    
+
+    private static void DrawMaterialEditorWindow(NotBSUI ui, float screenW, float screenH)
+    {
+        float editorW = 900;
+        float editorH = 600;
+        float editorX = (screenW - editorW) / 2;
+        float editorY = (screenH - editorH) / 2;
+
+        // Modal overlay
+        ui.Panel(0, 0, screenW, screenH, new System.Numerics.Vector4(0, 0, 0, 0.5f));
+
+        // Editor window
+        ui.Shadow(editorX, editorY, editorW, editorH, 6, 10, 0.5f);
+        ui.Panel(editorX, editorY, editorW, editorH, EditorTheme.Bg1);
+        ui.Panel(editorX, editorY, editorW, 1, EditorTheme.Border0);
+
+        // Title bar
+        float titleH = 36;
+        ui.Panel(editorX, editorY, editorW, titleH, EditorTheme.Bg2);
+        ui.Panel(editorX, editorY + titleH - 1, editorW, 1, EditorTheme.Border1);
+        ui.SetCursor(editorX + 12, editorY + 10);
+        string materialName = _editingMaterial?.MaterialName ?? "Untitled Material";
+        ui.Text($"🎨 {materialName}", EditorTheme.TextPrimary);
+
+        // Close button
+        uint closeId = 9300;
+        if (ui.ButtonEx(editorX + editorW - 70, editorY + 6, 60, 24, "Close",
+            EditorTheme.ToolbarBtnNormal,
+            EditorTheme.ToolbarBtnHover,
+            EditorTheme.AccentDim,
+            new System.Numerics.Vector4(0, 0, 0, 0.3f),
+            EditorTheme.TextSecondary, closeId))
+        {
+            _showMaterialEditor = false;
+        }
+
+        // Toolbar
+        float toolbarY = editorY + titleH;
+        float toolbarH = 32;
+        ui.Panel(editorX, toolbarY, editorW, toolbarH, EditorTheme.Bg3);
+        ui.Panel(editorX, toolbarY + toolbarH - 1, editorW, 1, EditorTheme.Border1);
+
+        // Save button
+        uint saveId = 9301;
+        if (ui.ButtonEx(editorX + 8, toolbarY + 4, 60, 24, "💾 Save",
+            EditorTheme.Accent,
+            EditorTheme.AccentHover,
+            EditorTheme.AccentDim,
+            new System.Numerics.Vector4(0, 0, 0, 0.3f),
+            EditorTheme.TextPrimary, saveId))
+        {
+            SaveMaterial();
+        }
+
+        // Main content area - split layout
+        float contentY = toolbarY + toolbarH;
+        float contentH = editorH - titleH - toolbarH;
+        float previewW = editorW * 0.55f;
+        float propsW = editorW - previewW;
+
+        // Preview area (left)
+        ui.Panel(editorX, contentY, previewW, contentH, EditorTheme.Bg0);
+        ui.Panel(editorX, contentY, previewW, 1, EditorTheme.Border1);
+        ui.SetCursor(editorX + 12, contentY + 12);
+        ui.Text("Preview", EditorTheme.TextMuted);
+
+        // Material color preview
+        if (_editingMaterial != null)
+        {
+            float previewX = editorX + previewW / 2 - 80;
+            float previewY = contentY + contentH / 2 - 80;
+            float previewSize = 160;
+
+            // Draw preview background
+            ui.Panel(previewX, previewY, previewSize, previewSize, EditorTheme.Bg3);
+
+            // Draw albedo color preview
+            var albedoColor = new System.Numerics.Vector4(
+                _editingMaterial.Albedo.X,
+                _editingMaterial.Albedo.Y,
+                _editingMaterial.Albedo.Z,
+                _editingMaterial.Opacity
+            );
+            ui.Panel(previewX + 10, previewY + 10, previewSize - 20, previewSize - 20, albedoColor);
+
+            // Draw emission indicator if emission is active
+            float emissionIntensity = _editingMaterial.Emission.X + _editingMaterial.Emission.Y + _editingMaterial.Emission.Z;
+            if (emissionIntensity > 0.1f)
+            {
+                ui.Panel(previewX + 10, previewY + 10, previewSize - 20, previewSize - 20,
+                    new System.Numerics.Vector4(1, 1, 0.5f, 0.3f));
+                ui.SetCursor(previewX + 45, previewY + 15);
+                ui.Text("✨ Emissive", new System.Numerics.Vector4(1, 1, 0.2f, 1));
+            }
+
+            // Draw metallic/roughness indicator
+            ui.SetCursor(previewX + 15, previewY + previewSize - 35);
+            ui.Text($"M: {_editingMaterial.Metallic:F2}  R: {_editingMaterial.Roughness:F2}", EditorTheme.TextSecondary);
+        }
+        else
+        {
+            // Placeholder when no material loaded
+            float sphereX = editorX + previewW / 2 - 60;
+            float sphereY = contentY + contentH / 2 - 60;
+            ui.Panel(sphereX, sphereY, 120, 120, EditorTheme.Bg3);
+            ui.Circle(sphereX + 60, sphereY + 60, 50, EditorTheme.Accent, false);
+            ui.SetCursor(sphereX + 35, sphereY + 55);
+            ui.Text("Sphere", EditorTheme.TextDisabled);
+        }
+
+        // Properties panel (right)
+        float propsX = editorX + previewW;
+        ui.Panel(propsX, contentY, propsW, contentH, EditorTheme.Bg0);
+        ui.Panel(propsX, contentY, 1, contentH, EditorTheme.Border1);
+        ui.SetCursor(propsX + 12, contentY + 12);
+        ui.Text("Properties", EditorTheme.TextMuted);
+
+        // Property controls
+        float propY = contentY + 40;
+        float propX = propsX + 12;
+        float propW = propsW - 24;
+
+        if (_editingMaterial != null)
+        {
+            // Albedo Color
+            ui.SetCursor(propX, propY);
+            ui.Text("Albedo Color", EditorTheme.TextPrimary);
+            propY += 24;
+
+            ui.SetCursor(propX, propY);
+            ui.Text("R", EditorTheme.TextSecondary);
+            ui.SetCursor(propX + 30, propY - 2);
+            float albedoR = _editingMaterial.Albedo.X;
+            if (ui.Slider(ref albedoR, 0f, 1f, propW - 40, 16))
+            {
+                _editingMaterial.Albedo = new Core.Assets.Vector3Data(albedoR, _editingMaterial.Albedo.Y, _editingMaterial.Albedo.Z);
+            }
+            propY += 26;
+
+            ui.SetCursor(propX, propY);
+            ui.Text("G", EditorTheme.TextSecondary);
+            ui.SetCursor(propX + 30, propY - 2);
+            float albedoG = _editingMaterial.Albedo.Y;
+            if (ui.Slider(ref albedoG, 0f, 1f, propW - 40, 16))
+            {
+                _editingMaterial.Albedo = new Core.Assets.Vector3Data(_editingMaterial.Albedo.X, albedoG, _editingMaterial.Albedo.Z);
+            }
+            propY += 26;
+
+            ui.SetCursor(propX, propY);
+            ui.Text("B", EditorTheme.TextSecondary);
+            ui.SetCursor(propX + 30, propY - 2);
+            float albedoB = _editingMaterial.Albedo.Z;
+            if (ui.Slider(ref albedoB, 0f, 1f, propW - 40, 16))
+            {
+                _editingMaterial.Albedo = new Core.Assets.Vector3Data(_editingMaterial.Albedo.X, _editingMaterial.Albedo.Y, albedoB);
+            }
+            propY += 30;
+
+            // Metallic
+            ui.SetCursor(propX, propY);
+            ui.Text("Metallic", EditorTheme.TextPrimary);
+            propY += 20;
+            ui.SetCursor(propX, propY - 2);
+            float metallic = _editingMaterial.Metallic;
+            if (ui.Slider(ref metallic, 0f, 1f, propW, 16))
+            {
+                _editingMaterial.Metallic = metallic;
+            }
+            propY += 30;
+
+            // Roughness
+            ui.SetCursor(propX, propY);
+            ui.Text("Roughness", EditorTheme.TextPrimary);
+            propY += 20;
+            ui.SetCursor(propX, propY - 2);
+            float roughness = _editingMaterial.Roughness;
+            if (ui.Slider(ref roughness, 0f, 1f, propW, 16))
+            {
+                _editingMaterial.Roughness = roughness;
+            }
+            propY += 30;
+
+            // Emission
+            ui.SetCursor(propX, propY);
+            ui.Text("Emission", EditorTheme.TextPrimary);
+            propY += 24;
+
+            ui.SetCursor(propX, propY);
+            ui.Text("R", EditorTheme.TextSecondary);
+            ui.SetCursor(propX + 30, propY - 2);
+            float emissionR = _editingMaterial.Emission.X;
+            if (ui.Slider(ref emissionR, 0f, 10f, propW - 40, 16))
+            {
+                _editingMaterial.Emission = new Core.Assets.Vector3Data(emissionR, _editingMaterial.Emission.Y, _editingMaterial.Emission.Z);
+            }
+            propY += 26;
+
+            ui.SetCursor(propX, propY);
+            ui.Text("G", EditorTheme.TextSecondary);
+            ui.SetCursor(propX + 30, propY - 2);
+            float emissionG = _editingMaterial.Emission.Y;
+            if (ui.Slider(ref emissionG, 0f, 10f, propW - 40, 16))
+            {
+                _editingMaterial.Emission = new Core.Assets.Vector3Data(_editingMaterial.Emission.X, emissionG, _editingMaterial.Emission.Z);
+            }
+            propY += 26;
+
+            ui.SetCursor(propX, propY);
+            ui.Text("B", EditorTheme.TextSecondary);
+            ui.SetCursor(propX + 30, propY - 2);
+            float emissionB = _editingMaterial.Emission.Z;
+            if (ui.Slider(ref emissionB, 0f, 10f, propW - 40, 16))
+            {
+                _editingMaterial.Emission = new Core.Assets.Vector3Data(_editingMaterial.Emission.X, _editingMaterial.Emission.Y, emissionB);
+            }
+            propY += 30;
+
+            // Opacity
+            ui.SetCursor(propX, propY);
+            ui.Text("Opacity", EditorTheme.TextPrimary);
+            propY += 20;
+            ui.SetCursor(propX, propY - 2);
+            float opacity = _editingMaterial.Opacity;
+            if (ui.Slider(ref opacity, 0f, 1f, propW, 16))
+            {
+                _editingMaterial.Opacity = opacity;
+            }
+            propY += 30;
+
+            // Normal Strength
+            ui.SetCursor(propX, propY);
+            ui.Text("Normal Strength", EditorTheme.TextPrimary);
+            propY += 20;
+            ui.SetCursor(propX, propY - 2);
+            float normalStrength = _editingMaterial.NormalStrength;
+            if (ui.Slider(ref normalStrength, 0f, 2f, propW, 16))
+            {
+                _editingMaterial.NormalStrength = normalStrength;
+            }
+        }
+        else
+        {
+            ui.SetCursor(propX, contentY + contentH / 2);
+            ui.Text("No material loaded", EditorTheme.TextDisabled);
+        }
+    }
+
+    private static void SaveMaterial()
+    {
+        if (_editingMaterial == null || string.IsNullOrEmpty(_editingMaterialPath))
+        {
+            Log("✗ No material to save");
+            return;
+        }
+
+        try
+        {
+            _editingMaterial.Save(_editingMaterialPath);
+            Log($"✓ Saved material: {_editingMaterial.MaterialName}");
+        }
+        catch (Exception ex)
+        {
+            Log($"✗ Save failed: {ex.Message}");
+        }
+    }
+
     private static void HotReloadScripts()
     {
         if (_world == null || _teaScriptSystem == null) return;
@@ -2867,6 +3354,52 @@ class Program
         catch (Exception ex)
         {
             Log($"✗ Rename failed: {ex.Message}");
+        }
+    }
+    
+    private static void DeleteSelectedAsset()
+    {
+        if (_selectedAssetIndex < 0 || string.IsNullOrEmpty(_currentBrowserDir))
+            return;
+        
+        try
+        {
+            var dirs = Directory.GetDirectories(_currentBrowserDir);
+            var files = Directory.GetFiles(_currentBrowserDir);
+            
+            int folderCount = dirs.Length;
+            
+            // Check if it's a folder
+            if (_selectedAssetIndex >= 5000 && _selectedAssetIndex < 5000 + folderCount)
+            {
+                int folderIdx = _selectedAssetIndex - 5000;
+                string folderPath = dirs[folderIdx];
+                string folderName = Path.GetFileName(folderPath);
+                
+                // Delete folder and all contents
+                Directory.Delete(folderPath, recursive: true);
+                Log($"✓ Deleted folder: {folderName}");
+            }
+            // Check if it's a file
+            else if (_selectedAssetIndex >= 6000)
+            {
+                int fileIdx = _selectedAssetIndex - 6000;
+                if (fileIdx < files.Length)
+                {
+                    string filePath = files[fileIdx];
+                    string fileName = Path.GetFileName(filePath);
+                    
+                    // Delete file
+                    File.Delete(filePath);
+                    Log($"✓ Deleted file: {fileName}");
+                }
+            }
+            
+            _selectedAssetIndex = -1;
+        }
+        catch (Exception ex)
+        {
+            Log($"✗ Delete failed: {ex.Message}");
         }
     }
 }

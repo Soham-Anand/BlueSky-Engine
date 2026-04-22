@@ -1,0 +1,26 @@
+// Physics Demo - Bouncing ball with physics
+let jumpForce = 500.0
+let moveSpeed = 300.0
+
+fn start() {
+    log("Physics demo started!")
+}
+
+fn update() {
+    let dt = getDeltaTime()
+    
+    // Get current velocity
+    let velY = getVelocityY()
+    
+    // Jump when hitting ground
+    if (getPositionY() <= 0.5 and velY <= 0.1) {
+        addImpulse(0, jumpForce, 0)
+        playSound("bounce", 1.0, false)
+    }
+    
+    // Move left/right with physics
+    let velX = getVelocityX()
+    if (velX < 5) {
+        addForce(moveSpeed * dt, 0, 0)
+    }
+}

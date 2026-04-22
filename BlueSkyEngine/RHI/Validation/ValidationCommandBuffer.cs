@@ -9,6 +9,7 @@ internal sealed class ValidationCommandBuffer : IRHICommandBuffer, IRHIWrapped<I
     private bool _pipelineSet;
     private bool _indexBufferSet;
     private bool _vertexBufferSet;
+    private bool _currentPipelineRequiresVertexBuffer;
 
     public ValidationCommandBuffer(ValidationDevice owner, IRHICommandBuffer inner)
     {
@@ -78,6 +79,9 @@ internal sealed class ValidationCommandBuffer : IRHICommandBuffer, IRHIWrapped<I
         var validated = Owner.ExpectPipeline(pipeline);
         Inner.SetPipeline(validated.Inner);
         _pipelineSet = true;
+        
+        // Check if this pipeline requires vertex buffers (has vertex attributes)
+        _currentPipelineRequiresVertexBuffer = validated.Desc.VertexLayout.Attributes.Length > 0;
     }
 
     public void SetViewport(Viewport viewport)
@@ -194,6 +198,11 @@ internal sealed class ValidationCommandBuffer : IRHICommandBuffer, IRHIWrapped<I
     {
         RHIValidation.RequireState(_inRenderPass, "Draw called outside of a render pass.");
         RHIValidation.RequireState(_pipelineSet, "Draw called without a pipeline set.");
-        RHIValidation.RequireState(_vertexBufferSet, "Draw called without a vertex buffer set.");
+        
+        // Only require vertex buffer if the pipeline has vertex attributes (not procedural geometry)
+        if (_currentPipelineRequiresVertexBuffer)
+        {
+            RHIValidation.RequireState(_vertexBufferSet, "Draw called without a vertex buffer set.");
+        }
     }
 }

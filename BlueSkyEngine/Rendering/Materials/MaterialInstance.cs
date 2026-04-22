@@ -181,8 +181,8 @@ public class MaterialInstance
     {
         try
         {
-            if (!path.EndsWith(".blueskymaterialinstance"))
-                path += ".blueskymaterialinstance";
+            if (!path.EndsWith(".blueskyasset"))
+                path += ".blueskyasset";
             
             var instanceAsset = new MaterialInstanceAsset
             {

@@ -1,3 +1,4 @@
+using System.Numerics;
 using BlueSky.Core.Assets;
 namespace BlueSky.Rendering;
 
@@ -36,7 +37,7 @@ public class AssetManager : IDisposable
     public int NormalTexture => _normalTexture;
 
     /// <summary>
-    /// Load a 3D model from file. Supports both .blueasset and source files (FBX, OBJ, etc.).
+    /// Load a 3D model from file. Supports both .blueasset and source files (FBX, OBJ, GLTF, GLB).
     /// Returns the first mesh ID for convenience.
     /// </summary>
     public int LoadModel(string path, out ModelData? modelData)
@@ -47,7 +48,14 @@ public class AssetManager : IDisposable
             return LoadModelFromAsset(path, out modelData);
         }
 
-        // Legacy loading from source file
+        // Check if this is GLTF/GLB - use new importer
+        var ext = Path.GetExtension(path).ToLowerInvariant();
+        if (ext == ".gltf" || ext == ".glb")
+        {
+            return LoadModelFromGLTF(path, out modelData);
+        }
+
+        // Legacy loading from source file (FBX, OBJ)
         modelData = MeshLoader.LoadModel(path);
         if (modelData == null || modelData.Meshes.Count == 0)
         {
@@ -85,6 +93,168 @@ public class AssetManager : IDisposable
 
         Console.WriteLine($"[AssetManager] Loaded model '{path}' with {modelData.Meshes.Count} meshes");
         return firstMeshId;
+    }
+    
+    /// <summary>
+    /// Load a model from GLTF/GLB file with full material and texture support.
+    /// </summary>
+    private int LoadModelFromGLTF(string path, out ModelData? modelData)
+    {
+        if (_meshCache.TryGetValue(path, out var cachedId))
+        {
+            modelData = null;
+            return cachedId;
+        }
+
+        try
+        {
+            var importer = Animation.GLTF.GltfImporter.FromFile(path);
+            var root = importer.Root;
+            
+            modelData = new ModelData();
+            
+            // Extract all meshes
+            if (root.Meshes != null)
+            {
+                for (int i = 0; i < root.Meshes.Length; i++)
+                {
+                    var gltfMeshData = importer.ExtractMesh(i);
+                    
+                    foreach (var prim in gltfMeshData.Primitives)
+                    {
+                        if (prim.Positions == null) continue;
+                        
+                        var mesh = ConvertGltfPrimitiveToMeshData(gltfMeshData.Name, prim);
+                        modelData.Meshes.Add(mesh);
+                    }
+                }
+            }
+            
+            // Extract all materials
+            if (root.Materials != null)
+            {
+                for (int i = 0; i < root.Materials.Length; i++)
+                {
+                    var matData = Animation.GLTF.GltfToEngineBridge.ExtractMaterial(importer, i);
+                    var material = ConvertGltfMaterialToMaterialData(matData);
+                    modelData.Materials.Add(material);
+                }
+            }
+            
+            // Extract and load all textures
+            var textures = Animation.GLTF.GltfToEngineBridge.ExtractAllTextures(path);
+            foreach (var kvp in textures)
+            {
+                string texName = kvp.Key;
+                byte[] texData = kvp.Value;
+                
+                // Save to temp file and load (or implement direct byte[] loading)
+                string tempPath = Path.Combine(Path.GetTempPath(), $"{texName}.png");
+                File.WriteAllBytes(tempPath, texData);
+                LoadTexture(tempPath, true);
+            }
+            
+            // Upload meshes to GPU
+            int firstMeshId = 0;
+            foreach (var mesh in modelData.Meshes)
+            {
+                var meshId = UploadMesh(mesh);
+                if (firstMeshId == 0) firstMeshId = meshId;
+                
+                var meshKey = $"{path}:{mesh.Name}";
+                _meshCache[meshKey] = meshId;
+            }
+            
+            Console.WriteLine($"[AssetManager] Loaded GLTF model '{path}' with {modelData.Meshes.Count} meshes, {modelData.Materials.Count} materials");
+            return firstMeshId;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[AssetManager] Failed to load GLTF model: {ex.Message}");
+            modelData = null;
+            return 0;
+        }
+    }
+    
+    private MeshData ConvertGltfPrimitiveToMeshData(string name, Animation.GLTF.GltfPrimitiveData prim)
+    {
+        int vertexCount = prim.Positions!.Length;
+        var vertices = new VertexData[vertexCount];
+        
+        for (int i = 0; i < vertexCount; i++)
+        {
+            // COORDINATE SYSTEM FIX: glTF right-handed → engine left-handed
+            // Negate X to un-mirror geometry (fixes reversed text, steering wheel side, etc.)
+            vertices[i].Position = new Vector3(
+                -prim.Positions[i].X,
+                prim.Positions[i].Y,
+                prim.Positions[i].Z
+            );
+            
+            if (prim.Normals != null && i < prim.Normals.Length)
+            {
+                vertices[i].Normal = new Vector3(
+                    -prim.Normals[i].X,
+                    prim.Normals[i].Y,
+                    prim.Normals[i].Z
+                );
+            }
+            
+            if (prim.TexCoords0 != null && i < prim.TexCoords0.Length)
+            {
+                vertices[i].TexCoords = new Vector2(
+                    prim.TexCoords0[i].X,
+                    prim.TexCoords0[i].Y
+                );
+            }
+            
+            if (prim.Tangents != null && i < prim.Tangents.Length)
+            {
+                vertices[i].Tangent = new Vector3(
+                    -prim.Tangents[i].X,
+                    prim.Tangents[i].Y,
+                    prim.Tangents[i].Z
+                );
+            }
+        }
+        
+        uint[] indices = prim.Indices ?? GenerateSequentialIndices(vertexCount);
+        
+        // WINDING ORDER FIX: X-negate flips triangle facing — swap idx 1 & 2 per triangle
+        for (int t = 0; t + 2 < indices.Length; t += 3)
+        {
+            (indices[t + 1], indices[t + 2]) = (indices[t + 2], indices[t + 1]);
+        }
+        
+        return new MeshData
+        {
+            Name = name,
+            Vertices = vertices,
+            Indices = indices
+        };
+    }
+    
+    private MaterialData ConvertGltfMaterialToMaterialData(Animation.GLTF.MaterialData gltfMat)
+    {
+        return new MaterialData
+        {
+            Name = gltfMat.Name,
+            Albedo = new Vector3(
+                gltfMat.BaseColor.X,
+                gltfMat.BaseColor.Y,
+                gltfMat.BaseColor.Z
+            ),
+            Metallic = gltfMat.MetallicFactor,
+            Roughness = gltfMat.RoughnessFactor
+        };
+    }
+    
+    private uint[] GenerateSequentialIndices(int count)
+    {
+        var indices = new uint[count];
+        for (int i = 0; i < count; i++)
+            indices[i] = (uint)i;
+        return indices;
     }
 
     /// <summary>

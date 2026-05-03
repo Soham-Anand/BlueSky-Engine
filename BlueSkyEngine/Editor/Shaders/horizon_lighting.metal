@@ -362,7 +362,7 @@ float3 calculateIBL(float3 normal,
     return ambient;
 }
 
-// Simplified IBL for low quality
+// Simplified IBL for low quality with improved hemisphere lighting
 float3 calculateSimpleIBL(float3 normal,
                            float3 viewDir,
                            float3 albedo,
@@ -370,11 +370,24 @@ float3 calculateSimpleIBL(float3 normal,
                            float roughness,
                            float ao)
 {
-    // Simple ambient approximation (skip Fresnel calculation for performance)
-    float3 ambientColor = float3(0.2, 0.3, 0.5);
-    float3 ambient = ambientColor * albedo * (0.5 + metallic * 0.5) * ao;
+    // Enhanced hemisphere lighting
+    float skyFactor = max(0.0, normal.y) * 0.5 + 0.5; // Remap [0,1] to [0.5,1]
+    float3 skyColor = float3(0.6, 0.7, 0.9); // Cool blue sky
+    float3 skyContribution = skyColor * skyFactor * 0.8;
     
-    return ambient;
+    float groundFactor = max(0.0, -normal.y) * 0.5 + 0.5;
+    float3 groundColor = float3(0.3, 0.25, 0.2); // Warm ground bounce
+    float3 groundContribution = groundColor * groundFactor * 0.4;
+    
+    float3 ambient = (skyContribution + groundContribution) * albedo;
+    
+    // Add subtle reflection for metallic/smooth surfaces
+    float reflectivity = metallic * (1.0 - roughness);
+    float3 reflectionDir = reflect(-viewDir, normal);
+    float reflectionSky = max(0.0, reflectionDir.y);
+    ambient += skyColor * reflectionSky * reflectivity * 0.3;
+    
+    return ambient * ao;
 }
 
 // ============================================================================
@@ -422,23 +435,47 @@ float3 calculateVolumetrics(float3 worldPos,
 
 // ============================================================================
 // Fragment Shader
-// ============================================================================
-
 fragment float4 horizon_fragment(VertexOut in [[stage_in]],
                                   constant ViewUniforms& view [[buffer(10)]],
                                   constant MaterialData& material [[buffer(11)]], 
                                   constant LightData* lights [[buffer(12)]],      
                                   constant int& lightCount [[buffer(13)]],        
-                                  constant LightingSettings& settings [[buffer(14)]])
+                                  constant LightingSettings& settings [[buffer(14)]],
+                                  texture2d<float> albedoMap [[texture(2)]],
+                                  texture2d<float> normalMap [[texture(3)]],
+                                  texture2d<float> rmaMap [[texture(4)]])
 {
+    constexpr sampler texSampler(address::repeat, filter::linear, mip_filter::linear);
+
     // Sample material properties
     float3 albedo = material.albedo;
+    if (material.useAlbedoTex != 0) {
+        float4 texColor = albedoMap.sample(texSampler, in.uv);
+        albedo *= texColor.rgb;
+    }
     
     float3 normal = normalize(in.normal);
+    if (material.useNormalTex != 0) {
+        // Basic tangent space mapping approximation (assuming flat UVs for now, proper TBN requires tangent vector)
+        float3 texNormal = normalMap.sample(texSampler, in.uv).rgb * 2.0 - 1.0;
+        // Simplified blend
+        normal = normalize(normal + texNormal * 0.5); 
+    }
     
     float metallic = material.metallic;
-    float roughness = max(MIN_ROUGHNESS, material.roughness);
+    float roughness = material.roughness;
     float ao = material.ao;
+    
+    if (material.useRMATex != 0) {
+        float3 rma = rmaMap.sample(texSampler, in.uv).rgb;
+        roughness = rma.g;  // G = Roughness
+        metallic = rma.b;   // B = Metallic
+        // Note: some GLTF packings might use R=AO, G=Roughness, B=Metallic, or other variants. 
+        // Standard engine packing: R=AO, G=Roughness, B=Metallic
+        ao *= rma.r;
+    }
+    
+    roughness = max(MIN_ROUGHNESS, roughness);
     
     float3 viewDir = normalize(view.cameraPos - in.worldPos);
     
@@ -482,7 +519,12 @@ fragment float4 horizon_fragment(VertexOut in [[stage_in]],
     if (settings.enableIBL != 0) {
         ambient = calculateSimpleIBL(normal, viewDir, albedo, metallic, roughness, ao);
     } else {
-        ambient = albedo * 0.03 * ao; // Simple ambient
+        // Fallback ambient with hemisphere lighting
+        float skyFactor = max(0.0, normal.y) * 0.5 + 0.5;
+        float3 skyLight = float3(0.6, 0.7, 0.9) * skyFactor * 0.5;
+        float groundFactor = max(0.0, -normal.y) * 0.5 + 0.5;
+        float3 groundLight = float3(0.3, 0.25, 0.2) * groundFactor * 0.3;
+        ambient = (skyLight + groundLight) * albedo * ao;
     }
     
     // Volumetric lighting
@@ -500,9 +542,12 @@ fragment float4 horizon_fragment(VertexOut in [[stage_in]],
     // Exposure adjustment
     finalColor *= settings.exposure;
     
-    // Tone mapping (ACES approximation)
+    // Tone mapping (Improved ACES Filmic)
     float3 x = max(float3(0.0), finalColor - 0.004);
     finalColor = (x * (6.2 * x + 0.5)) / (x * (6.2 * x + 1.7) + 0.06);
+    
+    // Subtle color grading for warmth
+    finalColor *= float3(1.02, 1.0, 0.98);
     
     // Gamma correction
     finalColor = pow(finalColor, float3(1.0 / 2.2));

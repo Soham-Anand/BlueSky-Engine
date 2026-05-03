@@ -14,16 +14,16 @@ public static class EditorTheme
     // ═══════════════════════════════════════════════════════════════════
 
     // Backgrounds — layered depth (darkest → lightest)
-    public static readonly Vector4 Bg0        = V(0.075f, 0.078f, 0.085f);  // Deepest: splitters, shadows
-    public static readonly Vector4 Bg1        = V(0.098f, 0.102f, 0.110f);  // Panel backgrounds
-    public static readonly Vector4 Bg2        = V(0.118f, 0.122f, 0.130f);  // Surfaces (cards, sections)
-    public static readonly Vector4 Bg3        = V(0.145f, 0.149f, 0.158f);  // Elevated surfaces
-    public static readonly Vector4 Bg4        = V(0.175f, 0.180f, 0.192f);  // Hover states, inputs
+    public static readonly Vector4 Bg0        = V(0.051f, 0.055f, 0.071f);  // Deepest: splitters, shadows
+    public static readonly Vector4 Bg1        = V(0.072f, 0.076f, 0.092f);  // Panel backgrounds
+    public static readonly Vector4 Bg2        = V(0.092f, 0.096f, 0.112f);  // Surfaces (cards, sections)
+    public static readonly Vector4 Bg3        = V(0.115f, 0.120f, 0.138f);  // Elevated surfaces
+    public static readonly Vector4 Bg4        = V(0.142f, 0.148f, 0.170f);  // Hover states, inputs
 
     // Borders
-    public static readonly Vector4 Border0    = V(0.060f, 0.065f, 0.070f);  // Hard dividers
-    public static readonly Vector4 Border1    = V(0.160f, 0.170f, 0.185f);  // Subtle borders
-    public static readonly Vector4 Border2    = V(0.220f, 0.235f, 0.260f);  // Visible borders
+    public static readonly Vector4 Border0    = V(0.040f, 0.045f, 0.058f);  // Hard dividers
+    public static readonly Vector4 Border1    = V(0.120f, 0.130f, 0.155f);  // Subtle borders
+    public static readonly Vector4 Border2    = V(0.180f, 0.195f, 0.225f);  // Visible borders
 
     // ═══════════════════════════════════════════════════════════════════
     //  TEXT
@@ -36,10 +36,12 @@ public static class EditorTheme
     // ═══════════════════════════════════════════════════════════════════
     //  ACCENTS — vibrant but not garish
     // ═══════════════════════════════════════════════════════════════════
-    public static readonly Vector4 Accent       = V(0.22f, 0.53f, 0.96f);   // Primary blue
-    public static readonly Vector4 AccentHover  = V(0.32f, 0.62f, 1.00f);   // Lighter blue
-    public static readonly Vector4 AccentDim    = V(0.15f, 0.38f, 0.72f);   // Pressed / darker blue
-    public static readonly Vector4 AccentGlow   = new(0.30f, 0.60f, 1.0f, 0.18f); // Selection glow
+    public static readonly Vector4 Accent       = V(0.29f, 0.62f, 1.00f);   // Primary blue (brighter)
+    public static readonly Vector4 AccentHover  = V(0.38f, 0.70f, 1.00f);   // Lighter blue
+    public static readonly Vector4 AccentDim    = V(0.18f, 0.42f, 0.78f);   // Pressed / darker blue
+    public static readonly Vector4 AccentGlow   = new(0.30f, 0.62f, 1.0f, 0.12f); // Selection glow (subtler)
+    public static readonly Vector4 AccentCyan   = V(0.30f, 0.85f, 0.95f);   // Secondary accent
+    public static readonly Vector4 AccentWarm   = V(1.00f, 0.55f, 0.30f);   // Warm accent for contrast
 
     public static readonly Vector4 Green        = V(0.30f, 0.82f, 0.50f);
     public static readonly Vector4 GreenDim     = V(0.22f, 0.60f, 0.38f);
@@ -65,8 +67,17 @@ public static class EditorTheme
     public static readonly Vector4 TabText        = TextPrimary;
     public static readonly Vector4 TabTextDim     = TextMuted;
 
-    public static readonly Vector4 SplitterNormal = V(0.055f, 0.060f, 0.068f);
+    public static readonly Vector4 SplitterNormal = V(0.035f, 0.040f, 0.052f);
     public static readonly Vector4 SplitterHot    = Accent;
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  ROUNDED RECT DEFAULTS
+    // ═══════════════════════════════════════════════════════════════════
+    public const float CardRadius     = 8f;    // Content browser cards
+    public const float ButtonRadius   = 6f;    // Toolbar buttons
+    public const float PillRadius     = 12f;   // FPS badge, Play button
+    public const float InputRadius    = 4f;    // Text fields, sliders
+    public const float SmallRadius    = 3f;    // Tiny elements
 
     // ═══════════════════════════════════════════════════════════════════
     //  SELECTION — layered highlight
@@ -78,9 +89,9 @@ public static class EditorTheme
     // ═══════════════════════════════════════════════════════════════════
     //  TOOLBAR
     // ═══════════════════════════════════════════════════════════════════
-    public static readonly Vector4 ToolbarBg   = V(0.090f, 0.094f, 0.102f);
-    public static readonly Vector4 ToolbarBtnNormal = V(0.130f, 0.135f, 0.148f);
-    public static readonly Vector4 ToolbarBtnHover  = V(0.170f, 0.178f, 0.195f);
+    public static readonly Vector4 ToolbarBg   = V(0.062f, 0.066f, 0.082f);
+    public static readonly Vector4 ToolbarBtnNormal = V(0.100f, 0.108f, 0.128f);
+    public static readonly Vector4 ToolbarBtnHover  = V(0.140f, 0.150f, 0.175f);
     public static readonly Vector4 ToolbarBtnActive = Accent;
 
     // Play/Pause/Stop transport controls
@@ -91,11 +102,11 @@ public static class EditorTheme
     // ═══════════════════════════════════════════════════════════════════
     //  PROJECT BROWSER (Launcher)
     // ═══════════════════════════════════════════════════════════════════
-    public static readonly Vector4 LauncherBg        = V(0.070f, 0.074f, 0.082f);
-    public static readonly Vector4 LauncherSidebar   = V(0.060f, 0.064f, 0.072f);
-    public static readonly Vector4 LauncherCardBg    = V(0.105f, 0.110f, 0.120f);
-    public static readonly Vector4 LauncherCardHover = V(0.135f, 0.142f, 0.155f);
-    public static readonly Vector4 LauncherBrand     = new(0.40f, 0.68f, 1.0f, 1.0f);
+    public static readonly Vector4 LauncherBg        = V(0.045f, 0.048f, 0.062f);
+    public static readonly Vector4 LauncherSidebar   = V(0.038f, 0.042f, 0.055f);
+    public static readonly Vector4 LauncherCardBg    = V(0.078f, 0.082f, 0.098f);
+    public static readonly Vector4 LauncherCardHover = V(0.105f, 0.112f, 0.132f);
+    public static readonly Vector4 LauncherBrand     = new(0.40f, 0.72f, 1.0f, 1.0f);
 
     // ═══════════════════════════════════════════════════════════════════
     //  SPACING (logical pixels)

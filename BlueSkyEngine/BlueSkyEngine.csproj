@@ -9,6 +9,13 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- Exclude DirectX9 (removed in Phase 1) -->
+    <Compile Remove="RHI\DirectX9\**" />
+    <EmbeddedResource Remove="RHI\DirectX9\**" />
+    <None Remove="RHI\DirectX9\**" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="JoltPhysicsSharp" Version="2.11.2" />
     <PackageReference Include="StbTrueTypeSharp" Version="1.26.12" />
     <PackageReference Include="StbImageSharp" Version="2.30.15" />

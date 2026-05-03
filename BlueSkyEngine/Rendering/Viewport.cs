@@ -62,6 +62,14 @@ namespace BlueSky.Rendering
             // NameComponent skipped - contains string field, not unmanaged
         }
 
+        /// <summary>
+        /// Reinitialize the camera entity (call after clearing/loading scenes)
+        /// </summary>
+        public void ReinitializeCamera()
+        {
+            InitializeCamera();
+        }
+
         public void Update(float deltaTime)
         {
             // Cap delta time to prevent camera teleporting on frame spikes
@@ -74,7 +82,11 @@ namespace BlueSky.Rendering
             ProcessKeyboardMovement(deltaTime);
             
             // 3. Sync camera with ECS
-            _camera.AspectRatio = (float)_window.Size.X / _window.Size.Y;
+            if (_vpW < 1 || _vpH < 1)
+            {
+                _camera.AspectRatio = (float)_window.Size.X / _window.Size.Y;
+            }
+            
             _world.AddComponent(_cameraEntity, _camera);
             _world.AddComponent(_cameraEntity, _cameraTransform);
         }
@@ -197,6 +209,7 @@ namespace BlueSky.Rendering
         public Entity GetCameraEntity() => _cameraEntity;
         public ref CameraComponent GetCamera() => ref _camera;
         public ref TransformComponent GetCameraTransform() => ref _cameraTransform;
+        public IRenderer Renderer => _renderer;
 
         public int Width => (int)_window.Size.X;
         public int Height => (int)_window.Size.Y;
@@ -234,11 +247,45 @@ namespace BlueSky.Rendering
             return ToNumerics(_camera.GetProjectionMatrix());
         }
 
-        /// <summary>Returns camera world position in System.Numerics format.</summary>
         public System.Numerics.Vector3 GetCameraPositionNumerics()
         {
             var p = _cameraTransform.Position;
             return new System.Numerics.Vector3(p.X, p.Y, p.Z);
+        }
+
+        /// <summary>
+        /// Converts a screen/window coordinate (logical space) into a 3D ray for picking.
+        /// </summary>
+        public Ray GetRayFromMouse(System.Numerics.Vector2 mousePos)
+        {
+            // 1. Transform mouse to viewport local coordinates
+            float localX = mousePos.X - _vpX;
+            float localY = mousePos.Y - _vpY;
+
+            // 2. Map to NDC space [-1, 1]
+            // We use the viewport width/height stored in _vpW, _vpH
+            float nx = (2.0f * localX) / _vpW - 1.0f;
+            float ny = 1.0f - (2.0f * localY) / _vpH; // Flip Y as window 0 is top
+
+            // 3. Unproject
+            var view = GetViewMatrixNumerics();
+            var proj = GetProjectionMatrixNumerics();
+            var viewProj = view * proj;
+            
+            if (!System.Numerics.Matrix4x4.Invert(viewProj, out var invViewProj))
+            {
+                return new Ray(_cameraTransform.Position, _cameraTransform.Forward);
+            }
+
+            // Near point (depth 0)
+            var nearPoint = System.Numerics.Vector4.Transform(new System.Numerics.Vector4(nx, ny, 0, 1), invViewProj);
+            // Far point (depth 1)
+            var farPoint = System.Numerics.Vector4.Transform(new System.Numerics.Vector4(nx, ny, 1, 1), invViewProj);
+
+            var nearPos = new Vector3(nearPoint.X / nearPoint.W, nearPoint.Y / nearPoint.W, nearPoint.Z / nearPoint.W);
+            var farPos = new Vector3(farPoint.X / farPoint.W, farPoint.Y / farPoint.W, farPoint.Z / farPoint.W);
+
+            return new Ray(nearPos, farPos - nearPos);
         }
 
         public void FocusOnEntity(Entity entity)
@@ -323,6 +370,86 @@ namespace BlueSky.Rendering
                 20, 21, 22, 20, 22, 23   // Left
             };
 
+            return (vertices, indices);
+        }
+        
+        /// <summary>
+        /// Creates a smooth cube with shared vertices and averaged normals for better shading
+        /// </summary>
+        public static (float[] vertices, uint[] indices) CreateSmoothCube(float size = 1.0f)
+        {
+            var s = size * 0.5f;
+            
+            // Use shared vertices (8 corners instead of 24 separate vertices)
+            var positions = new Vector3[]
+            {
+                new Vector3(-s, -s, -s), // 0: left-bottom-back
+                new Vector3( s, -s, -s), // 1: right-bottom-back
+                new Vector3( s,  s, -s), // 2: right-top-back
+                new Vector3(-s,  s, -s), // 3: left-top-back
+                new Vector3(-s, -s,  s), // 4: left-bottom-front
+                new Vector3( s, -s,  s), // 5: right-bottom-front
+                new Vector3( s,  s,  s), // 6: right-top-front
+                new Vector3(-s,  s,  s)  // 7: left-top-front
+            };
+            
+            // Calculate smooth normals by averaging face normals at each vertex
+            var normals = new Vector3[8];
+            
+            // Each vertex normal is the average of its adjacent face normals
+            normals[0] = new Vector3(-1, -1, -1).Normalize(); // left + bottom + back
+            normals[1] = new Vector3( 1, -1, -1).Normalize(); // right + bottom + back
+            normals[2] = new Vector3( 1,  1, -1).Normalize(); // right + top + back
+            normals[3] = new Vector3(-1,  1, -1).Normalize(); // left + top + back
+            normals[4] = new Vector3(-1, -1,  1).Normalize(); // left + bottom + front
+            normals[5] = new Vector3( 1, -1,  1).Normalize(); // right + bottom + front
+            normals[6] = new Vector3( 1,  1,  1).Normalize(); // right + top + front
+            normals[7] = new Vector3(-1,  1,  1).Normalize(); // left + top + front
+            
+            // Texture coordinates for each vertex
+            var texCoords = new Vector2[]
+            {
+                new Vector2(0, 0), new Vector2(1, 0), new Vector2(1, 1), new Vector2(0, 1),
+                new Vector2(0, 0), new Vector2(1, 0), new Vector2(1, 1), new Vector2(0, 1)
+            };
+            
+            // Pack into vertex array (position + normal + texcoord = 8 floats per vertex)
+            var vertices = new float[8 * 8];
+            for (int i = 0; i < 8; i++)
+            {
+                int offset = i * 8;
+                vertices[offset + 0] = positions[i].X;
+                vertices[offset + 1] = positions[i].Y;
+                vertices[offset + 2] = positions[i].Z;
+                vertices[offset + 3] = normals[i].X;
+                vertices[offset + 4] = normals[i].Y;
+                vertices[offset + 5] = normals[i].Z;
+                vertices[offset + 6] = texCoords[i].X;
+                vertices[offset + 7] = texCoords[i].Y;
+            }
+            
+            // Indices for the 12 triangles (6 faces * 2 triangles each)
+            var indices = new uint[]
+            {
+                // Front face (z = +s)
+                4, 5, 6,  4, 6, 7,
+                
+                // Back face (z = -s)
+                1, 0, 3,  1, 3, 2,
+                
+                // Top face (y = +s)
+                3, 7, 6,  3, 6, 2,
+                
+                // Bottom face (y = -s)
+                0, 1, 5,  0, 5, 4,
+                
+                // Right face (x = +s)
+                1, 2, 6,  1, 6, 5,
+                
+                // Left face (x = -s)
+                0, 4, 7,  0, 7, 3
+            };
+            
             return (vertices, indices);
         }
 

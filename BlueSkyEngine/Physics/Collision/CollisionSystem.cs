@@ -276,6 +276,7 @@ public class SpatialHash
     
     public List<Collider> Query(AABB bounds)
     {
+        var seen = new HashSet<Guid>();
         var result = new List<Collider>();
         var minCell = WorldToCell(bounds.Min);
         var maxCell = WorldToCell(bounds.Max);
@@ -289,7 +290,11 @@ public class SpatialHash
                     var key = (x, y, z);
                     if (_cells.TryGetValue(key, out var cell))
                     {
-                        result.AddRange(cell);
+                        foreach (var collider in cell)
+                        {
+                            if (seen.Add(collider.Id))
+                                result.Add(collider);
+                        }
                     }
                 }
             }

@@ -16,7 +16,7 @@ namespace BlueSky.Physics;
 /// </summary>
 public class PhysicsWorld : IDisposable
 {
-    private PhysicsSystem? _physicsSystem;
+    private JoltPhysicsSharp.PhysicsSystem? _physicsSystem;
     private BodyInterface? _bodyInterface;
     private readonly Dictionary<Entity, BodyID> _entityToBody = new();
     private readonly Dictionary<BodyID, Entity> _bodyToEntity = new();
@@ -56,7 +56,7 @@ public class PhysicsWorld : IDisposable
                     new ObjectLayerPairFilterTable(2), 2)
             };
 
-            _physicsSystem = new PhysicsSystem();
+            _physicsSystem = new JoltPhysicsSharp.PhysicsSystem();
             _physicsSystem.Init(settings);
             _physicsSystem.Gravity = new System.Numerics.Vector3(Gravity.X, Gravity.Y, Gravity.Z);
 
@@ -300,6 +300,8 @@ public class PhysicsWorld : IDisposable
     }
 }
 
+#endif
+
 /// <summary>
 /// Object layers for broad-phase collision filtering.
 /// </summary>
@@ -316,5 +318,3 @@ public struct RaycastHit
     public float Distance;
     public Entity Entity;
 }
-
-#endif

@@ -6,8 +6,6 @@ namespace NotBSRenderer;
 
 public static class RHIDiscovery
 {
-    private const uint D3D_SDK_VERSION = 32;
-
     public static RHIBackend DiscoverBestBackend()
     {
         if (OperatingSystem.IsMacOS())
@@ -19,8 +17,9 @@ public static class RHIDiscovery
 
         if (OperatingSystem.IsWindows())
         {
-            // DirectX 9 is the only implemented DirectX backend
-            if (IsDirectX9Supported()) return RHIBackend.DirectX9;
+            // Prefer DX12 > DX11 > Vulkan > OpenGL
+            if (IsDirectX12Supported()) return RHIBackend.DirectX12;
+            if (IsDirectX11Supported()) return RHIBackend.DirectX11;
             if (IsVulkanSupported()) return RHIBackend.Vulkan;
             return RHIBackend.OpenGL;
         }
@@ -53,15 +52,14 @@ public static class RHIDiscovery
         return false;
     }
 
-    public static bool IsDirectX11Supported()
+    public static bool IsDirectX12Supported()
     {
         if (!OperatingSystem.IsWindows()) return false;
         try
         {
-            // Simple check: can we load d3d11.dll and find D3D11CreateDevice?
-            IntPtr lib = NativeLibrary.Load("d3d11.dll");
+            IntPtr lib = NativeLibrary.Load("d3d12.dll");
             if (lib == IntPtr.Zero) return false;
-            IntPtr proc = NativeLibrary.GetExport(lib, "D3D11CreateDevice");
+            IntPtr proc = NativeLibrary.GetExport(lib, "D3D12CreateDevice");
             NativeLibrary.Free(lib);
             return proc != IntPtr.Zero;
         }
@@ -69,32 +67,16 @@ public static class RHIDiscovery
         return false;
     }
 
-    public static bool IsDirectX10Supported()
+    public static bool IsDirectX11Supported()
     {
         if (!OperatingSystem.IsWindows()) return false;
         try
         {
-            IntPtr lib = NativeLibrary.Load("d3d10.dll");
+            IntPtr lib = NativeLibrary.Load("d3d11.dll");
             if (lib == IntPtr.Zero) return false;
+            IntPtr proc = NativeLibrary.GetExport(lib, "D3D11CreateDevice");
             NativeLibrary.Free(lib);
-            return true;
-        }
-        catch { }
-        return false;
-    }
-
-    public static bool IsDirectX9Supported()
-    {
-        if (!OperatingSystem.IsWindows()) return false;
-        try
-        {
-            var d3d = Direct3DCreate9(D3D_SDK_VERSION);
-            if (d3d != IntPtr.Zero)
-            {
-                // In D3D9, we should Release the interface
-                // For a headless check, creation is enough.
-                return true;
-            }
+            return proc != IntPtr.Zero;
         }
         catch { }
         return false;
@@ -135,7 +117,4 @@ public static class RHIDiscovery
 
     [DllImport("/System/Library/Frameworks/Metal.framework/Metal")]
     private static extern IntPtr MTLCreateSystemDefaultDevice();
-
-    [DllImport("d3d9.dll")]
-    private static extern IntPtr Direct3DCreate9(uint sdkVersion);
 }

@@ -310,4 +310,60 @@ public class D3D9CommandBuffer : IRHICommandBuffer
     
     [System.Runtime.InteropServices.UnmanagedFunctionPointer(System.Runtime.InteropServices.CallingConvention.StdCall)]
     private delegate int SetPixelShaderConstantF_RawDelegate(IntPtr device, uint startRegister, IntPtr data, uint vector4fCount);
+    
+    // Phase 2/3 additions - stub implementations (DX9 doesn't support these features)
+    public void SetStorageBuffer(IRHIBuffer buffer, uint binding, uint set = 0)
+    {
+        // DX9 doesn't support storage buffers
+    }
+    
+    public void SetStorageTexture(IRHITexture texture, uint binding, uint set = 0)
+    {
+        // DX9 doesn't support storage textures
+    }
+    
+    public void SetBindlessResourceTable(uint set, ReadOnlySpan<BindlessResourceHandle> handles)
+    {
+        // DX9 doesn't support bindless resources
+    }
+    
+    public void SetComputeUniforms(uint binding, ReadOnlySpan<byte> data)
+    {
+        // DX9 doesn't support compute shaders
+    }
+    
+    public void DrawIndirect(IRHIBuffer buffer, ulong offset, uint drawCount, uint stride)
+    {
+        throw new NotSupportedException("DX9 doesn't support indirect drawing");
+    }
+    
+    public void DrawIndexedIndirect(IRHIBuffer buffer, ulong offset, uint drawCount, uint stride)
+    {
+        throw new NotSupportedException("DX9 doesn't support indirect drawing");
+    }
+    
+    public void Dispatch(uint groupCountX, uint groupCountY, uint groupCountZ)
+    {
+        throw new NotSupportedException("DX9 doesn't support compute shaders");
+    }
+    
+    public void DispatchIndirect(IRHIBuffer buffer, ulong offset)
+    {
+        throw new NotSupportedException("DX9 doesn't support compute shaders");
+    }
+    
+    public void MemoryBarrier()
+    {
+        // No-op for DX9
+    }
+    
+    public void BufferBarrier(IRHIBuffer buffer)
+    {
+        // No-op for DX9
+    }
+    
+    public void TextureBarrier(IRHITexture texture)
+    {
+        // No-op for DX9
+    }
 }

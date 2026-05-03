@@ -47,6 +47,8 @@ public static class ModernTheme
     public static readonly Vector4 Green = new(0.35f, 0.90f, 0.55f, 1f);
     public static readonly Vector4 GreenGlow = new(0.35f, 0.90f, 0.55f, 0.15f);
     
+    public static readonly Vector4 Blue = new(0.40f, 0.75f, 1.00f, 1f);
+    
     public static readonly Vector4 Orange = new(1.00f, 0.65f, 0.30f, 1f);
     public static readonly Vector4 OrangeGlow = new(1.00f, 0.65f, 0.30f, 0.15f);
     
@@ -158,5 +160,15 @@ public static class ModernTheme
             MathF.Min(1f, color.Z + intensity),
             color.W
         );
+    }
+    
+    // Convert Vector4 to uint color (RGBA)
+    public static uint ToUInt(Vector4 color)
+    {
+        byte r = (byte)(color.X * 255f);
+        byte g = (byte)(color.Y * 255f);
+        byte b = (byte)(color.Z * 255f);
+        byte a = (byte)(color.W * 255f);
+        return (uint)((a << 24) | (b << 16) | (g << 8) | r);
     }
 }

@@ -132,6 +132,12 @@ public struct GraphicsPipelineDesc
     public string? DebugName;
 }
 
+public struct ComputePipelineDesc
+{
+    public ShaderDesc ComputeShader;
+    public string? DebugName;
+}
+
 public struct Viewport
 {
     public float X;
@@ -174,4 +180,50 @@ public struct ClearValue
     {
         LoadInsteadOfClear = true
     };
+}
+
+/// <summary>
+/// Descriptor for bindless resource handle
+/// </summary>
+public struct BindlessResourceHandle
+{
+    public uint Index;
+    public uint Generation;
+    
+    public bool IsValid => Index != uint.MaxValue;
+    
+    public static BindlessResourceHandle Invalid => new() { Index = uint.MaxValue, Generation = 0 };
+}
+
+/// <summary>
+/// Dispatch parameters for compute shaders
+/// </summary>
+public struct ComputeDispatchDesc
+{
+    public uint GroupCountX;
+    public uint GroupCountY;
+    public uint GroupCountZ;
+}
+
+/// <summary>
+/// Indirect draw command structure
+/// </summary>
+public struct IndirectDrawCommand
+{
+    public uint VertexCount;
+    public uint InstanceCount;
+    public uint FirstVertex;
+    public uint FirstInstance;
+}
+
+/// <summary>
+/// Indirect indexed draw command structure
+/// </summary>
+public struct IndirectDrawIndexedCommand
+{
+    public uint IndexCount;
+    public uint InstanceCount;
+    public uint FirstIndex;
+    public int VertexOffset;
+    public uint FirstInstance;
 }

@@ -1,160 +1,126 @@
+/*
+ * StaticMeshComponent — ECS component for static mesh rendering.
+ *
+ * DESIGN CONSTRAINTS:
+ *   - Must be an unmanaged struct so the ECS archetype system can store it in
+ *     contiguous blobs without GC pressure.
+ *   - Fixed char arrays give us inline string storage with zero heap allocation
+ *     during iteration.
+ *
+ * MATERIAL SLOT STRATEGY:
+ *   - Slots 0-7 are stored inline in this struct (PathCapacity chars each).
+ *   - Slots 8+ cannot fit here without blowing the struct size past what the ECS
+ *     chunk allocator can handle.  They are stored in the mesh asset's metadata
+ *     and resolved at render time via MeshGPUData.MaterialSlotPaths (cached once
+ *     on first GPU upload, zero per-frame cost).
+ *
+ * PATH CAPACITY:
+ *   - 320 chars covers the longest realistic absolute path on macOS/Windows
+ *     (260-char Windows MAX_PATH + some headroom).
+ *   - If a path is still too long we log a hard warning — silent truncation was
+ *     the root cause of the "black car" bug.
+ */
+
 using System;
 
 namespace BlueSky.Core.ECS.Builtin
 {
-    /// <summary>
-    /// Material slot reference - maps a material asset to a specific slot index.
-    /// Slots correspond to material indices assigned in Blender/other DCC tools.
-    /// </summary>
-    public unsafe struct MaterialSlot
-    {
-        private fixed char _materialAssetId[128];
-        private int _slotIndex;
-        
-        public string MaterialAssetId
-        {
-            get
-            {
-                fixed (char* ptr = _materialAssetId)
-                {
-                    return new string(ptr).TrimEnd('\0');
-                }
-            }
-            set
-            {
-                value ??= string.Empty;
-                int length = System.Math.Min(127, value.Length);
-                for (int i = 0; i < length; i++)
-                {
-                    _materialAssetId[i] = value[i];
-                }
-                _materialAssetId[length] = '\0';
-            }
-        }
-        
-        public int SlotIndex
-        {
-            get => _slotIndex;
-            set => _slotIndex = value;
-        }
-        
-        public bool IsEmpty => string.IsNullOrEmpty(MaterialAssetId);
-    }
-
     public unsafe struct StaticMeshComponent
     {
-        private fixed char _meshAssetId[128];
-        private fixed char _materialAssetId[128]; // Legacy single material support
-        
-        // Material slots - up to 8 materials per mesh (Blender supports many, we limit to 8 for perf)
-        private fixed char _materialSlot0[128];
-        private fixed char _materialSlot1[128];
-        private fixed char _materialSlot2[128];
-        private fixed char _materialSlot3[128];
-        private fixed char _materialSlot4[128];
-        private fixed char _materialSlot5[128];
-        private fixed char _materialSlot6[128];
-        private fixed char _materialSlot7[128];
-        private int _slotCount;
-        
+        // ── Constants ────────────────────────────────────────────────────────
+        private const int PathCapacity = 320;   // chars per path (covers Windows MAX_PATH + headroom)
+        private const int MaxInlineSlots = 8;   // slots stored inline; 8+ live in asset metadata
+
+        // ── Storage ──────────────────────────────────────────────────────────
+        private fixed char _meshAssetId[PathCapacity];
+        private fixed char _legacyMaterialId[PathCapacity]; // kept for scene-file back-compat
+        private fixed char _slots[MaxInlineSlots * PathCapacity];
+        private int        _inlineSlotCount;    // highest slot index written + 1
+
+        // ── MeshAssetId ──────────────────────────────────────────────────────
         public string MeshAssetId
         {
-            get
-            {
-                fixed (char* ptr = _meshAssetId)
-                {
-                    return new string(ptr).TrimEnd('\0');
-                }
-            }
-            set
-            {
-                value ??= string.Empty;
-                int length = System.Math.Min(127, value.Length);
-                for (int i = 0; i < length; i++)
-                {
-                    _meshAssetId[i] = value[i];
-                }
-                _meshAssetId[length] = '\0';
-            }
+            get { fixed (char* p = _meshAssetId) return ReadFixed(p, PathCapacity); }
+            set { fixed (char* p = _meshAssetId) WriteFixed(p, PathCapacity, value, nameof(MeshAssetId)); }
         }
-        
+
+        // ── IsStatic ─────────────────────────────────────────────────────────
+        public bool IsStatic { get; set; }
+
+        // ── Legacy single-material (back-compat) ─────────────────────────────
         /// <summary>
-        /// Legacy single material. Returns first slot material or empty if none assigned.
+        /// Legacy single-material field kept for old scene files.
+        /// Setting this also writes slot 0 so new code sees it.
         /// </summary>
         public string MaterialAssetId
         {
-            get
-            {
-                fixed (char* ptr = _materialAssetId)
-                {
-                    return new string(ptr).TrimEnd('\0');
-                }
-            }
+            get { fixed (char* p = _legacyMaterialId) return ReadFixed(p, PathCapacity); }
             set
             {
-                value ??= string.Empty;
-                int length = System.Math.Min(127, value.Length);
-                for (int i = 0; i < length; i++)
-                {
-                    _materialAssetId[i] = value[i];
-                }
-                _materialAssetId[length] = '\0';
-                
-                // Also set as first slot for consistency
-                SetMaterialSlot(0, value);
+                fixed (char* p = _legacyMaterialId) WriteFixed(p, PathCapacity, value, nameof(MaterialAssetId));
+                SetMaterialSlot(0, value ?? string.Empty);
             }
         }
-        
+
+        // ── Per-slot API ─────────────────────────────────────────────────────
         /// <summary>
-        /// Get material asset ID for a specific slot. Returns empty string if slot is unassigned.
+        /// Returns the material asset path for <paramref name="slotIndex"/>.
+        /// Returns <see cref="string.Empty"/> for out-of-range or unassigned slots.
+        /// Slots ≥ 8 are NOT stored here — the renderer reads them from
+        /// <c>MeshGPUData.MaterialSlotPaths</c>.
         /// </summary>
         public string GetMaterialSlot(int slotIndex)
         {
-            if (slotIndex < 0 || slotIndex >= 8) return string.Empty;
-            
-            fixed (char* ptr0 = _materialSlot0)
-            {
-                char* ptr = ptr0 + slotIndex * 128;
-                return new string(ptr).TrimEnd('\0');
-            }
+            if ((uint)slotIndex >= MaxInlineSlots) return string.Empty;
+            fixed (char* p0 = _slots)
+                return ReadFixed(p0 + slotIndex * PathCapacity, PathCapacity);
         }
-        
+
         /// <summary>
-        /// Set material asset ID for a specific slot index.
+        /// Assigns a material asset path to <paramref name="slotIndex"/>.
+        /// Silently ignores slots ≥ 8 (those are handled via asset metadata).
         /// </summary>
-        public void SetMaterialSlot(int slotIndex, string materialAssetId)
+        public void SetMaterialSlot(int slotIndex, string path)
         {
-            if (slotIndex < 0 || slotIndex >= 8) return;
-            
-            materialAssetId ??= string.Empty;
-            int length = System.Math.Min(127, materialAssetId.Length);
-            
-            fixed (char* ptr0 = _materialSlot0)
-            {
-                char* ptr = ptr0 + slotIndex * 128;
-                for (int i = 0; i < length; i++)
-                {
-                    ptr[i] = materialAssetId[i];
-                }
-                ptr[length] = '\0';
-            }
-            
-            _slotCount = System.Math.Max(_slotCount, slotIndex + 1);
+            if ((uint)slotIndex >= MaxInlineSlots) return;
+            fixed (char* p0 = _slots)
+                WriteFixed(p0 + slotIndex * PathCapacity, PathCapacity, path, $"slot[{slotIndex}]");
+            _inlineSlotCount = System.Math.Max(_inlineSlotCount, slotIndex + 1);
         }
-        
+
+        /// <summary>Number of inline slots that have been written (0-8).</summary>
+        public int InlineSlotCount => _inlineSlotCount;
+
         /// <summary>
-        /// Number of material slots that have been assigned.
+        /// Returns the material path for <paramref name="slotIndex"/>, or
+        /// <see cref="string.Empty"/> if unassigned.
         /// </summary>
-        public int SlotCount => _slotCount;
-        
-        /// <summary>
-        /// Get the effective material for a slot index.
-        /// If the slot is empty, returns empty string (renderer will use default white).
-        /// </summary>
-        public string GetEffectiveMaterial(int slotIndex)
+        public string GetEffectiveMaterial(int slotIndex) => GetMaterialSlot(slotIndex);
+
+        // ── Helpers ──────────────────────────────────────────────────────────
+        /// <summary>Read a null-terminated string from a fixed char buffer.</summary>
+        private static string ReadFixed(char* ptr, int capacity)
         {
-            var material = GetMaterialSlot(slotIndex);
-            return material; // Empty means use default white material
+            // Find null terminator manually — avoids allocating a full-capacity string
+            int len = 0;
+            while (len < capacity && ptr[len] != '\0') len++;
+            return len == 0 ? string.Empty : new string(ptr, 0, len);
+        }
+
+        /// <summary>Write a string into a fixed char buffer, null-terminating it.</summary>
+        private static void WriteFixed(char* ptr, int capacity, string? value, string fieldName)
+        {
+            value ??= string.Empty;
+            int len = value.Length;
+            if (len >= capacity)
+            {
+                Console.WriteLine(
+                    $"[StaticMeshComponent] PATH TOO LONG for '{fieldName}' " +
+                    $"({len} chars, max {capacity - 1}). Truncating: {value}");
+                len = capacity - 1;
+            }
+            for (int i = 0; i < len; i++) ptr[i] = value[i];
+            ptr[len] = '\0';
         }
     }
 }

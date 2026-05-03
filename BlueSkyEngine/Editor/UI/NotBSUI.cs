@@ -15,8 +15,12 @@ public class NotBSUI
         public Vector2 Position;
         public Vector2 Size;
         public Vector4 Color;
+        public Vector4 ColorEnd;       // End color for gradients
         public string? Text;
         public float Radius;
+        public float CornerRadius;     // Corner radius for rounded rects
+        public bool GradientVertical;  // true = top-to-bottom, false = left-to-right
+        public Vector4? ClipRect;      // Optional clip rect (x, y, width, height) for scissoring
     }
 
     public enum DrawCommandType
@@ -26,7 +30,10 @@ public class NotBSUI
         Circle,
         CircleFilled,
         Text,
-        Line
+        Line,
+        GradientRectFilled,
+        RoundedRectFilled,
+        RoundedGradientRectFilled
     }
 
     private readonly List<DrawCommand> _drawCommands = new();
@@ -44,10 +51,23 @@ public class NotBSUI
     private bool _mouseReleased;
     private string _typedText = "";
     private bool _backspacePressed;
+    private float _scrollDelta;
+    private Dictionary<string, float> _scrollOffsets = new();
+    private Dictionary<string, float> _scrollTargets = new();  // Smooth scroll targets
+    private Stack<Vector4> _clipRectStack = new();               // Clip rect stack
+    private Vector4? _activeClipRect = null;                    // Current active clip rect
+    
+    // Scrollbar drag state
+    private string? _draggingScrollbar = null;
+    private float _scrollbarDragStartY;
+    private float _scrollbarDragStartOffset;
 
     public bool IsMouseDown => _mouseDown;
     public Vector2 MousePosition => _mousePos;
     public double Time { get; set; }
+    
+    // Allows disabling input interactions for the UI (useful for modals)
+    public bool InputEnabled { get; set; } = true;
 
     public NotBSUI(uint windowWidth, uint windowHeight)
     {
@@ -59,7 +79,7 @@ public class NotBSUI
         _windowSize = new Vector2(width, height);
     }
 
-    public void BeginFrame(Vector2 mousePos, bool mouseDown, string typedText = "", bool backspacePressed = false)
+    public void BeginFrame(Vector2 mousePos, bool mouseDown, string typedText = "", bool backspacePressed = false, float scrollDelta = 0f)
     {
         _drawCommands.Clear();
         _idCounter = 0;
@@ -67,6 +87,7 @@ public class NotBSUI
         
         _typedText = typedText ?? "";
         _backspacePressed = backspacePressed;
+        _scrollDelta = scrollDelta;
 
         _mousePressed = mouseDown && !_mouseDown;
         _mouseReleased = !mouseDown && _mouseDown;
@@ -92,6 +113,132 @@ public class NotBSUI
     {
         _cursorPos = new Vector2(x, y);
     }
+    
+    public Vector2 GetCursor() => _cursorPos;
+
+    public float BeginScrollArea(string id, float x, float y, float width, float height, float contentHeight)
+    {
+        if (!_scrollOffsets.TryGetValue(id, out float scroll)) scroll = 0;
+        if (!_scrollTargets.TryGetValue(id, out float scrollTarget)) scrollTarget = scroll;
+
+        float maxScroll = Math.Max(0, contentHeight - height);
+
+        // Handle scrollbar dragging
+        if (_draggingScrollbar == id)
+        {
+            if (_mouseDown)
+            {
+                float trackHeight = height;
+                float thumbHeight = Math.Max(20f, height * (height / Math.Max(1f, contentHeight)));
+                float scrollRange = trackHeight - thumbHeight;
+                if (scrollRange > 0)
+                {
+                    float deltaY = _mousePos.Y - _scrollbarDragStartY;
+                    float newScroll = _scrollbarDragStartOffset + (deltaY / scrollRange) * maxScroll;
+                    scrollTarget = Math.Clamp(newScroll, 0, maxScroll);
+                }
+            }
+            else
+            {
+                _draggingScrollbar = null;
+            }
+        }
+
+        // Mouse wheel scrolling
+        if (IsHovering(x, y, width, height) && _draggingScrollbar == null)
+        {
+            if (Math.Abs(_scrollDelta) > 0.001f)
+            {
+                scrollTarget -= _scrollDelta * 60f;
+                scrollTarget = Math.Clamp(scrollTarget, 0, maxScroll);
+            }
+        }
+        _scrollTargets[id] = scrollTarget;
+
+        // Smooth scroll interpolation (lerp towards target)
+        float lerpSpeed = 12f; // Higher = snappier
+        float dt = 1f / 60f;  // Approximate frame time
+        scroll = scroll + (scrollTarget - scroll) * Math.Min(1f, lerpSpeed * dt);
+        // Snap if very close
+        if (Math.Abs(scroll - scrollTarget) < 0.5f) scroll = scrollTarget;
+        scroll = Math.Clamp(scroll, 0, maxScroll);
+        _scrollOffsets[id] = scroll;
+
+        // Push clip rect for this scroll area
+        var clipRect = new Vector4(x, y, width, height);
+        _clipRectStack.Push(clipRect);
+        _activeClipRect = clipRect;
+
+        // Draw scrollbar
+        if (maxScroll > 0)
+        {
+            float trackWidth = 8f;
+            float trackX = x + width - trackWidth;
+            
+            // Scrollbar track background
+            _drawCommands.Add(new DrawCommand
+            {
+                Type = DrawCommandType.RoundedRectFilled,
+                Position = new Vector2(trackX, y),
+                Size = new Vector2(trackWidth, height),
+                Color = new Vector4(0.15f, 0.15f, 0.18f, 0.5f),
+                CornerRadius = 4f
+            });
+            
+            // Scrollbar thumb
+            float thumbHeight = Math.Max(20f, height * (height / contentHeight));
+            float scrollPct = maxScroll > 0 ? scroll / maxScroll : 0;
+            float thumbY = y + scrollPct * (height - thumbHeight);
+            
+            bool isThumbHovered = IsHovering(trackX, thumbY, trackWidth, thumbHeight);
+            bool isThumbActive = _draggingScrollbar == id;
+            var thumbColor = isThumbActive ? new Vector4(0.6f, 0.6f, 0.7f, 0.95f) :
+                             isThumbHovered ? new Vector4(0.5f, 0.5f, 0.6f, 0.9f) :
+                             new Vector4(0.4f, 0.4f, 0.45f, 0.8f);
+            
+            _drawCommands.Add(new DrawCommand
+            {
+                Type = DrawCommandType.RoundedRectFilled,
+                Position = new Vector2(trackX, thumbY),
+                Size = new Vector2(trackWidth, thumbHeight),
+                Color = thumbColor,
+                CornerRadius = 4f
+            });
+            
+            // Scrollbar drag interaction
+            if (isThumbHovered && _mousePressed && _draggingScrollbar == null)
+            {
+                _draggingScrollbar = id;
+                _scrollbarDragStartY = _mousePos.Y;
+                _scrollbarDragStartOffset = scroll;
+            }
+            // Click on track to jump
+            else if (IsHovering(trackX, y, trackWidth, height) && _mousePressed && !isThumbHovered && _draggingScrollbar == null)
+            {
+                float clickPct = (_mousePos.Y - y) / height;
+                _scrollTargets[id] = Math.Clamp(clickPct * maxScroll, 0, maxScroll);
+            }
+        }
+
+        // We shift the cursor up by scroll
+        _cursorPos.Y -= scroll;
+        return scroll;
+    }
+
+    public void EndScrollArea(string id)
+    {
+        // Pop clip rect
+        if (_clipRectStack.Count > 0)
+        {
+            _clipRectStack.Pop();
+            _activeClipRect = _clipRectStack.Count > 0 ? _clipRectStack.Peek() : null;
+        }
+        
+        if (_scrollOffsets.TryGetValue(id, out float scroll))
+        {
+            _cursorPos.Y += scroll;
+        }
+    }
 
     public void Text(string text, Vector4 color)
     {
@@ -100,7 +247,8 @@ public class NotBSUI
             Type = DrawCommandType.Text,
             Position = _cursorPos,
             Color = color,
-            Text = text
+            Text = text,
+            ClipRect = _activeClipRect
         });
 
         _cursorPos.Y += 20; // Line height
@@ -194,39 +342,35 @@ public class NotBSUI
         // Draw slider track
         _drawCommands.Add(new DrawCommand
         {
-            Type = DrawCommandType.RectFilled,
+            Type = DrawCommandType.RoundedRectFilled,
             Position = pos,
             Size = size,
-            Color = new Vector4(0.15f, 0.15f, 0.16f, 1.0f)
+            Color = new Vector4(0.051f, 0.055f, 0.071f, 1.0f), // EditorTheme.Bg0
+            CornerRadius = 4f
         });
 
         // Draw filled portion
         float fillWidth = ((value - min) / (max - min)) * width;
+        if (fillWidth > 2)
+        {
+            _drawCommands.Add(new DrawCommand
+            {
+                Type = DrawCommandType.RoundedRectFilled,
+                Position = pos,
+                Size = new Vector2(fillWidth, height),
+                Color = isActive ? new Vector4(0.38f, 0.70f, 1.00f, 1.0f) : new Vector4(0.29f, 0.62f, 1.00f, 1.0f), // Accent
+                CornerRadius = 4f
+            });
+        }
+        
+        // Value text
+        string valText = value.ToString("0.00");
         _drawCommands.Add(new DrawCommand
         {
-            Type = DrawCommandType.RectFilled,
-            Position = pos,
-            Size = new Vector2(fillWidth, height),
-            Color = new Vector4(0.3f, 0.5f, 0.7f, 1.0f)
-        });
-
-        // Draw handle
-        float handleX = pos.X + fillWidth - 4;
-        _drawCommands.Add(new DrawCommand
-        {
-            Type = DrawCommandType.RectFilled,
-            Position = new Vector2(handleX, pos.Y),
-            Size = new Vector2(8, height),
-            Color = isActive ? new Vector4(0.6f, 0.8f, 1.0f, 1.0f) : new Vector4(0.4f, 0.6f, 0.8f, 1.0f)
-        });
-
-        // Draw border
-        _drawCommands.Add(new DrawCommand
-        {
-            Type = DrawCommandType.Rect,
-            Position = pos,
-            Size = size,
-            Color = new Vector4(0.3f, 0.3f, 0.35f, 1.0f)
+            Type = DrawCommandType.Text,
+            Position = new Vector2(pos.X + width / 2 - valText.Length * 3.5f, pos.Y + height / 2 - 7),
+            Text = valText,
+            Color = new Vector4(1f, 1f, 1f, 0.8f) // TextPrimary
         });
 
         _cursorPos.Y += height + 10;
@@ -311,7 +455,8 @@ public class NotBSUI
             Type = DrawCommandType.RectFilled,
             Position = new Vector2(x, y),
             Size = new Vector2(width, height),
-            Color = color
+            Color = color,
+            ClipRect = _activeClipRect
         });
 
         if (borderColor.HasValue)
@@ -321,9 +466,63 @@ public class NotBSUI
                 Type = DrawCommandType.Rect,
                 Position = new Vector2(x, y),
                 Size = new Vector2(width, height),
-                Color = borderColor.Value
+                Color = borderColor.Value,
+                ClipRect = _activeClipRect
             });
         }
+    }
+
+    /// <summary>Draw a filled rectangle with a linear gradient (top-to-bottom or left-to-right).</summary>
+    public void GradientPanel(float x, float y, float width, float height,
+                              Vector4 colorStart, Vector4 colorEnd,
+                              bool vertical = true)
+    {
+        _drawCommands.Add(new DrawCommand
+        {
+            Type = DrawCommandType.GradientRectFilled,
+            Position = new Vector2(x, y),
+            Size = new Vector2(width, height),
+            Color = colorStart,
+            ColorEnd = colorEnd,
+            GradientVertical = vertical
+        });
+    }
+
+    /// <summary>Draw a filled rectangle with rounded corners.</summary>
+    public void RoundedPanel(float x, float y, float width, float height,
+                             Vector4 color, float cornerRadius = 6f)
+    {
+        if (cornerRadius < 0.5f)
+        {
+            // Fall back to regular panel for tiny radii
+            Panel(x, y, width, height, color);
+            return;
+        }
+        _drawCommands.Add(new DrawCommand
+        {
+            Type = DrawCommandType.RoundedRectFilled,
+            Position = new Vector2(x, y),
+            Size = new Vector2(width, height),
+            Color = color,
+            CornerRadius = cornerRadius
+        });
+    }
+
+    /// <summary>Draw a rounded rectangle with a linear gradient fill.</summary>
+    public void RoundedGradientPanel(float x, float y, float width, float height,
+                                     Vector4 colorStart, Vector4 colorEnd,
+                                     float cornerRadius = 6f, bool vertical = true)
+    {
+        _drawCommands.Add(new DrawCommand
+        {
+            Type = DrawCommandType.RoundedGradientRectFilled,
+            Position = new Vector2(x, y),
+            Size = new Vector2(width, height),
+            Color = colorStart,
+            ColorEnd = colorEnd,
+            CornerRadius = cornerRadius,
+            GradientVertical = vertical
+        });
     }
 
     // Shadow effect: draws a dark offset rectangle behind
@@ -373,43 +572,37 @@ public class NotBSUI
             bgColor = hoverColor;
         }
         
-        // Draw shadow first (behind)
-        if (shadowAlpha > 0.01f)
-        {
-            _drawCommands.Add(new DrawCommand
-            {
-                Type = DrawCommandType.RectFilled,
-                Position = new Vector2(x + 2, y + 2),
-                Size = size,
-                Color = new Vector4(shadowColor.X, shadowColor.Y, shadowColor.Z, shadowAlpha)
-            });
-        }
+        // Shadow removed to fix rendering bleeding artifact        
+        // Draw button background (gradient for depth)
+        Vector4 bgTop = new Vector4(
+            Math.Min(1f, bgColor.X + 0.05f),
+            Math.Min(1f, bgColor.Y + 0.05f),
+            Math.Min(1f, bgColor.Z + 0.05f),
+            bgColor.W);
         
-        // Draw button background
+        Vector4 bgBottom = new Vector4(
+            Math.Max(0f, bgColor.X - 0.05f),
+            Math.Max(0f, bgColor.Y - 0.05f),
+            Math.Max(0f, bgColor.Z - 0.05f),
+            bgColor.W);
+
+        if (isActive) {
+            // Invert gradient when pressed
+            var temp = bgTop;
+            bgTop = bgBottom;
+            bgBottom = temp;
+        }
+
         _drawCommands.Add(new DrawCommand
         {
-            Type = DrawCommandType.RectFilled,
+            Type = DrawCommandType.RoundedGradientRectFilled,
             Position = pos,
             Size = size,
-            Color = bgColor
-        });
-        
-        // Draw subtle top highlight line
-        _drawCommands.Add(new DrawCommand
-        {
-            Type = DrawCommandType.RectFilled,
-            Position = new Vector2(pos.X, pos.Y),
-            Size = new Vector2(size.X, 1),
-            Color = new Vector4(1, 1, 1, isActive ? 0.05f : 0.15f)
-        });
-        
-        // Draw subtle bottom shadow line (inset effect)
-        _drawCommands.Add(new DrawCommand
-        {
-            Type = DrawCommandType.RectFilled,
-            Position = new Vector2(pos.X, pos.Y + size.Y - 1),
-            Size = new Vector2(size.X, 1),
-            Color = new Vector4(0, 0, 0, isActive ? 0.3f : 0.15f)
+            Color = bgTop,
+            ColorEnd = bgBottom,
+            CornerRadius = 6f,
+            GradientVertical = true,
+            ClipRect = _activeClipRect
         });
         
         // Draw text centered
@@ -422,7 +615,8 @@ public class NotBSUI
             Type = DrawCommandType.Text,
             Position = new Vector2(textX, textY),
             Color = textColor,
-            Text = text
+            Text = text,
+            ClipRect = _activeClipRect
         });
         
         return wasPressed;
@@ -453,31 +647,17 @@ public class NotBSUI
         else if (isHot)
             color = hoverColor;
         
-        // Shadow
-        _drawCommands.Add(new DrawCommand
-        {
-            Type = DrawCommandType.RectFilled,
-            Position = new Vector2(x + 1, y + 2),
-            Size = new Vector2(width, height),
-            Color = new Vector4(0, 0, 0, 0.3f)
-        });
+        // Shadow removed to fix rendering bleeding artifact
         
-        // Card
+        // Card body (rounded)
         _drawCommands.Add(new DrawCommand
         {
-            Type = DrawCommandType.RectFilled,
+            Type = DrawCommandType.RoundedRectFilled,
             Position = new Vector2(x, y),
             Size = new Vector2(width, height),
-            Color = color
-        });
-        
-        // Top highlight
-        _drawCommands.Add(new DrawCommand
-        {
-            Type = DrawCommandType.RectFilled,
-            Position = new Vector2(x, y),
-            Size = new Vector2(width, 1),
-            Color = new Vector4(1, 1, 1, isActive ? 0.05f : 0.1f)
+            Color = color,
+            CornerRadius = 6f,
+            ClipRect = _activeClipRect
         });
         
         return clicked;
@@ -507,6 +687,8 @@ public class NotBSUI
 
     private bool IsMouseOver(Vector2 pos, Vector2 size)
     {
+        if (!InputEnabled) return false;
+        
         return _mousePos.X >= pos.X && _mousePos.X <= pos.X + size.X &&
                _mousePos.Y >= pos.Y && _mousePos.Y <= pos.Y + size.Y;
     }

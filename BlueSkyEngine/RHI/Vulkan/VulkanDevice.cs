@@ -136,4 +136,12 @@ internal class VulkanDevice : IRHIDevice
         _disposed = true;
         Console.WriteLine("[Vulkan] Device disposed");
     }
+
+    // Phase 2/3 additions - stub implementations
+    public RHICapabilities Capabilities => RHICapabilities.ComputeShaders | RHICapabilities.BindlessResources | RHICapabilities.IndirectDrawing | RHICapabilities.MultiDrawIndirect | RHICapabilities.AsyncCompute;
+    public DescriptorBindingMode BindingMode => DescriptorBindingMode.Bindless;
+    public IRHIPipeline CreateComputePipeline(ComputePipelineDesc desc) { throw new NotImplementedException("Compute pipelines not yet implemented for Vulkan"); }
+    public BindlessResourceHandle RegisterBindlessTexture(IRHITexture texture) { return new BindlessResourceHandle { Index = 0, Generation = 0 }; }
+    public BindlessResourceHandle RegisterBindlessBuffer(IRHIBuffer buffer) { return new BindlessResourceHandle { Index = 0, Generation = 0 }; }
+    public void UnregisterBindlessResource(BindlessResourceHandle handle) { }
 }

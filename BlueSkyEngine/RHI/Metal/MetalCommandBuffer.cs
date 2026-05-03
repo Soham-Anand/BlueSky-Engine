@@ -390,4 +390,67 @@ internal class MetalCommandBuffer : IRHICommandBuffer
     {
         SetScissorNative(encoder, selector, new MTLScissorRect { x = (nuint)scissor.X, y = (nuint)scissor.Y, width = (nuint)scissor.Width, height = (nuint)scissor.Height });
     }
+    
+    // Phase 2/3 additions - stub implementations
+    public void SetStorageBuffer(IRHIBuffer buffer, uint binding, uint set = 0)
+    {
+        // TODO: Implement storage buffer binding for compute shaders
+        SetUniformBuffer(buffer, binding, set);
+    }
+    
+    public void SetStorageTexture(IRHITexture texture, uint binding, uint set = 0)
+    {
+        // TODO: Implement storage texture binding for compute shaders
+        SetTexture(texture, binding, set);
+    }
+    
+    public void SetBindlessResourceTable(uint set, ReadOnlySpan<BindlessResourceHandle> handles)
+    {
+        // TODO: Implement bindless resource table (Metal 3.0+)
+        // For now, resources are bound individually
+    }
+    
+    public void SetComputeUniforms(uint binding, ReadOnlySpan<byte> data)
+    {
+        // TODO: Implement compute shader uniforms
+    }
+    
+    public void DrawIndirect(IRHIBuffer buffer, ulong offset, uint drawCount, uint stride)
+    {
+        // TODO: Implement indirect drawing
+        throw new NotImplementedException("DrawIndirect not yet implemented for Metal");
+    }
+    
+    public void DrawIndexedIndirect(IRHIBuffer buffer, ulong offset, uint drawCount, uint stride)
+    {
+        // TODO: Implement indexed indirect drawing
+        throw new NotImplementedException("DrawIndexedIndirect not yet implemented for Metal");
+    }
+    
+    public void Dispatch(uint groupCountX, uint groupCountY, uint groupCountZ)
+    {
+        // TODO: Implement compute shader dispatch
+        throw new NotImplementedException("Compute shaders not yet implemented for Metal");
+    }
+    
+    public void DispatchIndirect(IRHIBuffer buffer, ulong offset)
+    {
+        // TODO: Implement indirect compute dispatch
+        throw new NotImplementedException("DispatchIndirect not yet implemented for Metal");
+    }
+    
+    public void MemoryBarrier()
+    {
+        // TODO: Implement memory barrier for compute shaders
+    }
+    
+    public void BufferBarrier(IRHIBuffer buffer)
+    {
+        // TODO: Implement buffer barrier
+    }
+    
+    public void TextureBarrier(IRHITexture texture)
+    {
+        // TODO: Implement texture barrier
+    }
 }

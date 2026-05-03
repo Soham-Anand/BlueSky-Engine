@@ -341,4 +341,12 @@ internal class D3D9Device : IRHIDevice
         _disposed = true;
         Console.WriteLine("[DX9] Device disposed");
     }
+
+    // Phase 2/3 additions - stub implementations (DX9 doesn't support these features)
+    public RHICapabilities Capabilities => RHICapabilities.None;
+    public DescriptorBindingMode BindingMode => DescriptorBindingMode.SlotBased;
+    public IRHIPipeline CreateComputePipeline(ComputePipelineDesc desc) { throw new NotSupportedException("DX9 doesn't support compute shaders"); }
+    public BindlessResourceHandle RegisterBindlessTexture(IRHITexture texture) { return BindlessResourceHandle.Invalid; }
+    public BindlessResourceHandle RegisterBindlessBuffer(IRHIBuffer buffer) { return BindlessResourceHandle.Invalid; }
+    public void UnregisterBindlessResource(BindlessResourceHandle handle) { }
 }

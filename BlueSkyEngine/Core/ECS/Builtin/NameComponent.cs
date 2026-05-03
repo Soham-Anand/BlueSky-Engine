@@ -20,15 +20,24 @@ namespace BlueSky.Core.ECS.Builtin
             }
         }
         
-        public NameComponent(string name) 
-        { 
+        public void SetName(string name)
+        {
             name ??= string.Empty;
             int length = System.Math.Min(63, name.Length);
-            for (int i = 0; i < length; i++)
+            fixed (char* ptr = _name)
             {
-                _name[i] = name[i];
+                for (int i = 0; i < length; i++)
+                {
+                    ptr[i] = name[i];
+                }
+                ptr[length] = '\0';
             }
-            _name[length] = '\0';
+        }
+        
+        public NameComponent(string name) 
+        { 
+            _name[0] = '\0'; // Initialize first char
+            SetName(name);
         }
         
         public static implicit operator NameComponent(string name) => new(name);

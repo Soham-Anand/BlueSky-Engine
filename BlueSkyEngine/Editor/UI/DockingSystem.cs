@@ -291,8 +291,10 @@ public class DockingSystem
 
         // ── Tab bar ──────────────────────────────────────────────
         ui.Panel(b.X, b.Y, b.W, tabH, EditorTheme.TabBarBg);
-        // Bottom border of tab bar
-        ui.Panel(b.X, b.Y + tabH - 1, b.W, 1, EditorTheme.Border0);
+        
+        // Bottom border of tab bar (skip for transparent panels like viewport)
+        if (!isTransparent)
+            ui.Panel(b.X, b.Y + tabH - 1, b.W, 1, EditorTheme.Border0);
 
         // ── Draw tabs ────────────────────────────────────────────
         float tabX = b.X + 4;

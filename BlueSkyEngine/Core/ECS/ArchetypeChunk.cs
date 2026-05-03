@@ -6,7 +6,7 @@ namespace BlueSky.Core.ECS
 {
     /// <summary>
     /// A contiguous chunk of memory storing components for entities with the same archetype.
-    /// Provides cache-friendly iteration and O(1) component access.
+    /// Provides cache-friendly iteration and O(1) component access using SOA (Structure of Arrays) layout.
     /// </summary>
     public sealed class ArchetypeChunk
     {
@@ -14,7 +14,7 @@ namespace BlueSky.Core.ECS
         
         private readonly ArchetypeType _archetype;
         private readonly int[] _componentSizes;
-        private readonly int[] _componentOffsets;
+        private readonly int[] _componentOffsets; // These are now offsets to the START of each component type array
         private readonly int _entitySize;
         private int _capacity;
         private int _count;
@@ -33,24 +33,31 @@ namespace BlueSky.Core.ECS
         {
             _archetype = archetype;
             
-            // Calculate component sizes and offsets
+            // Calculate component sizes
             int componentCount = archetype.ComponentCount;
             _componentSizes = new int[componentCount];
-            _componentOffsets = new int[componentCount];
+            _entitySize = 0;
             
-            int offset = 0;
             for (int i = 0; i < componentCount; i++)
             {
                 var type = archetype.ComponentTypes[i];
                 int size = Marshal.SizeOf(type);
                 _componentSizes[i] = size;
-                _componentOffsets[i] = offset;
-                offset += size;
+                _entitySize += size;
             }
             
-            _entitySize = offset;
             _capacity = ChunkSize / System.Math.Max(_entitySize, 1);
-            _data = new byte[_capacity * _entitySize];
+            _componentOffsets = new int[componentCount];
+            
+            // Calculate offsets for SOA (each component type has its own contiguous block)
+            int currentOffset = 0;
+            for (int i = 0; i < componentCount; i++)
+            {
+                _componentOffsets[i] = currentOffset;
+                currentOffset += _componentSizes[i] * _capacity;
+            }
+            
+            _data = new byte[currentOffset];
             _entities = new Entity[_capacity];
             _entityToRow = new int[1024]; // Will resize as needed
             
@@ -72,9 +79,12 @@ namespace BlueSky.Core.ECS
             EnsureEntityToRowCapacity(entity.Id);
             _entityToRow[entity.Id] = row;
             
-            // Zero-initialize components
-            int offset = row * _entitySize;
-            _data.AsSpan(offset, _entitySize).Clear();
+            // Zero-initialize components for this row across all arrays
+            for (int i = 0; i < _componentSizes.Length; i++)
+            {
+                int offset = _componentOffsets[i] + (row * _componentSizes[i]);
+                _data.AsSpan(offset, _componentSizes[i]).Clear();
+            }
             
             return row;
         }
@@ -98,10 +108,14 @@ namespace BlueSky.Core.ECS
                 _entities[row] = lastEntity;
                 _entityToRow[lastEntity.Id] = row;
                 
-                // Copy component data
-                int destOffset = row * _entitySize;
-                int srcOffset = lastRow * _entitySize;
-                _data.AsSpan(srcOffset, _entitySize).CopyTo(_data.AsSpan(destOffset));
+                // Copy component data for each type (swap last into current)
+                for (int i = 0; i < _componentSizes.Length; i++)
+                {
+                    int size = _componentSizes[i];
+                    int destOffset = _componentOffsets[i] + (row * size);
+                    int srcOffset = _componentOffsets[i] + (lastRow * size);
+                    _data.AsSpan(srcOffset, size).CopyTo(_data.AsSpan(destOffset, size));
+                }
             }
             
             _entityToRow[entity.Id] = -1;
@@ -129,7 +143,7 @@ namespace BlueSky.Core.ECS
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public unsafe ref T GetComponent<T>(int row, int componentIndex) where T : unmanaged
         {
-            int offset = row * _entitySize + _componentOffsets[componentIndex];
+            int offset = _componentOffsets[componentIndex] + (row * _componentSizes[componentIndex]);
             fixed (byte* ptr = &_data[offset])
             {
                 return ref *(T*)ptr;
@@ -142,7 +156,7 @@ namespace BlueSky.Core.ECS
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public unsafe void SetComponent<T>(int row, int componentIndex, T value) where T : unmanaged
         {
-            int offset = row * _entitySize + _componentOffsets[componentIndex];
+            int offset = _componentOffsets[componentIndex] + (row * _componentSizes[componentIndex]);
             fixed (byte* ptr = &_data[offset])
             {
                 *(T*)ptr = value;
@@ -162,8 +176,8 @@ namespace BlueSky.Core.ECS
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void CopyComponentRaw(int sourceRow, int sourceCompIndex, ArchetypeChunk destChunk, int destRow, int destCompIndex)
         {
-            int srcOffset = sourceRow * _entitySize + _componentOffsets[sourceCompIndex];
-            int dstOffset = destRow * destChunk._entitySize + destChunk._componentOffsets[destCompIndex];
+            int srcOffset = _componentOffsets[sourceCompIndex] + (sourceRow * _componentSizes[sourceCompIndex]);
+            int dstOffset = destChunk._componentOffsets[destCompIndex] + (destRow * destChunk._componentSizes[destCompIndex]);
             int size = _componentSizes[sourceCompIndex];
             
             _data.AsSpan(srcOffset, size).CopyTo(destChunk._data.AsSpan(dstOffset, size));
@@ -171,18 +185,14 @@ namespace BlueSky.Core.ECS
 
         /// <summary>
         /// Returns a span of all components of a specific type in this chunk.
-        /// Provides cache-friendly contiguous iteration.
+        /// Provides cache-friendly contiguous iteration for SIMD.
         /// </summary>
         public unsafe Span<T> GetComponentSpan<T>(int componentIndex) where T : unmanaged
         {
-            int size = _componentSizes[componentIndex];
             int offset = _componentOffsets[componentIndex];
-            
-            // This creates a view into the data - components are NOT contiguous
-            // For true SOA, we'd need a different layout
             fixed (byte* ptr = _data)
             {
-                return new Span<T>(ptr + offset, _count * _entitySize / size);
+                return new Span<T>(ptr + offset, _count);
             }
         }
 

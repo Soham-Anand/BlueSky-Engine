@@ -46,7 +46,7 @@ public class MaterialAsset
     [JsonPropertyName("ao")]
     public float AO { get; set; } = 1.0f;
     
-    // Texture references (asset IDs)
+    // Texture references (asset IDs — for future asset database integration)
     [JsonPropertyName("albedoTexture")]
     public Guid AlbedoTexture { get; set; } = Guid.Empty;
     
@@ -67,6 +67,26 @@ public class MaterialAsset
     
     [JsonPropertyName("rmaTexture")]
     public Guid RMATexture { get; set; } = Guid.Empty; // Packed RMA
+    
+    // Texture file paths — used by the renderer to load textures from disk.
+    // These take priority over GUID references for direct file-based workflows.
+    [JsonPropertyName("albedoTexturePath")]
+    public string AlbedoTexturePath { get; set; } = "";
+    
+    [JsonPropertyName("normalTexturePath")]
+    public string NormalTexturePath { get; set; } = "";
+    
+    [JsonPropertyName("rmaTexturePath")]
+    public string RMATexturePath { get; set; } = ""; // Packed Roughness/Metallic/AO
+    
+    [JsonPropertyName("metallicTexturePath")]
+    public string MetallicTexturePath { get; set; } = "";
+    
+    [JsonPropertyName("roughnessTexturePath")]
+    public string RoughnessTexturePath { get; set; } = "";
+    
+    [JsonPropertyName("opacityTexturePath")]
+    public string OpacityTexturePath { get; set; } = "";
     
     // Tiling and offset
     [JsonPropertyName("tiling")]
@@ -172,62 +192,137 @@ public class MaterialAsset
     {
         try
         {
+            Console.WriteLine($"[MaterialAsset] Loading material from: {path}");
+            
             if (!File.Exists(path))
+            {
+                Console.WriteLine($"[MaterialAsset] File not found: {path}");
                 return null;
+            }
             
             // Try loading as BlueAsset first
+            Console.WriteLine($"[MaterialAsset] Attempting to load as BlueAsset...");
             var blueAsset = BlueAsset.Load(path);
-            if (blueAsset != null && blueAsset.Type == AssetType.Material && blueAsset.HasPayload)
+            
+            if (blueAsset != null)
             {
-                // Deserialize material data from BlueAsset payload
-                return JsonSerializer.Deserialize<MaterialAsset>(blueAsset.PayloadData);
+                Console.WriteLine($"[MaterialAsset] BlueAsset loaded - Type: {blueAsset.Type}, HasPayload: {blueAsset.HasPayload}, PayloadSize: {blueAsset.PayloadData?.Length ?? 0}");
+                
+                if (blueAsset.Type == AssetType.Material && blueAsset.HasPayload)
+                {
+                    Console.WriteLine($"[MaterialAsset] Deserializing material from payload...");
+                    
+                    // Debug: print first few bytes of payload to see if it's valid JSON
+                    if (blueAsset.PayloadData != null && blueAsset.PayloadData.Length > 0)
+                    {
+                        var preview = System.Text.Encoding.UTF8.GetString(blueAsset.PayloadData, 0, System.Math.Min(200, blueAsset.PayloadData.Length));
+                        Console.WriteLine($"[MaterialAsset] Payload preview: {preview}");
+                    }
+                    
+                    var material = JsonSerializer.Deserialize<MaterialAsset>(blueAsset.PayloadData);
+                    Console.WriteLine($"[MaterialAsset] Deserialization {(material != null ? "SUCCESS" : "FAILED")}");
+                    return material;
+                }
+                else
+                {
+                    Console.WriteLine($"[MaterialAsset] Not a material asset or no payload - Type: {blueAsset.Type}, HasPayload: {blueAsset.HasPayload}");
+                }
+            }
+            else
+            {
+                Console.WriteLine($"[MaterialAsset] BlueAsset.Load returned null");
             }
             
             // Fallback: try loading as plain JSON (old format)
+            Console.WriteLine($"[MaterialAsset] Trying fallback as plain JSON...");
             var json = File.ReadAllText(path);
-            return JsonSerializer.Deserialize<MaterialAsset>(json);
+            Console.WriteLine($"[MaterialAsset] JSON length: {json.Length}");
+            
+            if (json.Length > 0)
+            {
+                var preview = json.Substring(0, System.Math.Min(200, json.Length));
+                Console.WriteLine($"[MaterialAsset] JSON preview: {preview}");
+            }
+            
+            var fallbackMaterial = JsonSerializer.Deserialize<MaterialAsset>(json);
+            Console.WriteLine($"[MaterialAsset] Fallback deserialization {(fallbackMaterial != null ? "SUCCESS" : "FAILED")}");
+            return fallbackMaterial;
         }
         catch (Exception ex)
         {
             Console.WriteLine($"[MaterialAsset] Failed to load: {ex.Message}");
+            Console.WriteLine($"[MaterialAsset] Stack trace: {ex.StackTrace}");
             return null;
         }
     }
     
     /// <summary>
-    /// Convert to runtime PBR material.
+    /// Convert to Material System V2 (MaterialAssetV2).
     /// </summary>
-    public PBRMaterial ToRuntimeMaterial()
+    public BlueSky.Rendering.Materials.MaterialAssetV2 ToMaterialV2()
     {
-        return new PBRMaterial
+        var material = new BlueSky.Rendering.Materials.MaterialAssetV2
         {
-            MaterialId = MaterialId,
             Name = MaterialName,
             Albedo = new System.Numerics.Vector3(Albedo.X, Albedo.Y, Albedo.Z),
             Metallic = Metallic,
             Roughness = Roughness,
-            Emission = new System.Numerics.Vector3(Emission.X, Emission.Y, Emission.Z),
-            EmissionIntensity = EmissionIntensity,
+            Emissive = new System.Numerics.Vector3(Emission.X, Emission.Y, Emission.Z),
+            EmissiveIntensity = EmissionIntensity,
             NormalStrength = NormalStrength,
             AO = AO,
-            AlbedoTexture = AlbedoTexture,
-            NormalTexture = NormalTexture,
-            MetallicTexture = MetallicTexture,
-            RoughnessTexture = RoughnessTexture,
-            EmissionTexture = EmissionTexture,
-            AOTexture = AOTexture,
             Tiling = new System.Numerics.Vector2(Tiling.X, Tiling.Y),
             Offset = new System.Numerics.Vector2(Offset.X, Offset.Y),
             Opacity = Opacity,
-            BlendMode = BlendMode,
-            DoubleSided = DoubleSided,
-            UseSimplifiedLighting = UseSimplifiedLighting,
             EnableParallax = EnableParallax,
-            EnableDetailMaps = EnableDetailMaps,
-            UseRoughnessMetallicAO = UseRoughnessMetallicAO,
-            MaxLOD = MaxLOD,
-            ForceLowQuality = ForceLowQuality
+            UsePackedRMA = UseRoughnessMetallicAO
         };
+        
+        // Add texture slots
+        if (!string.IsNullOrEmpty(AlbedoTexturePath))
+        {
+            material.Textures["albedoMap"] = new BlueSky.Rendering.Materials.TextureSlot
+            {
+                Path = AlbedoTexturePath,
+                SamplerPreset = "anisotropic_repeat",
+                IsSRGB = true
+            };
+        }
+        
+        if (!string.IsNullOrEmpty(NormalTexturePath))
+        {
+            material.Textures["normalMap"] = new BlueSky.Rendering.Materials.TextureSlot
+            {
+                Path = NormalTexturePath,
+                SamplerPreset = "anisotropic_repeat",
+                IsSRGB = false
+            };
+        }
+        
+        if (!string.IsNullOrEmpty(RMATexturePath))
+        {
+            material.Textures["rmaMap"] = new BlueSky.Rendering.Materials.TextureSlot
+            {
+                Path = RMATexturePath,
+                SamplerPreset = "anisotropic_repeat",
+                IsSRGB = false,
+                Channels = "RMA"
+            };
+        }
+        
+        // Set render state
+        material.RenderState.BlendMode = BlendMode switch
+        {
+            BlueSky.Rendering.Materials.BlendMode.Opaque => BlueSky.Rendering.Materials.BlendMode.Opaque,
+            BlueSky.Rendering.Materials.BlendMode.AlphaTest => BlueSky.Rendering.Materials.BlendMode.AlphaTest,
+            BlueSky.Rendering.Materials.BlendMode.AlphaBlend => BlueSky.Rendering.Materials.BlendMode.AlphaBlend,
+            BlueSky.Rendering.Materials.BlendMode.Additive => BlueSky.Rendering.Materials.BlendMode.Additive,
+            BlueSky.Rendering.Materials.BlendMode.Multiply => BlueSky.Rendering.Materials.BlendMode.Multiply,
+            _ => BlueSky.Rendering.Materials.BlendMode.Opaque
+        };
+        material.RenderState.DoubleSided = DoubleSided;
+        
+        return material;
     }
 }
 

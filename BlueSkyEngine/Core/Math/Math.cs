@@ -256,11 +256,36 @@ namespace BlueSky.Core.Math
         public float LengthSquared { [MethodImpl(MethodImplOptions.AggressiveInlining)] get => X * X + Y * Y + Z * Z + W * W; }
         public float Length { [MethodImpl(MethodImplOptions.AggressiveInlining)] get => MathF.Sqrt(LengthSquared); }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)] public static Vector4 operator +(Vector4 a, Vector4 b) => new(a.X + b.X, a.Y + b.Y, a.Z + b.Z, a.W + b.W);
-        [MethodImpl(MethodImplOptions.AggressiveInlining)] public static Vector4 operator -(Vector4 a, Vector4 b) => new(a.X - b.X, a.Y - b.Y, a.Z - b.Z, a.W - b.W);
-        [MethodImpl(MethodImplOptions.AggressiveInlining)] public static Vector4 operator *(Vector4 a, float s) => new(a.X * s, a.Y * s, a.Z * s, a.W * s);
-        [MethodImpl(MethodImplOptions.AggressiveInlining)] public static Vector4 operator /(Vector4 a, float s) => new(a.X / s, a.Y / s, a.Z / s, a.W / s);
-        [MethodImpl(MethodImplOptions.AggressiveInlining)] public static float Dot(Vector4 a, Vector4 b) => a.X * b.X + a.Y * b.Y + a.Z * b.Z + a.W * b.W;
+        [MethodImpl(MethodImplOptions.AggressiveInlining)] 
+        public static Vector4 operator +(Vector4 a, Vector4 b)
+        {
+            if (Vector128.IsHardwareAccelerated) { var va = Unsafe.As<Vector4, Vector128<float>>(ref a); var vb = Unsafe.As<Vector4, Vector128<float>>(ref b); var vr = va + vb; return Unsafe.As<Vector128<float>, Vector4>(ref vr); }
+            return new(a.X + b.X, a.Y + b.Y, a.Z + b.Z, a.W + b.W);
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)] 
+        public static Vector4 operator -(Vector4 a, Vector4 b)
+        {
+            if (Vector128.IsHardwareAccelerated) { var va = Unsafe.As<Vector4, Vector128<float>>(ref a); var vb = Unsafe.As<Vector4, Vector128<float>>(ref b); var vr = va - vb; return Unsafe.As<Vector128<float>, Vector4>(ref vr); }
+            return new(a.X - b.X, a.Y - b.Y, a.Z - b.Z, a.W - b.W);
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)] 
+        public static Vector4 operator *(Vector4 a, float s)
+        {
+            if (Vector128.IsHardwareAccelerated) { var va = Unsafe.As<Vector4, Vector128<float>>(ref a); var vb = Vector128.Create(s); var vr = va * vb; return Unsafe.As<Vector128<float>, Vector4>(ref vr); }
+            return new(a.X * s, a.Y * s, a.Z * s, a.W * s);
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)] 
+        public static Vector4 operator /(Vector4 a, float s)
+        {
+            if (Vector128.IsHardwareAccelerated) { var va = Unsafe.As<Vector4, Vector128<float>>(ref a); var vb = Vector128.Create(s); var vr = va / vb; return Unsafe.As<Vector128<float>, Vector4>(ref vr); }
+            return new(a.X / s, a.Y / s, a.Z / s, a.W / s);
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)] 
+        public static float Dot(Vector4 a, Vector4 b)
+        {
+            if (Vector128.IsHardwareAccelerated) { var va = Unsafe.As<Vector4, Vector128<float>>(ref a); var vb = Unsafe.As<Vector4, Vector128<float>>(ref b); return Vector128.Dot(va, vb); }
+            return a.X * b.X + a.Y * b.Y + a.Z * b.Z + a.W * b.W;
+        }
         [MethodImpl(MethodImplOptions.AggressiveInlining)] public static Vector4 Lerp(Vector4 a, Vector4 b, float t) => new(BlueMath.Lerp(a.X, b.X, t), BlueMath.Lerp(a.Y, b.Y, t), BlueMath.Lerp(a.Z, b.Z, t), BlueMath.Lerp(a.W, b.W, t));
         [MethodImpl(MethodImplOptions.AggressiveInlining)] public Vector4 Normalize() { float l = Length; return l > 0 ? this / l : Zero; }
 
@@ -308,6 +333,8 @@ namespace BlueSky.Core.Math
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Color FromHSV(float h, float s, float v, float a = 1f)
         {
+            // Clamp h to [0,1) so that (int)(h*6f) % 6 is never negative
+            h = h - MathF.Floor(h); // wraps negatives correctly
             float c = v * s, x = c * (1 - MathF.Abs(h * 6f % 2 - 1)), m = v - c;
             int sector = (int)(h * 6f) % 6;
             return sector switch
@@ -502,11 +529,29 @@ namespace BlueSky.Core.Math
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static Vector4 operator *(Matrix4x4 m, Vector4 v) => new(
-            m.M11 * v.X + m.M12 * v.Y + m.M13 * v.Z + m.M14 * v.W,
-            m.M21 * v.X + m.M22 * v.Y + m.M23 * v.Z + m.M24 * v.W,
-            m.M31 * v.X + m.M32 * v.Y + m.M33 * v.Z + m.M34 * v.W,
-            m.M41 * v.X + m.M42 * v.Y + m.M43 * v.Z + m.M44 * v.W);
+        public static Vector4 operator *(Matrix4x4 m, Vector4 v)
+        {
+            if (Vector128.IsHardwareAccelerated)
+            {
+                var vx = Vector128.Create(v.X);
+                var vy = Vector128.Create(v.Y);
+                var vz = Vector128.Create(v.Z);
+                var vw = Vector128.Create(v.W);
+
+                var r0 = Vector128.Create(m.M11, m.M21, m.M31, m.M41);
+                var r1 = Vector128.Create(m.M12, m.M22, m.M32, m.M42);
+                var r2 = Vector128.Create(m.M13, m.M23, m.M33, m.M43);
+                var r3 = Vector128.Create(m.M14, m.M24, m.M34, m.M44);
+
+                var res = vx * r0 + vy * r1 + vz * r2 + vw * r3;
+                return new(res[0], res[1], res[2], res[3]);
+            }
+            return new(
+                m.M11 * v.X + m.M12 * v.Y + m.M13 * v.Z + m.M14 * v.W,
+                m.M21 * v.X + m.M22 * v.Y + m.M23 * v.Z + m.M24 * v.W,
+                m.M31 * v.X + m.M32 * v.Y + m.M33 * v.Z + m.M34 * v.W,
+                m.M41 * v.X + m.M42 * v.Y + m.M43 * v.Z + m.M44 * v.W);
+        }
 
         public bool Equals(Matrix4x4 o) =>
             M11==o.M11 && M12==o.M12 && M13==o.M13 && M14==o.M14 &&

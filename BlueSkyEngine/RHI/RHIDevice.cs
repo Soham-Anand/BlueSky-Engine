@@ -9,9 +9,9 @@ public static class RHIDevice
         var device = backend switch
         {
             RHIBackend.Metal => (IRHIDevice)new Metal.MetalDevice(),
-            RHIBackend.DirectX9 => window != null ? new DirectX9.D3D9Device(window) : throw new ArgumentException("DirectX9 requires a window"),
-            RHIBackend.DirectX10 => throw new NotImplementedException("DirectX 10 backend not yet implemented"),
-            RHIBackend.DirectX11 => throw new NotImplementedException("DirectX 11 backend not yet implemented"),
+            RHIBackend.DirectX11 => window != null
+                ? (IRHIDevice)new DirectX11.D3D11Device(window)
+                : throw new ArgumentException("DirectX 11 requires a window for device creation"),
             RHIBackend.DirectX12 => throw new NotImplementedException("DirectX 12 backend not yet implemented"),
             RHIBackend.Vulkan => throw new NotImplementedException("Vulkan backend not yet implemented"),
             RHIBackend.OpenGL => throw new NotImplementedException("OpenGL backend not yet implemented"),

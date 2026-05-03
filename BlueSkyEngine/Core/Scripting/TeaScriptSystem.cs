@@ -321,6 +321,149 @@ public class TeaScriptSystem : SystemBase
             }
             return 0.0;
         });
+        
+        // ═══════════════════════════════════════════════════════════════
+        //  PHYSICS API
+        // ═══════════════════════════════════════════════════════════════
+        
+        // Rigidbody - Velocity
+        engine.RegisterFunction("getVelocityX", (args) =>
+        {
+            if (World.HasComponent<RigidbodyComponent>(entity))
+            {
+                var velocity = BlueSky.Physics.PhysicsTeaScriptBridge.GetVelocity(entity);
+                return (double)velocity.X;
+            }
+            return 0.0;
+        });
+        
+        engine.RegisterFunction("getVelocityY", (args) =>
+        {
+            if (World.HasComponent<RigidbodyComponent>(entity))
+            {
+                var velocity = BlueSky.Physics.PhysicsTeaScriptBridge.GetVelocity(entity);
+                return (double)velocity.Y;
+            }
+            return 0.0;
+        });
+        
+        engine.RegisterFunction("getVelocityZ", (args) =>
+        {
+            if (World.HasComponent<RigidbodyComponent>(entity))
+            {
+                var velocity = BlueSky.Physics.PhysicsTeaScriptBridge.GetVelocity(entity);
+                return (double)velocity.Z;
+            }
+            return 0.0;
+        });
+        
+        engine.RegisterFunction("setVelocity", (args) =>
+        {
+            if (args.Count >= 3 && World.HasComponent<RigidbodyComponent>(entity))
+            {
+                float x = Convert.ToSingle(args[0]);
+                float y = Convert.ToSingle(args[1]);
+                float z = Convert.ToSingle(args[2]);
+                var velocity = new System.Numerics.Vector3(x, y, z);
+                BlueSky.Physics.PhysicsTeaScriptBridge.SetVelocity(entity, velocity);
+            }
+            return null;
+        });
+        
+        // Rigidbody - Force
+        engine.RegisterFunction("addForce", (args) =>
+        {
+            if (args.Count >= 3 && World.HasComponent<RigidbodyComponent>(entity))
+            {
+                float x = Convert.ToSingle(args[0]);
+                float y = Convert.ToSingle(args[1]);
+                float z = Convert.ToSingle(args[2]);
+                var force = new System.Numerics.Vector3(x, y, z);
+                BlueSky.Physics.PhysicsTeaScriptBridge.AddForce(entity, force);
+            }
+            return null;
+        });
+        
+        engine.RegisterFunction("addImpulse", (args) =>
+        {
+            if (args.Count >= 3 && World.HasComponent<RigidbodyComponent>(entity))
+            {
+                float x = Convert.ToSingle(args[0]);
+                float y = Convert.ToSingle(args[1]);
+                float z = Convert.ToSingle(args[2]);
+                var impulse = new System.Numerics.Vector3(x, y, z);
+                BlueSky.Physics.PhysicsTeaScriptBridge.AddForce(entity, impulse);
+            }
+            return null;
+        });
+        
+        // Rigidbody - Properties
+        engine.RegisterFunction("getMass", (args) =>
+        {
+            if (World.TryGetComponent<RigidbodyComponent>(entity, out var rb))
+            {
+                return (double)rb.Mass;
+            }
+            return 1.0;
+        });
+        
+        engine.RegisterFunction("setMass", (args) =>
+        {
+            if (args.Count >= 1 && World.HasComponent<RigidbodyComponent>(entity))
+            {
+                ref var rb = ref World.GetComponent<RigidbodyComponent>(entity);
+                rb.Mass = Convert.ToSingle(args[0]);
+            }
+            return null;
+        });
+        
+        engine.RegisterFunction("setGravity", (args) =>
+        {
+            if (args.Count >= 1 && World.HasComponent<RigidbodyComponent>(entity))
+            {
+                ref var rb = ref World.GetComponent<RigidbodyComponent>(entity);
+                rb.UseGravity = Convert.ToBoolean(args[0]);
+            }
+            return null;
+        });
+        
+        engine.RegisterFunction("setKinematic", (args) =>
+        {
+            if (args.Count >= 1 && World.HasComponent<RigidbodyComponent>(entity))
+            {
+                ref var rb = ref World.GetComponent<RigidbodyComponent>(entity);
+                rb.IsKinematic = Convert.ToBoolean(args[0]);
+            }
+            return null;
+        });
+        
+        // Rotation
+        engine.RegisterFunction("rotate", (args) =>
+        {
+            if (args.Count >= 3 && World.HasComponent<TransformComponent>(entity))
+            {
+                ref var transform = ref World.GetComponent<TransformComponent>(entity);
+                float x = Convert.ToSingle(args[0]);
+                float y = Convert.ToSingle(args[1]);
+                float z = Convert.ToSingle(args[2]);
+                
+                // Simple euler angle rotation (degrees)
+                transform.Rotation = BlueSky.Core.Math.Quaternion.Euler(x, y, z);
+            }
+            return null;
+        });
+        
+        // Raycasting (placeholder)
+        engine.RegisterFunction("raycast", (args) =>
+        {
+            if (args.Count >= 6)
+            {
+                // raycast(originX, originY, originZ, dirX, dirY, dirZ, maxDistance)
+                Console.WriteLine($"[TeaScript] raycast called but not yet implemented");
+                return false;
+            }
+            return false;
+        });
     }
     
     /// <summary>

@@ -91,17 +91,17 @@ public class PhysicsSystem : SystemBase, IDisposable
         }
     }
     
-    public BodyID CreateRigidbody(Entity entity, RigidbodyComponent rigidbody, Vector3 position, Quaternion rotation)
+    public BodyID CreateRigidbody(Entity entity, RigidbodyComponent rigidbody, ColliderComponent collider, Vector3 position, Quaternion rotation)
     {
         if (!_initialized || _bodyInterface == null)
             throw new InvalidOperationException("Physics system not initialized");
         
-        // Create shape based on rigidbody type
-        Shape shape = rigidbody.ColliderType switch
+        // Create shape based on collider type
+        Shape shape = collider.Type switch
         {
-            ColliderType.Box => new BoxShape(rigidbody.Size * 0.5f),
-            ColliderType.Sphere => new SphereShape(rigidbody.Radius),
-            ColliderType.Capsule => new CapsuleShape(rigidbody.Height * 0.5f, rigidbody.Radius),
+            ColliderType.Box => new BoxShape(collider.Size * 0.5f),
+            ColliderType.Sphere => new SphereShape(collider.Radius),
+            ColliderType.Capsule => new CapsuleShape(collider.Height * 0.5f, collider.Radius),
             _ => new BoxShape(new Vector3(0.5f))
         };
         
@@ -115,8 +115,8 @@ public class PhysicsSystem : SystemBase, IDisposable
             ObjectLayer = rigidbody.IsKinematic || rigidbody.Mass == 0 ? 
                          ObjectLayers.NonMoving : ObjectLayers.Moving,
             AllowSleeping = true,
-            Friction = rigidbody.Friction,
-            Restitution = rigidbody.Restitution
+            Friction = collider.Friction,
+            Restitution = collider.Restitution
         };
         
         var body = _bodyInterface.CreateBody(bodySettings);
@@ -237,51 +237,6 @@ public class PhysicsSystem : SystemBase, IDisposable
         
         _disposed = true;
         Console.WriteLine("[Physics] Jolt Physics shut down");
-    }
-}
-
-public static class ObjectLayers
-{
-    public const byte NonMoving = 0;
-    public const byte Moving = 1;
-}
-
-public struct RaycastHit
-{
-    public Vector3 Point;
-    public Vector3 Normal;
-    public float Distance;
-    public Entity Entity;
-}
-
-public enum ColliderType
-{
-    Box,
-    Sphere,
-    Capsule
-}
-
-public struct RigidbodyComponent
-{
-    public float Mass;
-    public bool IsKinematic;
-    public float Friction;
-    public float Restitution;
-    public ColliderType ColliderType;
-    public Vector3 Size;      // For box
-    public float Radius;      // For sphere/capsule
-    public float Height;      // For capsule
-    
-    public RigidbodyComponent()
-    {
-        Mass = 1.0f;
-        IsKinematic = false;
-        Friction = 0.5f;
-        Restitution = 0.3f;
-        ColliderType = ColliderType.Box;
-        Size = new Vector3(1, 1, 1);
-        Radius = 0.5f;
-        Height = 2.0f;
     }
 }
 

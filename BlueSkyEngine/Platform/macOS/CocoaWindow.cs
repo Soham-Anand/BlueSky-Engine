@@ -514,12 +514,16 @@ public class CocoaWindow : IWindow
             case 1: return Input.KeyCode.S;
             case 2: return Input.KeyCode.D;
             case 3: return Input.KeyCode.F;
+            case 6: return Input.KeyCode.Z;       // Z key for undo
             case 12: return Input.KeyCode.Q;
             case 13: return Input.KeyCode.W;
             case 14: return Input.KeyCode.E;
             case 15: return Input.KeyCode.R;
+            case 35: return Input.KeyCode.P;      // P key for command palette
             case 34: return Input.KeyCode.I;      // I key for import
+            case 36: return Input.KeyCode.Enter;  // Enter/Return
             case 49: return Input.KeyCode.Space;
+            case 53: return Input.KeyCode.Escape; // Escape
             case 56: return Input.KeyCode.LeftShift;
             case 59: return Input.KeyCode.LeftControl;
             case 123: return Input.KeyCode.Left;  // Left arrow

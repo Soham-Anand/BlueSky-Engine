@@ -21,7 +21,7 @@ public class AssetLoader
     public List<int> LoadMeshAsset(string assetPath)
     {
         var asset = BlueAsset.Load(assetPath);
-        if (asset == null || asset.Type != AssetType.Mesh)
+        if (asset == null || (asset.Type != AssetType.StaticMesh && asset.Type != AssetType.Mesh))
         {
             Console.WriteLine($"[AssetLoader] Failed to load mesh asset: {assetPath}");
             return new List<int>();
@@ -37,52 +37,61 @@ public class AssetLoader
 
         try
         {
-            using var fs = File.OpenRead(asset.DataFile);
-            using var reader = new BinaryReader(fs);
+            using var ms = new MemoryStream(asset.PayloadData);
+            using var reader = new BinaryReader(ms);
 
-            // Read mesh count
-            int meshCount = reader.ReadInt32();
-
-            for (int i = 0; i < meshCount; i++)
+            if (asset.Metadata.TryGetValue("format", out var format) && format == "Packed32")
             {
-                // Read mesh data
-                string meshName = reader.ReadString();
-                int materialIndex = reader.ReadInt32();
+                // New unified binary format (Position, Normal, UV)
+                int vertexByteCount = reader.ReadInt32();
+                byte[] vertexBytes = reader.ReadBytes(vertexByteCount);
+                int vertexCount = vertexByteCount / 32;
 
-                // Read vertices
-                int vertexCount = reader.ReadInt32();
-                var vertices = new float[vertexCount * 14]; // 14 floats per vertex
+                int indexByteCount = reader.ReadInt32();
+                byte[] indexBytes = reader.ReadBytes(indexByteCount);
+                int indexCount = indexByteCount / 4;
 
-                for (int v = 0; v < vertexCount; v++)
+                int submeshCount = reader.ReadInt32();
+                for (int i = 0; i < submeshCount; i++)
                 {
-                    int offset = v * 14;
-                    vertices[offset + 0] = reader.ReadSingle(); // pos.x
-                    vertices[offset + 1] = reader.ReadSingle(); // pos.y
-                    vertices[offset + 2] = reader.ReadSingle(); // pos.z
-                    vertices[offset + 3] = reader.ReadSingle(); // normal.x
-                    vertices[offset + 4] = reader.ReadSingle(); // normal.y
-                    vertices[offset + 5] = reader.ReadSingle(); // normal.z
-                    vertices[offset + 6] = reader.ReadSingle(); // uv.x
-                    vertices[offset + 7] = reader.ReadSingle(); // uv.y
-                    vertices[offset + 8] = reader.ReadSingle(); // tangent.x
-                    vertices[offset + 9] = reader.ReadSingle(); // tangent.y
-                    vertices[offset + 10] = reader.ReadSingle(); // tangent.z
-                    vertices[offset + 11] = reader.ReadSingle(); // bitangent.x
-                    vertices[offset + 12] = reader.ReadSingle(); // bitangent.y
-                    vertices[offset + 13] = reader.ReadSingle(); // bitangent.z
-                }
+                    int offset = reader.ReadInt32();
+                    int count = reader.ReadInt32();
+                    int slot = reader.ReadInt32();
 
-                // Read indices
-                int indexCount = reader.ReadInt32();
-                var indices = new uint[indexCount];
-                for (int idx = 0; idx < indexCount; idx++)
+                    // Extract sub-index buffer for this submesh
+                    var subIndices = new uint[count];
+                    Buffer.BlockCopy(indexBytes, offset * 4, subIndices, 0, count * 4);
+
+                    // Upload as separate mesh to renderer for now
+                    // TODO: Move to multi-submesh renderer support
+                    float[] floatVertices = new float[vertexCount * 8];
+                    Buffer.BlockCopy(vertexBytes, 0, floatVertices, 0, vertexByteCount);
+
+                    var meshId = _renderer.CreateMesh(floatVertices, subIndices);
+                    meshIds.Add(meshId);
+                }
+            }
+            else
+            {
+                // Legacy format support
+                int meshCount = reader.ReadInt32();
+                for (int i = 0; i < meshCount; i++)
                 {
-                    indices[idx] = reader.ReadUInt32();
-                }
+                    string meshName = reader.ReadString();
+                    int materialIndex = reader.ReadInt32();
+                    int vertexCount = reader.ReadInt32();
+                    var vertices = new float[vertexCount * 14];
+                    for (int v = 0; v < vertexCount; v++)
+                    {
+                        for (int f = 0; f < 14; f++) vertices[v * 14 + f] = reader.ReadSingle();
+                    }
+                    int indexCount = reader.ReadInt32();
+                    var indices = new uint[indexCount];
+                    for (int idx = 0; idx < indexCount; idx++) indices[idx] = reader.ReadUInt32();
 
-                // Upload to GPU
-                var meshId = UploadMeshToGPU(vertices, indices);
-                meshIds.Add(meshId);
+                    var meshId = UploadMeshToGPU(vertices, indices);
+                    meshIds.Add(meshId);
+                }
             }
 
             Console.WriteLine($"[AssetLoader] Loaded mesh asset '{asset.AssetName}' with {meshIds.Count} meshes");
@@ -115,8 +124,8 @@ public class AssetLoader
 
         try
         {
-            using var fs = File.OpenRead(asset.DataFile);
-            using var reader = new BinaryReader(fs);
+            using var ms = new MemoryStream(asset.PayloadData);
+            using var reader = new BinaryReader(ms);
 
             int width = reader.ReadInt32();
             int height = reader.ReadInt32();
@@ -124,8 +133,11 @@ public class AssetLoader
             int dataLength = reader.ReadInt32();
             byte[] data = reader.ReadBytes(dataLength);
 
+            bool isSRGB = srgb;
+            if (asset.Metadata.TryGetValue("format", out var fmt) && fmt == "RGBA8") isSRGB = srgb;
+
             // Upload to GPU
-            var textureId = UploadTextureToGPU(width, height, data, srgb);
+            var textureId = UploadTextureToGPU(width, height, data, isSRGB);
 
             Console.WriteLine($"[AssetLoader] Loaded texture asset '{asset.AssetName}' ({width}x{height})");
             return textureId;

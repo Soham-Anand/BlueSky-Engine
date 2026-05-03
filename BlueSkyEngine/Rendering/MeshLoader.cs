@@ -216,8 +216,15 @@ namespace BlueSky.Rendering
             vertexMap[faceVertex] = newIndex;
         }
 
+        /// <summary>
+        /// Generate smooth normals by averaging face normals for shared vertices.
+        /// This creates smooth shading instead of faceted/flat shading.
+        /// </summary>
         private static void GenerateFlatNormals(List<VertexData> vertices, List<uint> indices)
         {
+            // First pass: accumulate face normals for each vertex position
+            var normalAccumulator = new Dictionary<Vector3, Vector3>();
+            
             for (int i = 0; i < indices.Count; i += 3)
             {
                 if (i + 2 >= indices.Count) break;
@@ -226,14 +233,41 @@ namespace BlueSky.Rendering
                 var v1 = vertices[(int)indices[i + 1]];
                 var v2 = vertices[(int)indices[i + 2]];
 
+                // Calculate face normal
                 var edge1 = v1.Position - v0.Position;
                 var edge2 = v2.Position - v0.Position;
-                var normal = Vector3.Normalize(Vector3.Cross(edge1, edge2));
-
-                v0.Normal = normal; vertices[(int)indices[i]] = v0;
-                v1.Normal = normal; vertices[(int)indices[i + 1]] = v1;
-                v2.Normal = normal; vertices[(int)indices[i + 2]] = v2;
+                var faceNormal = Vector3.Cross(edge1, edge2);
+                
+                // Don't normalize yet - we want to weight by triangle area
+                // (larger triangles contribute more to the vertex normal)
+                
+                // Accumulate for each vertex position
+                if (!normalAccumulator.ContainsKey(v0.Position))
+                    normalAccumulator[v0.Position] = Vector3.Zero;
+                if (!normalAccumulator.ContainsKey(v1.Position))
+                    normalAccumulator[v1.Position] = Vector3.Zero;
+                if (!normalAccumulator.ContainsKey(v2.Position))
+                    normalAccumulator[v2.Position] = Vector3.Zero;
+                
+                normalAccumulator[v0.Position] += faceNormal;
+                normalAccumulator[v1.Position] += faceNormal;
+                normalAccumulator[v2.Position] += faceNormal;
             }
+            
+            // Second pass: normalize accumulated normals and assign to vertices
+            for (int i = 0; i < vertices.Count; i++)
+            {
+                var vertex = vertices[i];
+                if (normalAccumulator.TryGetValue(vertex.Position, out var accumulatedNormal))
+                {
+                    // Normalize the accumulated normal
+                    var smoothNormal = Vector3.Normalize(accumulatedNormal);
+                    vertex.Normal = smoothNormal;
+                    vertices[i] = vertex;
+                }
+            }
+            
+            Console.WriteLine($"[MeshLoader] Generated smooth normals for {vertices.Count} vertices");
         }
 
         private static void LoadMTL(string path, ModelData model)

@@ -205,4 +205,17 @@ internal sealed class ValidationCommandBuffer : IRHICommandBuffer, IRHIWrapped<I
             RHIValidation.RequireState(_vertexBufferSet, "Draw called without a vertex buffer set.");
         }
     }
+
+    // Phase 2/3 additions - pass-through to underlying command buffer
+    public void SetStorageBuffer(IRHIBuffer buffer, uint binding, uint set = 0) => Inner.SetStorageBuffer(buffer, binding, set);
+    public void SetStorageTexture(IRHITexture texture, uint binding, uint set = 0) => Inner.SetStorageTexture(texture, binding, set);
+    public void SetBindlessResourceTable(uint set, ReadOnlySpan<BindlessResourceHandle> handles) => Inner.SetBindlessResourceTable(set, handles);
+    public void SetComputeUniforms(uint binding, ReadOnlySpan<byte> data) => Inner.SetComputeUniforms(binding, data);
+    public void DrawIndirect(IRHIBuffer buffer, ulong offset, uint drawCount, uint stride) => Inner.DrawIndirect(buffer, offset, drawCount, stride);
+    public void DrawIndexedIndirect(IRHIBuffer buffer, ulong offset, uint drawCount, uint stride) => Inner.DrawIndexedIndirect(buffer, offset, drawCount, stride);
+    public void Dispatch(uint groupCountX, uint groupCountY, uint groupCountZ) => Inner.Dispatch(groupCountX, groupCountY, groupCountZ);
+    public void DispatchIndirect(IRHIBuffer buffer, ulong offset) => Inner.DispatchIndirect(buffer, offset);
+    public void MemoryBarrier() => Inner.MemoryBarrier();
+    public void BufferBarrier(IRHIBuffer buffer) => Inner.BufferBarrier(buffer);
+    public void TextureBarrier(IRHITexture texture) => Inner.TextureBarrier(texture);
 }

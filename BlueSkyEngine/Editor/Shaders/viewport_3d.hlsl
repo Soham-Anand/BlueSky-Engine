@@ -45,7 +45,7 @@ VS_SKY_OUTPUT vs_sky(uint vertexID : SV_VertexID) {
     float4 clipPos = float4(uv * 2.0 - 1.0, 1.0, 1.0);
     float4 worldPosH = mul(InvViewProj, clipPos); // HLSL uses mul(M, v)
     float3 worldPos = worldPosH.xyz / worldPosH.w;
-    output.rayDir = normalize(worldPos - CameraPos);
+    output.rayDir = worldPos - CameraPos;
 
     return output;
 }
@@ -134,7 +134,7 @@ float3 computeSky(float3 rayDir, float3 sunDir, float time) {
 }
 
 float4 fs_sky(VS_SKY_OUTPUT input) : COLOR {
-    float3 skyColor = computeSky(input.rayDir, SunDirection, Time);
+    float3 skyColor = computeSky(normalize(input.rayDir), SunDirection, Time);
     return float4(skyColor, 1.0);
 }
 
@@ -202,28 +202,28 @@ FS_GRID_OUTPUT fs_grid(VS_GRID_OUTPUT input) {
 
     if (fadeFar < 0.001) clip(-1);
 
-    float4 fineGrid   = gridPattern(hitPos, 1.0, 1.0);
-    float4 coarseGrid = gridPattern(hitPos, 0.1, 1.5);
+    float4 fineGrid   = gridPattern(hitPos, 0.1, 1.0);
+    float4 coarseGrid = gridPattern(hitPos, 0.01, 1.5);
 
     float4 gridColor = fineGrid;
-    gridColor.a = max(fineGrid.a * 0.4, coarseGrid.a * 0.7);
+    gridColor.a = max(fineGrid.a * 0.35, coarseGrid.a * 0.7);
     gridColor.rgb = lerp(fineGrid.rgb, coarseGrid.rgb * 1.2, coarseGrid.a);
 
     float2 axisDerivative = fwidth(hitPos.xz);
     
-    float xAxisDist = abs(hitPos.z) / axisDerivative.y;
+    float xAxisDist = abs(hitPos.z) / (axisDerivative.y * 1.5);
     float xAxisLine = 1.0 - min(xAxisDist, 1.0);
     
-    float zAxisDist = abs(hitPos.x) / axisDerivative.x;
+    float zAxisDist = abs(hitPos.x) / (axisDerivative.x * 1.5);
     float zAxisLine = 1.0 - min(zAxisDist, 1.0);
 
     if (xAxisLine > 0.01) {
-        gridColor.rgb = lerp(gridColor.rgb, float3(0.85, 0.20, 0.18), xAxisLine);
-        gridColor.a = max(gridColor.a, xAxisLine * 0.9);
+        gridColor.rgb = lerp(gridColor.rgb, float3(0.9, 0.1, 0.1), xAxisLine);
+        gridColor.a = max(gridColor.a, xAxisLine * 1.0);
     }
     if (zAxisLine > 0.01) {
-        gridColor.rgb = lerp(gridColor.rgb, float3(0.20, 0.35, 0.85), zAxisLine);
-        gridColor.a = max(gridColor.a, zAxisLine * 0.9);
+        gridColor.rgb = lerp(gridColor.rgb, float3(0.1, 0.1, 0.9), zAxisLine);
+        gridColor.a = max(gridColor.a, zAxisLine * 1.0);
     }
 
     gridColor.a *= fadeFar;
@@ -308,9 +308,10 @@ float4 fs_shadow(VS_SHADOW_OUTPUT input) : SV_Target0 {
     return float4(input.position.z, 0, 0, 1);
 }
 
-float4 fs_mesh(VS_MESH_OUTPUT input) : SV_Target0 {
+float4 fs_mesh(VS_MESH_OUTPUT input, bool isFrontFace : SV_IsFrontFace) : SV_Target0 {
     float3 lightDir = normalize(SunDirection);
     float3 normal = normalize(input.normal);
+    if (!isFrontFace) normal = -normal;
     
     float3 ambient = 0.2 * EntityColor.rgb;
     

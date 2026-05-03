@@ -195,7 +195,9 @@ public class Interpreter
             case TokenType.Star:
                 return ToNumber(left) * ToNumber(right);
             case TokenType.Slash:
-                return ToNumber(left) / ToNumber(right);
+                var divisor = ToNumber(right);
+                if (divisor == 0) throw new Exception("Division by zero");
+                return ToNumber(left) / divisor;
             case TokenType.Equal:
                 return IsEqual(left, right);
             case TokenType.NotEqual:

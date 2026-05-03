@@ -6,7 +6,7 @@ using namespace metal;
 //   offset  0 :  float2  position
 //   offset  8 :  float4  color
 //   offset 24 :  float2  uv
-//   offset 32 :  float   mode   (0 = solid geometry, 1 = glyph alpha-texture)
+//   offset 32 :  float   mode   (0 = solid geometry, 1 = glyph alpha-texture, 2 = full texture)
 //   offset 36 :  float   _pad
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -51,11 +51,17 @@ fragment float4 fs_ui(
     VertexOut              in        [[stage_in]],
     texture2d<float>       fontAtlas [[texture(0)]]
 ) {
-    if (in.mode > 0.5) {
+    if (in.mode > 1.5) {
+        // Mode 2: Full texture render (viewport). RGBA8Unorm — no swizzle needed.
+        return fontAtlas.sample(kFontSampler, in.uv);
+    }
+    else if (in.mode > 0.5) {
+        // Mode 1: Font atlas with coverage
         float coverage = fontAtlas.sample(kFontSampler, in.uv).r;
         if (coverage < 0.01) discard_fragment();
         return float4(in.color.rgb, in.color.a * coverage);
     }
 
+    // Mode 0: Solid geometry
     return in.color;
 }

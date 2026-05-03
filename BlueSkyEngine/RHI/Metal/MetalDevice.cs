@@ -217,6 +217,35 @@ internal class MetalDevice : IRHIDevice
     internal IntPtr Device => _device;
     internal IntPtr CommandQueue => _commandQueue;
     
+    // Phase 2/3 additions - stub implementations
+    public RHICapabilities Capabilities => RHICapabilities.ComputeShaders | RHICapabilities.BindlessResources | 
+                                           RHICapabilities.IndirectDrawing | RHICapabilities.AsyncCompute;
+    
+    public DescriptorBindingMode BindingMode => DescriptorBindingMode.Bindless;
+    
+    public IRHIPipeline CreateComputePipeline(ComputePipelineDesc desc)
+    {
+        // TODO: Implement compute pipeline creation
+        throw new NotImplementedException("Compute pipelines not yet implemented for Metal");
+    }
+    
+    public BindlessResourceHandle RegisterBindlessTexture(IRHITexture texture)
+    {
+        // TODO: Implement bindless texture registration (Metal 3.0+)
+        return new BindlessResourceHandle { Index = 0, Generation = 0 };
+    }
+    
+    public BindlessResourceHandle RegisterBindlessBuffer(IRHIBuffer buffer)
+    {
+        // TODO: Implement bindless buffer registration (Metal 3.0+)
+        return new BindlessResourceHandle { Index = 0, Generation = 0 };
+    }
+    
+    public void UnregisterBindlessResource(BindlessResourceHandle handle)
+    {
+        // TODO: Implement bindless resource unregistration
+    }
+    
     public void Dispose()
     {
         if (_disposed) return;

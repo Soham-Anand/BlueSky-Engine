@@ -1,0 +1,34 @@
+BlueSky Engine License
+
+Copyright (c) 2024 BlueSky Engine Contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to use,
+modify, and distribute the Software for any purpose, including commercial
+applications, subject to the following conditions:
+
+1. ATTRIBUTION REQUIREMENT:
+   Any game, application, or software created using BlueSky Engine MUST include
+   visible attribution to "BlueSky Engine" in one of the following ways:
+   
+   - A splash screen, loading screen, or credits screen displaying "Made with BlueSky Engine"
+   - An "About" or "Credits" section within the application/game menu
+   - End credits roll containing "Powered by BlueSky Engine"
+   - Any other clearly visible acknowledgment within the application
+
+   The attribution must be reasonably visible to end users during normal use of
+   the application.
+
+2. NO WARRANTY:
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+   THE SOFTWARE.
+
+3. ENGINE SOURCE CODE:
+   Modifications to the engine source code itself do not need to be redistributed,
+   but the attribution requirement still applies to any applications built with
+   the modified engine.

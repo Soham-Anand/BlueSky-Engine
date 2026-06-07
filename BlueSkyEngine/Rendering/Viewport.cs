@@ -75,11 +75,15 @@ namespace BlueSky.Rendering
             // Cap delta time to prevent camera teleporting on frame spikes
             deltaTime = MathF.Min(deltaTime, 0.1f);
             
-            // 1. Process mouse look (right button held)
-            ProcessMouseLook();
-            
-            // 2. Process keyboard movement (continuous polling)
-            ProcessKeyboardMovement(deltaTime);
+            // Only update fly camera when in free camera mode
+            if (BlueSky.Core.Gameplay.PlayerController.Instance.IsInFreeCameraMode)
+            {
+                // 1. Process mouse look (right button held)
+                ProcessMouseLook();
+                
+                // 2. Process keyboard movement (continuous polling)
+                ProcessKeyboardMovement(deltaTime);
+            }
             
             // 3. Sync camera with ECS
             if (_vpW < 1 || _vpH < 1)
@@ -134,6 +138,7 @@ namespace BlueSky.Rendering
             var delta = _input.MouseDelta;
             if (MathF.Abs(delta.X) > 0.001f || MathF.Abs(delta.Y) > 0.001f)
             {
+                // Reconciled rotation logic: Positive delta increases yaw/pitch
                 _yaw += delta.X * _mouseSensitivity;
                 _pitch += delta.Y * _mouseSensitivity;
                 UpdateCameraRotation();
@@ -163,11 +168,11 @@ namespace BlueSky.Rendering
             
             if (_input.IsKeyDown(KeyCode.W))
             {
-                moveX -= forward.X; moveY -= forward.Y; moveZ -= forward.Z; // W moves forward
+                moveX += forward.X; moveY += forward.Y; moveZ += forward.Z; // FIX: W moves forward (was inverted)
             }
             if (_input.IsKeyDown(KeyCode.S))
             {
-                moveX += forward.X; moveY += forward.Y; moveZ += forward.Z; // S moves backward
+                moveX -= forward.X; moveY -= forward.Y; moveZ -= forward.Z; // FIX: S moves backward (was inverted)
             }
             if (_input.IsKeyDown(KeyCode.A))
             {
@@ -202,6 +207,12 @@ namespace BlueSky.Rendering
 
         public void Render()
         {
+            if (_vpW > 0 && _vpH > 0)
+            {
+                var (renderW, renderH) = GetPhysicalViewportSize();
+                _renderer.SetViewport(0, 0, renderW, renderH);
+            }
+
             _renderer.BeginFrame(0.1f, 0.1f, 0.1f);
             _renderer.RenderScene(_world, _camera, _cameraTransform);
         }
@@ -221,7 +232,21 @@ namespace BlueSky.Rendering
         {
             _vpX = x; _vpY = y; _vpW = w; _vpH = h;
             if (_vpW > 0 && _vpH > 0)
-                _camera.AspectRatio = _vpW / _vpH;
+            {
+                var (renderW, renderH) = GetPhysicalViewportSize();
+                _camera.AspectRatio = (float)renderW / renderH;
+
+                _renderer.SetViewport(0, 0, renderW, renderH);
+            }
+        }
+
+        private (int Width, int Height) GetPhysicalViewportSize()
+        {
+            float scaleX = _window.Size.X > 0 ? _window.FramebufferSize.X / _window.Size.X : 1.0f;
+            float scaleY = _window.Size.Y > 0 ? _window.FramebufferSize.Y / _window.Size.Y : 1.0f;
+            int renderW = Math.Max(1, (int)MathF.Round(_vpW * scaleX));
+            int renderH = Math.Max(1, (int)MathF.Round(_vpH * scaleY));
+            return (renderW, renderH);
         }
 
         // ── System.Numerics helpers for RHI rendering ──────────────────

@@ -6,19 +6,46 @@ namespace NotBSRenderer;
 
 public static class RHIDiscovery
 {
-    public static RHIBackend DiscoverBestBackend()
+    public static RHIBackend DiscoverBestBackend(string[]? cliArgs, bool forceCompatibility = false)
+    {
+        bool wantsVulkan = HasFlag(cliArgs, "--vulkan");
+        bool wantsOpenGL = HasFlag(cliArgs, "--opengl");
+
+        if (OperatingSystem.IsWindows())
+        {
+            if (wantsVulkan)
+            {
+                if (IsVulkanSupported()) return RHIBackend.Vulkan;
+                Console.WriteLine("[RHI] --vulkan requested, but Vulkan was not found. Falling back to DirectX 11.");
+            }
+
+            if (IsDirectX11Supported()) return RHIBackend.DirectX11;
+
+            if (IsVulkanSupported()) return RHIBackend.Vulkan;
+            if (wantsOpenGL && IsOpenGLSupported()) return RHIBackend.OpenGL;
+            return RHIBackend.DirectX11;
+        }
+
+        if (OperatingSystem.IsLinux())
+        {
+            if (!wantsOpenGL && IsVulkanSupported()) return RHIBackend.Vulkan;
+            return RHIBackend.OpenGL;
+        }
+
+        return DiscoverBestBackend(forceCompatibility);
+    }
+
+    public static RHIBackend DiscoverBestBackend(bool forceCompatibility = false)
     {
         if (OperatingSystem.IsMacOS())
         {
             if (IsMetalSupported()) return RHIBackend.Metal;
-            if (IsVulkanSupported()) return RHIBackend.Vulkan;
-            return RHIBackend.OpenGL;
+            throw new PlatformNotSupportedException("Metal is required on macOS.");
         }
 
         if (OperatingSystem.IsWindows())
         {
-            // Prefer DX12 > DX11 > Vulkan > OpenGL
-            if (IsDirectX12Supported()) return RHIBackend.DirectX12;
+            // Windows defaults to DirectX 11. Vulkan is opt-in through --vulkan.
             if (IsDirectX11Supported()) return RHIBackend.DirectX11;
             if (IsVulkanSupported()) return RHIBackend.Vulkan;
             return RHIBackend.OpenGL;
@@ -31,6 +58,17 @@ public static class RHIDiscovery
         }
 
         return RHIBackend.OpenGL;
+    }
+
+    private static bool HasFlag(string[]? args, string flag)
+    {
+        if (args == null) return false;
+        foreach (var arg in args)
+        {
+            if (arg.Equals(flag, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
     }
 
     public static bool IsMetalSupported()

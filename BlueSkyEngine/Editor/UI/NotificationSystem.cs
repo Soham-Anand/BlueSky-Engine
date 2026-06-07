@@ -65,7 +65,7 @@ public class NotificationSystem
         }
     }
     
-    public void ShowInfo(string message, float duration = 3f) => Show(message, NotificationType.Info, duration, "ℹ️");
+    public void ShowInfo(string message, float duration = 3f) => Show(message, NotificationType.Info, duration, "i");
     public void ShowSuccess(string message, float duration = 3f) => Show(message, NotificationType.Success, duration, "✓");
     public void ShowWarning(string message, float duration = 3f) => Show(message, NotificationType.Warning, duration, "⚠");
     public void ShowError(string message, float duration = 3f) => Show(message, NotificationType.Error, duration, "✗");
@@ -146,19 +146,17 @@ public class NotificationSystem
             ui.Shadow(x + 2, y + 2, notifWidth, notifHeight, 4, 8, 0.3f * alpha);
             
             // Background
-            ui.Panel(x, y, notifWidth, notifHeight, bgColor);
+            ui.RoundedPanel(x, y, notifWidth, notifHeight, bgColor, EditorTheme.CardRadius);
             
             // Border
-            ui.Panel(x, y, notifWidth, 2, borderColor);
-            ui.Panel(x, y + notifHeight - 2, notifWidth, 2, borderColor);
-            ui.Panel(x, y, 2, notifHeight, borderColor);
-            ui.Panel(x + notifWidth - 2, y, 2, notifHeight, borderColor);
+            EditorChrome.Stroke(ui, x, y, notifWidth, notifHeight, borderColor);
+            ui.Panel(x + 1, y + 1, notifWidth - 2, 1, ModernTheme.WithAlpha(ModernTheme.TextPrimary, 0.08f * alpha));
             
             // Icon
             if (!string.IsNullOrEmpty(notif.Icon))
             {
-                ui.SetCursor(x + 16, y + 20);
-                ui.Text(notif.Icon, iconColor);
+                ui.Circle(x + 22, y + notifHeight * 0.5f, 10, ModernTheme.WithAlpha(iconColor, 0.18f), true);
+                ui.TextCentered(x + 12, y + notifHeight * 0.5f - 10, 20, 20, notif.Icon, iconColor);
             }
             
             // Message

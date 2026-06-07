@@ -26,74 +26,212 @@ public static class GltfToEngineBridge
             throw new GltfException("No meshes found in GLTF file");
         
         var mesh = new SkeletalMesh();
-        var gltfMeshData = importer.ExtractMesh(0);
-        var prim = gltfMeshData.Primitives[0];
         
-        if (prim.Positions == null) 
-            throw new GltfException("Mesh has no position data");
+        // CRITICAL FIX: Collect ALL meshes and ALL primitives, not just [0]
+        var allVertices = new List<SkeletalVertex>();
+        var allIndices = new List<uint>();
+        var submeshInfo = new List<SubmeshData>();
         
-        int vertexCount = prim.Positions.Length;
-        var vertices = new SkeletalVertex[vertexCount];
-        
-        for (int v = 0; v < vertexCount; v++)
+        // Loop through ALL meshes in the glTF file (body + wheels)
+        for (int meshIdx = 0; meshIdx < root.Meshes.Length; meshIdx++)
         {
-            vertices[v].Position = prim.Positions[v];
+            var gltfMeshData = importer.ExtractMesh(meshIdx);
             
-            if (prim.Normals != null && v < prim.Normals.Length)
-                vertices[v].Normal = prim.Normals[v];
-            
-            if (prim.TexCoords0 != null && v < prim.TexCoords0.Length)
-                vertices[v].TexCoord = new Vector2(prim.TexCoords0[v].X, prim.TexCoords0[v].Y);
-            
-            if (prim.Tangents != null && v < prim.Tangents.Length)
-                vertices[v].Tangent = new Vector3(prim.Tangents[v].X, prim.Tangents[v].Y, prim.Tangents[v].Z);
-            
-            if (prim.Joints != null && v < prim.Joints.Length)
+            // Loop through ALL primitives in this mesh
+            foreach (var prim in gltfMeshData.Primitives)
             {
-                vertices[v].BoneIndex0 = prim.Joints[v][0];
-                vertices[v].BoneIndex1 = prim.Joints[v][1];
-                vertices[v].BoneIndex2 = prim.Joints[v][2];
-                vertices[v].BoneIndex3 = prim.Joints[v][3];
-            }
-            
-            if (prim.Weights != null && v < prim.Weights.Length)
-            {
-                vertices[v].BoneWeight0 = prim.Weights[v].X;
-                vertices[v].BoneWeight1 = prim.Weights[v].Y;
-                vertices[v].BoneWeight2 = prim.Weights[v].Z;
-                vertices[v].BoneWeight3 = prim.Weights[v].W;
+                if (prim.Positions == null) 
+                    continue; // Skip invalid primitives
+                
+                int vertexCount = prim.Positions.Length;
+                uint baseVertex = (uint)allVertices.Count;
+                uint baseIndex = (uint)allIndices.Count;
+                
+                // Add vertices from this primitive
+                for (int v = 0; v < vertexCount; v++)
+                {
+                    var vertex = new SkeletalVertex();
+                    vertex.Position = prim.Positions[v];
+                    
+                    if (prim.Normals != null && v < prim.Normals.Length)
+                        vertex.Normal = prim.Normals[v];
+                    
+                    if (prim.TexCoords0 != null && v < prim.TexCoords0.Length)
+                        vertex.TexCoord = new Vector2(prim.TexCoords0[v].X, prim.TexCoords0[v].Y);
+                    
+                    if (prim.Tangents != null && v < prim.Tangents.Length)
+                        vertex.Tangent = new Vector3(prim.Tangents[v].X, prim.Tangents[v].Y, prim.Tangents[v].Z);
+                    
+                    if (prim.Joints != null && v < prim.Joints.Length)
+                    {
+                        vertex.BoneIndex0 = prim.Joints[v][0];
+                        vertex.BoneIndex1 = prim.Joints[v][1];
+                        vertex.BoneIndex2 = prim.Joints[v][2];
+                        vertex.BoneIndex3 = prim.Joints[v][3];
+                    }
+                    
+                    if (prim.Weights != null && v < prim.Weights.Length)
+                    {
+                        vertex.BoneWeight0 = prim.Weights[v].X;
+                        vertex.BoneWeight1 = prim.Weights[v].Y;
+                        vertex.BoneWeight2 = prim.Weights[v].Z;
+                        vertex.BoneWeight3 = prim.Weights[v].W;
+                    }
+                    
+                    allVertices.Add(vertex);
+                }
+                
+                // Add indices from this primitive (offset by baseVertex)
+                var primIndices = prim.Indices ?? GenerateSequentialIndices(vertexCount);
+                foreach (var idx in primIndices)
+                {
+                    allIndices.Add(baseVertex + idx);
+                }
+                
+                // Track submesh boundaries
+                submeshInfo.Add(new SubmeshData
+                {
+                    MeshName = gltfMeshData.Name,
+                    IndexOffset = (int)baseIndex,
+                    IndexCount = primIndices.Length,
+                    MaterialIndex = prim.MaterialIndex ?? -1
+                });
             }
         }
         
-        mesh.Vertices = vertices;
-        mesh.Indices = prim.Indices ?? GenerateSequentialIndices(vertexCount);
+        // Assign combined data to SkeletalMesh
+        mesh.Vertices = allVertices.ToArray();
+        mesh.Indices = allIndices.ToArray();
+        mesh.SubmeshData = submeshInfo; // Store for debugging
+        
+        // CRITICAL FIX: Extract and store materials from GLTF so colors render properly
+        if (root.Materials != null && root.Materials.Length > 0)
+        {
+            mesh.Materials = new MaterialData[root.Materials.Length];
+            for (int i = 0; i < root.Materials.Length; i++)
+            {
+                mesh.Materials[i] = ExtractMaterial(importer, i);
+            }
+            Console.WriteLine($"[GLTF Bridge] ✅ Extracted {mesh.Materials.Length} materials with colors");
+        }
         
         if (root.Skins != null && root.Skins.Length > 0)
         {
             var skin = root.Skins[0];
             mesh.Bones = new Bone[skin.Joints.Length];
+            mesh.RootBoneIndex = 0;
             
             Matrix4x4[]? inverseBindMatrices = null;
             if (skin.InverseBindMatrices.HasValue)
                 inverseBindMatrices = importer.ExtractMatrix4Array(skin.InverseBindMatrices.Value);
+
+            var jointNodeToBoneIndex = new Dictionary<int, int>();
+            for (int i = 0; i < skin.Joints.Length; i++)
+            {
+                jointNodeToBoneIndex[skin.Joints[i]] = i;
+            }
+
+            var nodeParent = BuildNodeParentMap(root);
             
             for (int i = 0; i < skin.Joints.Length; i++)
             {
                 int nodeIndex = skin.Joints[i];
-                string boneName = root.Nodes?[nodeIndex].Name ?? $"Bone_{i}";
+                var node = root.Nodes != null && nodeIndex >= 0 && nodeIndex < root.Nodes.Length
+                    ? root.Nodes[nodeIndex]
+                    : null;
+                string boneName = node?.Name ?? $"Bone_{i}";
+
+                int parentIndex = -1;
+                if (nodeParent.TryGetValue(nodeIndex, out int parentNodeIndex) &&
+                    jointNodeToBoneIndex.TryGetValue(parentNodeIndex, out int parentBoneIndex))
+                {
+                    parentIndex = parentBoneIndex;
+                }
                 
                 mesh.Bones[i] = new Bone
                 {
                     Name = boneName,
-                    ParentIndex = -1,
+                    ParentIndex = parentIndex,
+                    LocalBindPose = node != null ? GetNodeLocalTransform(node) : Matrix4x4.Identity,
                     InverseBindPose = inverseBindMatrices?[i] ?? Matrix4x4.Identity
                 };
                 
                 mesh.BoneNameToIndex[boneName] = i;
             }
+
+            for (int i = 0; i < mesh.Bones.Length; i++)
+            {
+                int parentIndex = mesh.Bones[i].ParentIndex;
+                if (parentIndex >= 0 && parentIndex < mesh.Bones.Length)
+                    mesh.Bones[parentIndex].Children.Add(i);
+            }
+
+            if (skin.Skeleton.HasValue && jointNodeToBoneIndex.TryGetValue(skin.Skeleton.Value, out int rootBoneIndex))
+            {
+                mesh.RootBoneIndex = rootBoneIndex;
+            }
+            else
+            {
+                for (int i = 0; i < mesh.Bones.Length; i++)
+                {
+                    if (mesh.Bones[i].ParentIndex < 0)
+                    {
+                        mesh.RootBoneIndex = i;
+                        break;
+                    }
+                }
+            }
         }
         
         return mesh;
+    }
+
+    private static Dictionary<int, int> BuildNodeParentMap(GltfRoot root)
+    {
+        var parentMap = new Dictionary<int, int>();
+        if (root.Nodes == null) return parentMap;
+
+        for (int parentIndex = 0; parentIndex < root.Nodes.Length; parentIndex++)
+        {
+            var children = root.Nodes[parentIndex].Children;
+            if (children == null) continue;
+
+            foreach (int childIndex in children)
+            {
+                parentMap[childIndex] = parentIndex;
+            }
+        }
+
+        return parentMap;
+    }
+
+    private static Matrix4x4 GetNodeLocalTransform(GltfNode node)
+    {
+        if (node.Matrix != null && node.Matrix.Length == 16)
+        {
+            return new Matrix4x4(
+                node.Matrix[0], node.Matrix[1], node.Matrix[2], node.Matrix[3],
+                node.Matrix[4], node.Matrix[5], node.Matrix[6], node.Matrix[7],
+                node.Matrix[8], node.Matrix[9], node.Matrix[10], node.Matrix[11],
+                node.Matrix[12], node.Matrix[13], node.Matrix[14], node.Matrix[15]
+            );
+        }
+
+        var translation = (node.Translation != null && node.Translation.Length >= 3)
+            ? new Vector3(node.Translation[0], node.Translation[1], node.Translation[2])
+            : Vector3.Zero;
+
+        var rotation = (node.Rotation != null && node.Rotation.Length >= 4)
+            ? new Quaternion(node.Rotation[0], node.Rotation[1], node.Rotation[2], node.Rotation[3])
+            : Quaternion.Identity;
+
+        var scale = (node.Scale != null && node.Scale.Length >= 3)
+            ? new Vector3(node.Scale[0], node.Scale[1], node.Scale[2])
+            : Vector3.One;
+
+        return Matrix4x4.CreateScale(scale) *
+               Matrix4x4.CreateFromQuaternion(rotation) *
+               Matrix4x4.CreateTranslation(translation);
     }
     
     // TODO: Implement animation import once AnimationClip structure is finalized
@@ -151,7 +289,15 @@ public static class GltfToEngineBridge
             Name = gltfMat.Name ?? $"Material_{materialIndex}",
             AlphaMode = gltfMat.AlphaMode,
             AlphaCutoff = gltfMat.AlphaCutoff,
-            DoubleSided = gltfMat.DoubleSided
+            DoubleSided = gltfMat.DoubleSided,
+            // CRITICAL: Initialize to -1 (no texture). Struct default is 0, which
+            // is a valid GLTF texture index and would silently bind the wrong texture
+            // to materials that have no textures assigned.
+            BaseColorTextureIndex = -1,
+            MetallicRoughnessTextureIndex = -1,
+            NormalTextureIndex = -1,
+            OcclusionTextureIndex = -1,
+            EmissiveTextureIndex = -1
         };
         
         if (gltfMat.PbrMetallicRoughness != null)
@@ -281,6 +427,14 @@ public struct MaterialData
         OcclusionTextureIndex = -1,
         EmissiveTextureIndex = -1
     };
+}
+
+public struct SubmeshData
+{
+    public string MeshName;
+    public int IndexOffset;
+    public int IndexCount;
+    public int MaterialIndex;
 }
 
 public struct AnimationTrack

@@ -31,6 +31,12 @@ constexpr sampler kFontSampler(
     mip_filter::none
 );
 
+constexpr sampler kViewportSampler(
+    filter::linear,
+    address::clamp_to_edge,
+    mip_filter::none
+);
+
 // ──────────────────────────────────────── Vertex ────────────────────────────
 
 vertex VertexOut vs_ui(
@@ -52,8 +58,8 @@ fragment float4 fs_ui(
     texture2d<float>       fontAtlas [[texture(0)]]
 ) {
     if (in.mode > 1.5) {
-        // Mode 2: Full texture render (viewport). RGBA8Unorm — no swizzle needed.
-        return fontAtlas.sample(kFontSampler, in.uv);
+        // Mode 2: Full texture render (viewport).
+        return fontAtlas.sample(kViewportSampler, in.uv);
     }
     else if (in.mode > 0.5) {
         // Mode 1: Font atlas with coverage

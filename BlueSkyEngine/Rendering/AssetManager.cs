@@ -119,40 +119,67 @@ public class AssetManager : IDisposable
                 for (int i = 0; i < root.Meshes.Length; i++)
                 {
                     var gltfMeshData = importer.ExtractMesh(i);
-                    
                     foreach (var prim in gltfMeshData.Primitives)
                     {
                         if (prim.Positions == null) continue;
                         
                         var mesh = ConvertGltfPrimitiveToMeshData(gltfMeshData.Name, prim);
+                        mesh.MaterialIndex = prim.Material ?? -1;
                         modelData.Meshes.Add(mesh);
                     }
                 }
             }
             
-            // Extract all materials
+            // Extract and load all textures FIRST (so we have paths for materials)
+            // KEY: Map by GLTF *texture* index (not image index), because material
+            // properties (BaseColorTexture.Index, etc.) reference texture indices.
+            // GltfImporter.ExtractTexture() handles the Texture→Image indirection.
+            var textureIndexToPath = new Dictionary<int, string>();
+            if (root.Textures != null)
+            {
+                for (int i = 0; i < root.Textures.Length; i++)
+                {
+                    try
+                    {
+                        byte[] texData = importer.ExtractTexture(i);
+                        if (texData != null && texData.Length > 0)
+                        {
+                            // Save to temp file and load
+                            string tempPath = Path.Combine(Path.GetTempPath(), $"BS_Import_{Guid.NewGuid()}_{i}.png");
+                            File.WriteAllBytes(tempPath, texData);
+                            LoadTexture(tempPath, true);
+                            textureIndexToPath[i] = tempPath;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[AssetManager] Failed to extract texture {i}: {ex.Message}");
+                    }
+                }
+            }
+            
+            // Extract all materials and link textures
             if (root.Materials != null)
             {
                 for (int i = 0; i < root.Materials.Length; i++)
                 {
                     var matData = Animation.GLTF.GltfToEngineBridge.ExtractMaterial(importer, i);
                     var material = ConvertGltfMaterialToMaterialData(matData);
+                    
+                    // Link texture paths using GLTF texture index (matches material references)
+                    if (matData.BaseColorTextureIndex >= 0 && textureIndexToPath.TryGetValue(matData.BaseColorTextureIndex, out var albedoPath))
+                        material.AlbedoTexture = albedoPath;
+                    
+                    if (matData.NormalTextureIndex >= 0 && textureIndexToPath.TryGetValue(matData.NormalTextureIndex, out var normalPath))
+                        material.NormalTexture = normalPath;
+                    
+                    if (matData.MetallicRoughnessTextureIndex >= 0 && textureIndexToPath.TryGetValue(matData.MetallicRoughnessTextureIndex, out var mrPath))
+                        material.MetallicRoughnessTexture = mrPath;
+                    
                     modelData.Materials.Add(material);
                 }
             }
-            
-            // Extract and load all textures
-            var textures = Animation.GLTF.GltfToEngineBridge.ExtractAllTextures(path);
-            foreach (var kvp in textures)
-            {
-                string texName = kvp.Key;
-                byte[] texData = kvp.Value;
-                
-                // Save to temp file and load (or implement direct byte[] loading)
-                string tempPath = Path.Combine(Path.GetTempPath(), $"{texName}.png");
-                File.WriteAllBytes(tempPath, texData);
-                LoadTexture(tempPath, true);
-            }
+
             
             // Upload meshes to GPU
             int firstMeshId = 0;
@@ -165,7 +192,7 @@ public class AssetManager : IDisposable
                 _meshCache[meshKey] = meshId;
             }
             
-            Console.WriteLine($"[AssetManager] Loaded GLTF model '{path}' with {modelData.Meshes.Count} meshes, {modelData.Materials.Count} materials");
+            Console.WriteLine($"[AssetManager] Loaded GLTF model '{path}' with {modelData.Meshes.Count} meshes, {modelData.Materials.Count} materials, {textureIndexToPath.Count} textures");
             return firstMeshId;
         }
         catch (Exception ex)
@@ -244,8 +271,12 @@ public class AssetManager : IDisposable
                 gltfMat.BaseColor.Y,
                 gltfMat.BaseColor.Z
             ),
+            Alpha = gltfMat.BaseColor.W,
             Metallic = gltfMat.MetallicFactor,
-            Roughness = gltfMat.RoughnessFactor
+            Roughness = gltfMat.RoughnessFactor,
+            AlphaMode = gltfMat.AlphaMode,
+            AlphaCutoff = gltfMat.AlphaCutoff,
+            DoubleSided = gltfMat.DoubleSided
         };
     }
     

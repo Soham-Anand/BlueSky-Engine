@@ -22,16 +22,22 @@ struct VertexOut {
 
 // Material properties
 struct MaterialData {
-    float3 albedo;
-    float metallic;
-    float roughness;
-    float3 emission;
-    float emissionIntensity;
-    float ao;
-    int useAlbedoTex;
-    int useNormalTex;
-    int useRMA;
-    int simplifiedLighting;
+    packed_float3 albedo;
+    float  metallic;
+    float  roughness;
+    float  ao;
+    float  emission;
+    float  subsurface;
+    
+    int    useAlbedoTex;
+    int    useNormalTex;
+    int    useRMA;
+    int    blendMode;
+    int    useOpacityTex;
+    
+    int    _pad0;
+    int    _pad1;
+    int    simplifiedLighting; // Stored in _pad2
 };
 
 // Lighting data
@@ -124,6 +130,26 @@ float3 calculatePBR(float3 normal, float3 lightDir, float3 viewDir,
     return (diffuse + spec) * NdotL;
 }
 
+// ACES Fitted Tonemapping
+float3 ACESFitted(float3 color) {
+    const float3x3 ACESInputMat = float3x3(
+        float3(0.59719, 0.07600, 0.02840),
+        float3(0.35458, 0.90834, 0.13383),
+        float3(0.04823, 0.01566, 0.83777)
+    );
+    const float3x3 ACESOutputMat = float3x3(
+        float3( 1.60475, -0.10208, -0.00327),
+        float3(-0.53108,  1.10813, -0.07276),
+        float3(-0.07367, -0.00605,  1.07602)
+    );
+    color = ACESInputMat * color;
+    float3 a = color * (color + 0.0245786) - 0.000090537;
+    float3 b = color * (0.983729 * color + 0.4329510) + 0.238081;
+    color = a / b;
+    color = ACESOutputMat * color;
+    return saturate(color);
+}
+
 // Fragment shader
 fragment float4 fragment_main(VertexOut in [[stage_in]],
                               constant ViewUniforms& view [[buffer(0)]],
@@ -173,8 +199,21 @@ fragment float4 fragment_main(VertexOut in [[stage_in]],
     // Apply light intensity and AO
     lighting *= light.intensity * ao;
     
-    // Add emission
-    lighting += material.emission * material.emissionIntensity;
+    // Add ambient base
+    float3 ambient = albedo * 0.03;
+    float3 finalColor = ambient + lighting;
     
-    return float4(lighting, 1.0);
+    // Add emission
+    finalColor += albedo * material.emission;
+    
+    // ACES tonemapping
+    finalColor = ACESFitted(finalColor);
+    
+    // Warmth color grading
+    finalColor *= float3(1.02, 1.0, 0.98);
+    
+    // sRGB Gamma Correction
+    finalColor = pow(finalColor, float3(1.0 / 2.2));
+    
+    return float4(finalColor, 1.0);
 }

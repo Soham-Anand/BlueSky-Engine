@@ -9,6 +9,13 @@ namespace NotBSRenderer;
 /// </summary>
 public class NotBSUI
 {
+    public enum TextAlign
+    {
+        Left,
+        Center,
+        Right
+    }
+
     public struct DrawCommand
     {
         public DrawCommandType Type;
@@ -65,6 +72,9 @@ public class NotBSUI
     public bool IsMouseDown => _mouseDown;
     public Vector2 MousePosition => _mousePos;
     public double Time { get; set; }
+    public Func<string, float>? MeasureTextWidth { get; set; }
+    public float TextLineHeight { get; set; } = 16f;
+    public bool SharpCorners { get; set; } = false;
     
     // Allows disabling input interactions for the UI (useful for modals)
     public bool InputEnabled { get; set; } = true;
@@ -172,17 +182,16 @@ public class NotBSUI
         // Draw scrollbar
         if (maxScroll > 0)
         {
-            float trackWidth = 8f;
+            float trackWidth = 6f;
             float trackX = x + width - trackWidth;
             
             // Scrollbar track background
             _drawCommands.Add(new DrawCommand
             {
-                Type = DrawCommandType.RoundedRectFilled,
+                Type = DrawCommandType.RectFilled,
                 Position = new Vector2(trackX, y),
                 Size = new Vector2(trackWidth, height),
-                Color = new Vector4(0.15f, 0.15f, 0.18f, 0.5f),
-                CornerRadius = 4f
+                Color = new Vector4(0.035f, 0.038f, 0.044f, 0.85f)
             });
             
             // Scrollbar thumb
@@ -198,11 +207,10 @@ public class NotBSUI
             
             _drawCommands.Add(new DrawCommand
             {
-                Type = DrawCommandType.RoundedRectFilled,
+                Type = DrawCommandType.RectFilled,
                 Position = new Vector2(trackX, thumbY),
                 Size = new Vector2(trackWidth, thumbHeight),
-                Color = thumbColor,
-                CornerRadius = 4f
+                Color = thumbColor
             });
             
             // Scrollbar drag interaction
@@ -242,16 +250,55 @@ public class NotBSUI
 
     public void Text(string text, Vector4 color)
     {
+        TextAt(_cursorPos.X, _cursorPos.Y, text, color);
+
+        _cursorPos.Y += MathF.Max(18f, TextLineHeight + 4f);
+    }
+
+    public void TextAt(float x, float y, string text, Vector4 color)
+    {
         _drawCommands.Add(new DrawCommand
         {
             Type = DrawCommandType.Text,
-            Position = _cursorPos,
+            Position = new Vector2(x, y),
             Color = color,
             Text = text,
             ClipRect = _activeClipRect
         });
+    }
 
-        _cursorPos.Y += 20; // Line height
+    public void TextInRect(float x, float y, float width, float height, string text, Vector4 color,
+                           TextAlign horizontalAlign = TextAlign.Left, float verticalBias = 0.5f)
+    {
+        Vector2 pos = GetAlignedTextPosition(x, y, width, height, text, horizontalAlign, verticalBias);
+        TextAt(pos.X, pos.Y, text, color);
+    }
+
+    public void TextCentered(float x, float y, float width, float height, string text, Vector4 color)
+    {
+        TextInRect(x, y, width, height, text, color, TextAlign.Center, 0.5f);
+    }
+
+    public Vector2 GetAlignedTextPosition(float x, float y, float width, float height, string text,
+                                          TextAlign horizontalAlign = TextAlign.Left, float verticalBias = 0.5f)
+    {
+        float textWidth = MeasureText(text);
+        float textHeight = MathF.Max(12f, TextLineHeight);
+        float textX = horizontalAlign switch
+        {
+            TextAlign.Center => x + MathF.Max(0f, (width - textWidth) * 0.5f),
+            TextAlign.Right => x + MathF.Max(0f, width - textWidth),
+            _ => x
+        };
+        float textY = y + MathF.Max(0f, (height - textHeight) * Math.Clamp(verticalBias, 0f, 1f));
+        return new Vector2(MathF.Round(textX), MathF.Round(textY));
+    }
+
+    public float MeasureText(string? text)
+    {
+        if (string.IsNullOrEmpty(text)) return 0f;
+        if (MeasureTextWidth != null) return MeasureTextWidth(text);
+        return text.Length * 8.5f;
     }
 
     public bool Button(string text, float width, float height)
@@ -297,13 +344,7 @@ public class NotBSUI
             Color = new Vector4(0.1f, 0.1f, 0.1f, 1.0f)
         });
 
-        _drawCommands.Add(new DrawCommand
-        {
-            Type = DrawCommandType.Text,
-            Position = pos + new Vector2(10, height / 2 - 8),
-            Color = new Vector4(0.9f, 0.9f, 0.95f, 1.0f),
-            Text = text
-        });
+        TextInRect(pos.X, pos.Y, size.X, size.Y, text, new Vector4(0.9f, 0.9f, 0.95f, 1.0f), TextAlign.Center);
 
         _cursorPos.Y += height + 5;
 
@@ -342,11 +383,10 @@ public class NotBSUI
         // Draw slider track
         _drawCommands.Add(new DrawCommand
         {
-            Type = DrawCommandType.RoundedRectFilled,
+            Type = DrawCommandType.RectFilled,
             Position = pos,
             Size = size,
-            Color = new Vector4(0.051f, 0.055f, 0.071f, 1.0f), // EditorTheme.Bg0
-            CornerRadius = 4f
+            Color = new Vector4(0.032f, 0.035f, 0.040f, 1.0f)
         });
 
         // Draw filled portion
@@ -355,23 +395,16 @@ public class NotBSUI
         {
             _drawCommands.Add(new DrawCommand
             {
-                Type = DrawCommandType.RoundedRectFilled,
+                Type = DrawCommandType.RectFilled,
                 Position = pos,
                 Size = new Vector2(fillWidth, height),
-                Color = isActive ? new Vector4(0.38f, 0.70f, 1.00f, 1.0f) : new Vector4(0.29f, 0.62f, 1.00f, 1.0f), // Accent
-                CornerRadius = 4f
+                Color = isActive ? new Vector4(0.28f, 0.64f, 1.00f, 1.0f) : new Vector4(0.18f, 0.56f, 0.95f, 1.0f)
             });
         }
         
         // Value text
         string valText = value.ToString("0.00");
-        _drawCommands.Add(new DrawCommand
-        {
-            Type = DrawCommandType.Text,
-            Position = new Vector2(pos.X + width / 2 - valText.Length * 3.5f, pos.Y + height / 2 - 7),
-            Text = valText,
-            Color = new Vector4(1f, 1f, 1f, 0.8f) // TextPrimary
-        });
+        TextInRect(pos.X, pos.Y, width, height, valText, new Vector4(1f, 1f, 1f, 0.8f), TextAlign.Center);
 
         _cursorPos.Y += height + 10;
 
@@ -435,13 +468,8 @@ public class NotBSUI
             displayText += "|"; // Blinking cursor
         }
 
-        _drawCommands.Add(new DrawCommand
-        {
-            Type = DrawCommandType.Text,
-            Position = pos + new Vector2(10, height / 2 - 8),
-            Color = new Vector4(0.9f, 0.9f, 0.95f, 1.0f),
-            Text = displayText
-        });
+        TextInRect(pos.X + 10, pos.Y, MathF.Max(0f, width - 20f), height, displayText,
+            new Vector4(0.9f, 0.9f, 0.95f, 1.0f), TextAlign.Left);
 
         _cursorPos.Y += height + 10;
 
@@ -492,7 +520,7 @@ public class NotBSUI
     public void RoundedPanel(float x, float y, float width, float height,
                              Vector4 color, float cornerRadius = 6f)
     {
-        if (cornerRadius < 0.5f)
+        if (SharpCorners || cornerRadius < 0.5f)
         {
             // Fall back to regular panel for tiny radii
             Panel(x, y, width, height, color);
@@ -504,7 +532,8 @@ public class NotBSUI
             Position = new Vector2(x, y),
             Size = new Vector2(width, height),
             Color = color,
-            CornerRadius = cornerRadius
+            CornerRadius = cornerRadius,
+            ClipRect = _activeClipRect
         });
     }
 
@@ -513,6 +542,12 @@ public class NotBSUI
                                      Vector4 colorStart, Vector4 colorEnd,
                                      float cornerRadius = 6f, bool vertical = true)
     {
+        if (SharpCorners || cornerRadius < 0.5f)
+        {
+            GradientPanel(x, y, width, height, colorStart, colorEnd, vertical);
+            return;
+        }
+
         _drawCommands.Add(new DrawCommand
         {
             Type = DrawCommandType.RoundedGradientRectFilled,
@@ -521,7 +556,8 @@ public class NotBSUI
             Color = colorStart,
             ColorEnd = colorEnd,
             CornerRadius = cornerRadius,
-            GradientVertical = vertical
+            GradientVertical = vertical,
+            ClipRect = _activeClipRect
         });
     }
 
@@ -572,52 +608,44 @@ public class NotBSUI
             bgColor = hoverColor;
         }
         
-        // Shadow removed to fix rendering bleeding artifact        
-        // Draw button background (gradient for depth)
-        Vector4 bgTop = new Vector4(
-            Math.Min(1f, bgColor.X + 0.05f),
-            Math.Min(1f, bgColor.Y + 0.05f),
-            Math.Min(1f, bgColor.Z + 0.05f),
-            bgColor.W);
-        
-        Vector4 bgBottom = new Vector4(
-            Math.Max(0f, bgColor.X - 0.05f),
-            Math.Max(0f, bgColor.Y - 0.05f),
-            Math.Max(0f, bgColor.Z - 0.05f),
-            bgColor.W);
-
-        if (isActive) {
-            // Invert gradient when pressed
-            var temp = bgTop;
-            bgTop = bgBottom;
-            bgBottom = temp;
+        if (!SharpCorners && height >= 16f)
+        {
+            _drawCommands.Add(new DrawCommand
+            {
+                Type = DrawCommandType.RoundedRectFilled,
+                Position = pos,
+                Size = size,
+                Color = bgColor,
+                CornerRadius = MathF.Min(8f, height * 0.35f),
+                ClipRect = _activeClipRect
+            });
+        }
+        else
+        {
+            _drawCommands.Add(new DrawCommand
+            {
+                Type = DrawCommandType.RectFilled,
+                Position = pos,
+                Size = size,
+                Color = bgColor,
+                ClipRect = _activeClipRect
+            });
         }
 
+        var edgeColor = isHot || isActive
+            ? new Vector4(pressedColor.X, pressedColor.Y, pressedColor.Z, Math.Max(0.65f, pressedColor.W))
+            : new Vector4(0.145f, 0.155f, 0.172f, 1.0f);
+
         _drawCommands.Add(new DrawCommand
         {
-            Type = DrawCommandType.RoundedGradientRectFilled,
+            Type = DrawCommandType.Rect,
             Position = pos,
             Size = size,
-            Color = bgTop,
-            ColorEnd = bgBottom,
-            CornerRadius = 6f,
-            GradientVertical = true,
+            Color = edgeColor,
             ClipRect = _activeClipRect
         });
         
-        // Draw text centered
-        float textWidth = text.Length * 9;
-        float textX = pos.X + (size.X - textWidth) / 2;
-        float textY = pos.Y + (size.Y - 12) / 2;
-        
-        _drawCommands.Add(new DrawCommand
-        {
-            Type = DrawCommandType.Text,
-            Position = new Vector2(textX, textY),
-            Color = textColor,
-            Text = text,
-            ClipRect = _activeClipRect
-        });
+        TextCentered(pos.X, pos.Y, size.X, size.Y, text, textColor);
         
         return wasPressed;
     }
@@ -649,14 +677,12 @@ public class NotBSUI
         
         // Shadow removed to fix rendering bleeding artifact
         
-        // Card body (rounded)
         _drawCommands.Add(new DrawCommand
         {
-            Type = DrawCommandType.RoundedRectFilled,
+            Type = DrawCommandType.RectFilled,
             Position = new Vector2(x, y),
             Size = new Vector2(width, height),
             Color = color,
-            CornerRadius = 6f,
             ClipRect = _activeClipRect
         });
         

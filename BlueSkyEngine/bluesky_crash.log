@@ -1,0 +1,11 @@
+[CRASH] System.ArgumentException: Buffer data upload exceeds buffer size.
+   at NotBSRenderer.RHIValidation.Require(Boolean condition, String message) in /Users/sohamanand/BlueSky Engine/BlueSkyEngine/RHI/Validation/RHIValidation.cs:line 27
+   at NotBSRenderer.RHIValidation.ValidateBufferRange(ValidationBuffer buffer, ReadOnlySpan`1 data, UInt64 offset) in /Users/sohamanand/BlueSky Engine/BlueSkyEngine/RHI/Validation/RHIValidation.cs:line 123
+   at NotBSRenderer.ValidationDevice.UpdateBuffer(IRHIBuffer buffer, ReadOnlySpan`1 data, UInt64 offset) in /Users/sohamanand/BlueSky Engine/BlueSkyEngine/RHI/Validation/ValidationDevice.cs:line 107
+   at BlueSky.Rendering.EasePlus.EasePlusRenderer.UploadTileData() in /Users/sohamanand/BlueSky Engine/BlueSkyEngine/Rendering/EasePlus/Core/EasePlusRenderer.cs:line 689
+   at BlueSky.Rendering.EasePlus.EasePlusRenderer.RenderSceneWithShadows(World world, CameraComponent camera, TransformComponent cameraTransform, Vector3 lightPos, Vector3 lightDir) in /Users/sohamanand/BlueSky Engine/BlueSkyEngine/Rendering/EasePlus/Core/EasePlusRenderer.cs:line 245
+   at BlueSky.Rendering.EasePlus.EasePlusRenderer.RenderScene(World world, CameraComponent camera, TransformComponent cameraTransform) in /Users/sohamanand/BlueSky Engine/BlueSkyEngine/Rendering/EasePlus/Core/EasePlusRenderer.cs:line 177
+   at BlueSky.Rendering.Viewport.Render() in /Users/sohamanand/BlueSky Engine/BlueSkyEngine/Rendering/Viewport.cs:line 207
+   at BlueSky.Editor.Program.RenderFrame() in /Users/sohamanand/BlueSky Engine/BlueSkyEngine/Editor/EditorApp.cs:line 542
+   at BlueSky.Editor.Program.Run(String[] args) in /Users/sohamanand/BlueSky Engine/BlueSkyEngine/Editor/EditorApp.cs:line 371
+   at BlueSky.Editor.Program.Main(String[] args) in /Users/sohamanand/BlueSky Engine/BlueSkyEngine/Editor/Program.cs:line 22

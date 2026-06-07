@@ -23,6 +23,42 @@ internal static class D3D11Interop
         out IntPtr ppDevice,
         out uint pFeatureLevel,
         out IntPtr ppImmediateContext);
+        
+    [DllImport("d3dcompiler_47.dll", CallingConvention = CallingConvention.StdCall)]
+    public static extern int D3DCompile(
+        IntPtr pSrcData,
+        nuint SrcDataSize,
+        [MarshalAs(UnmanagedType.LPStr)] string pSourceName,
+        IntPtr pDefines,
+        IntPtr pInclude,
+        [MarshalAs(UnmanagedType.LPStr)] string pEntrypoint,
+        [MarshalAs(UnmanagedType.LPStr)] string pTarget,
+        uint Flags1,
+        uint Flags2,
+        out IntPtr ppCode,
+        out IntPtr ppErrorMsgs);
+
+    public static IntPtr GetBufferPointer(IntPtr blob)
+    {
+        unsafe
+        {
+            IntPtr vtable = *(IntPtr*)blob;
+            IntPtr fnPtr = *((IntPtr*)vtable + 3); // GetBufferPointer
+            var fn = (delegate* unmanaged[Stdcall]<IntPtr, IntPtr>)fnPtr;
+            return fn(blob);
+        }
+    }
+
+    public static nuint GetBufferSize(IntPtr blob)
+    {
+        unsafe
+        {
+            IntPtr vtable = *(IntPtr*)blob;
+            IntPtr fnPtr = *((IntPtr*)vtable + 4); // GetBufferSize
+            var fn = (delegate* unmanaged[Stdcall]<IntPtr, nuint>)fnPtr;
+            return fn(blob);
+        }
+    }
     
     // Constants
     public const uint D3D11_SDK_VERSION = 7;
@@ -102,10 +138,20 @@ internal static class D3D11Interop
         return format switch
         {
             TextureFormat.R8Unorm => DXGI_FORMAT_R8_UNORM,
+            TextureFormat.R32Float => DXGI_FORMAT_R32_FLOAT,
             TextureFormat.RGBA8Unorm => DXGI_FORMAT_R8G8B8A8_UNORM,
+            TextureFormat.RGBA8Srgb => DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
             TextureFormat.BGRA8Unorm => DXGI_FORMAT_B8G8R8A8_UNORM,
+            TextureFormat.BGRA8Srgb => DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+            TextureFormat.RG32Float => DXGI_FORMAT_R32G32_FLOAT,
+            TextureFormat.RGB32Float => DXGI_FORMAT_R32G32B32_FLOAT,
+            TextureFormat.RGBA16Float => DXGI_FORMAT_R16G16B16A16_FLOAT,
+            TextureFormat.RGBA32Float => DXGI_FORMAT_R32G32B32A32_FLOAT,
             TextureFormat.Depth32Float => DXGI_FORMAT_D32_FLOAT,
             TextureFormat.Depth24Stencil8 => DXGI_FORMAT_D24_UNORM_S8_UINT,
+            TextureFormat.BC1 => DXGI_FORMAT_BC1_UNORM,
+            TextureFormat.BC3 => DXGI_FORMAT_BC3_UNORM,
+            TextureFormat.BC7 => DXGI_FORMAT_BC7_UNORM,
             _ => throw new NotSupportedException($"Format {format} not supported on DX11")
         };
     }
@@ -137,29 +183,7 @@ internal static class D3D11Interop
     public const uint DXGI_FORMAT_BC3_UNORM = 77;
     public const uint DXGI_FORMAT_BC7_UNORM = 98;
 
-    // ── Extended format mapper ──────────────────────────────────────────
-    public static uint ToDXGIFormatExtended(TextureFormat format)
-    {
-        return format switch
-        {
-            TextureFormat.R8Unorm => DXGI_FORMAT_R8_UNORM,
-            TextureFormat.R32Float => DXGI_FORMAT_R32_FLOAT,
-            TextureFormat.RGBA8Unorm => DXGI_FORMAT_R8G8B8A8_UNORM,
-            TextureFormat.RGBA8Srgb => DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
-            TextureFormat.BGRA8Unorm => DXGI_FORMAT_B8G8R8A8_UNORM,
-            TextureFormat.BGRA8Srgb => DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
-            TextureFormat.RG32Float => DXGI_FORMAT_R32G32_FLOAT,
-            TextureFormat.RGB32Float => DXGI_FORMAT_R32G32B32_FLOAT,
-            TextureFormat.RGBA16Float => DXGI_FORMAT_R16G16B16A16_FLOAT,
-            TextureFormat.RGBA32Float => DXGI_FORMAT_R32G32B32A32_FLOAT,
-            TextureFormat.Depth32Float => DXGI_FORMAT_D32_FLOAT,
-            TextureFormat.Depth24Stencil8 => DXGI_FORMAT_D24_UNORM_S8_UINT,
-            TextureFormat.BC1 => DXGI_FORMAT_BC1_UNORM,
-            TextureFormat.BC3 => DXGI_FORMAT_BC3_UNORM,
-            TextureFormat.BC7 => DXGI_FORMAT_BC7_UNORM,
-            _ => DXGI_FORMAT_UNKNOWN
-        };
-    }
+    // ── Extended format mapper removed (merged into ToDXGIFormat) ──
 
     // ── Blend Constants ─────────────────────────────────────────────────
     public const uint D3D11_BLEND_ZERO = 1;

@@ -1,0 +1,58 @@
+// Character Locomotion AnimScript
+// This controls walking, running, jumping for a character
+
+state Idle {
+    animation "character_idle"
+    speed 1.0
+    loop true
+    blend 0.2
+    
+    // Transition to walk when moving
+    transition Walk when speed > 0.1
+    
+    // Transition to jump when jump button pressed
+    transition Jump when isJumping
+}
+
+state Walk {
+    animation "character_walk"
+    speed 1.0
+    loop true
+    blend 0.2
+    
+    // Back to idle when stopped
+    transition Idle when speed < 0.1
+    
+    // Speed up to run
+    transition Run when speed > 5.0
+    
+    // Can jump while walking
+    transition Jump when isJumping
+}
+
+state Run {
+    animation "character_run"
+    speed 1.0
+    loop true
+    blend 0.15
+    
+    // Slow down to walk
+    transition Walk when speed < 5.0
+    
+    // Stop running
+    transition Idle when speed < 0.1
+    
+    // Can jump while running
+    transition Jump when isJumping
+}
+
+state Jump {
+    animation "character_jump"
+    speed 1.0
+    loop false
+    blend 0.1
+    
+    // Land back to idle or walk based on speed
+    transition Idle when isGrounded
+    transition Walk when isGrounded
+}

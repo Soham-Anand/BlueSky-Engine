@@ -477,7 +477,8 @@ namespace BlueSky.Core.Math
         public static Matrix4x4 CreatePerspective(float fov, float aspect, float near, float far)
         {
             float yS = 1f / MathF.Tan(fov * 0.5f), xS = yS / aspect;
-            return new(xS, 0, 0, 0, 0, yS, 0, 0, 0, 0, far / (far - near), 1, 0, 0, -near * far / (far - near), 0);
+            // Right-Handed [0, 1] projection (m33 = far/(near-far), m34 = -1, m43 = (near*far)/(near-far))
+            return new(xS, 0, 0, 0, 0, yS, 0, 0, 0, 0, far / (near - far), -1, 0, 0, (near * far) / (near - far), 0);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]

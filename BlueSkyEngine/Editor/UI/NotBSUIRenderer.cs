@@ -29,8 +29,11 @@ public sealed class NotBSUIRenderer : IDisposable
     private          IRHIPipeline? _pipeline;
     private          IRHIBuffer?   _vertexBuffer;
     private          IRHIBuffer?   _indexBuffer;
+    private          IRHIBuffer?   _textureVertexBuffer;
+    private          IRHIBuffer?   _textureIndexBuffer;
     private          IRHIBuffer?   _uniformBuffer;
     private          IRHITexture?  _whiteTexture;
+    private          IntPtr        _dx11Sampler; // ID3D11SamplerState*
     
     // ── font rendering ──────────────────────────────────────────────────────
     public           FontAtlas?    FontAtlas { get; set; }
@@ -89,6 +92,49 @@ public sealed class NotBSUIRenderer : IDisposable
         });
     }
 
+    private const string SimpleUI_HLSL = @"
+cbuffer Uniforms : register(b1) {
+    float4x4 projection;
+};
+
+Texture2D fontAtlasTex : register(t0);
+SamplerState fontAtlasSampler : register(s0);
+
+struct VS_INPUT {
+    float2 position : POSITION;
+    float4 color    : NORMAL;
+    float2 uv       : TEXCOORD0;
+    float  mode     : COLOR0;
+};
+
+struct VS_OUTPUT {
+    float4 position : SV_POSITION;
+    float4 color    : COLOR0;
+    float2 uv       : TEXCOORD0;
+    float  mode     : TEXCOORD1;
+};
+
+VS_OUTPUT vs_ui(VS_INPUT input) {
+    VS_OUTPUT output;
+    output.position = mul(projection, float4(input.position, 0.0, 1.0));
+    output.color = input.color;
+    output.uv = input.uv;
+    output.mode = input.mode;
+    return output;
+}
+
+float4 fs_ui(VS_OUTPUT input) : SV_Target {
+    if (input.mode > 1.5) {
+        return fontAtlasTex.Sample(fontAtlasSampler, input.uv);
+    } else if (input.mode > 0.5) {
+        float coverage = fontAtlasTex.Sample(fontAtlasSampler, input.uv).r;
+        if (coverage < 0.01) discard;
+        return float4(input.color.rgb, input.color.a * coverage);
+    }
+    return input.color;
+}
+";
+
     private ShaderDesc LoadShader(ShaderStage stage, string entryPoint)
     {
         byte[] bytecode = Array.Empty<byte>();
@@ -114,6 +160,73 @@ public sealed class NotBSUIRenderer : IDisposable
             {
                 Console.WriteLine($"[NotBSUIRenderer] WARNING: simple_ui.metallib not found. Searched:");
                 foreach (var p in searchPaths) Console.WriteLine($"  {p}");
+            }
+        }
+        else if (_device.Backend == RHIBackend.DirectX11)
+        {
+            // DX11: Compile shader from embedded HLSL at runtime using D3DCompile
+            string profile = stage == ShaderStage.Vertex ? "vs_4_0" : "ps_4_0";
+            IntPtr pSrc = Marshal.StringToHGlobalAnsi(SimpleUI_HLSL);
+            
+            int hr = NotBSRenderer.DirectX11.D3D11Interop.D3DCompile(
+                pSrc,
+                (nuint)SimpleUI_HLSL.Length,
+                "simple_ui.hlsl",
+                IntPtr.Zero,
+                IntPtr.Zero,
+                entryPoint,
+                profile,
+                0, 0,
+                out IntPtr blob,
+                out IntPtr errorBlob);
+                
+            Marshal.FreeHGlobal(pSrc);
+
+            if (hr < 0)
+            {
+                if (errorBlob != IntPtr.Zero)
+                {
+                    IntPtr pErrorStr = NotBSRenderer.DirectX11.D3D11Interop.GetBufferPointer(errorBlob);
+                    string? errorMsg = Marshal.PtrToStringAnsi(pErrorStr);
+                    Console.WriteLine($"[NotBSUIRenderer] DX11 Shader Compile Error ({entryPoint}):\n{errorMsg}");
+                    Marshal.Release(errorBlob);
+                }
+                Console.WriteLine($"[NotBSUIRenderer] D3DCompile failed for {entryPoint} with HRESULT 0x{hr:X8}");
+            }
+            else
+            {
+                if (blob != IntPtr.Zero)
+                {
+                    IntPtr pCode = NotBSRenderer.DirectX11.D3D11Interop.GetBufferPointer(blob);
+                    nuint size = NotBSRenderer.DirectX11.D3D11Interop.GetBufferSize(blob);
+                    bytecode = new byte[size];
+                    Marshal.Copy(pCode, bytecode, 0, (int)size);
+                    Marshal.Release(blob);
+                }
+                if (errorBlob != IntPtr.Zero) Marshal.Release(errorBlob);
+            }
+        }
+        else if (_device.Backend == RHIBackend.Vulkan)
+        {
+            string stageSuffix = stage == ShaderStage.Vertex ? "vert" : "frag";
+            string fileName = $"simple_ui.{stageSuffix}.spv";
+            string[] searchPaths = new[]
+            {
+                Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Shaders", fileName),
+                Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Editor", "Shaders", fileName),
+                Path.Combine(Directory.GetCurrentDirectory(), "Editor", "Shaders", fileName),
+                Path.Combine(Directory.GetCurrentDirectory(), "BlueSkyEngine", "Editor", "Shaders", fileName),
+            };
+
+            string? found = Array.Find(searchPaths, File.Exists);
+            if (found != null)
+            {
+                bytecode = File.ReadAllBytes(found);
+                Console.WriteLine($"[NotBSUIRenderer] Loaded Vulkan shader {fileName} from {found} ({bytecode.Length} bytes)");
+            }
+            else
+            {
+                Console.WriteLine($"[NotBSUIRenderer] WARNING: {fileName} not found. Vulkan UI rendering requires SPIR-V bytecode.");
             }
         }
 
@@ -143,6 +256,22 @@ public sealed class NotBSUIRenderer : IDisposable
             DebugName  = "NotBSUI.IB",
         });
 
+        _textureVertexBuffer = _device.CreateBuffer(new BufferDesc
+        {
+            Size       = (ulong)(4 * UIVertex.Stride),
+            Usage      = BufferUsage.Vertex,
+            MemoryType = MemoryType.CpuToGpu,
+            DebugName  = "NotBSUI.TextureVB",
+        });
+
+        _textureIndexBuffer = _device.CreateBuffer(new BufferDesc
+        {
+            Size       = 6 * sizeof(ushort),
+            Usage      = BufferUsage.Index,
+            MemoryType = MemoryType.CpuToGpu,
+            DebugName  = "NotBSUI.TextureIB",
+        });
+
         _uniformBuffer = _device.CreateBuffer(new BufferDesc
         {
             Size       = 64,
@@ -168,6 +297,15 @@ public sealed class NotBSUIRenderer : IDisposable
 
         Span<byte> pixel = stackalloc byte[4] { 255, 255, 255, 255 };
         _device.UploadTexture(_whiteTexture, pixel);
+
+        if (_device.Backend == RHIBackend.DirectX11 && _device is NotBSRenderer.DirectX11.D3D11Device d3dDevice)
+        {
+            // Create a default linear sampler for DX11
+            _dx11Sampler = d3dDevice.CreateSamplerState(
+                21, // D3D11_FILTER_MIN_MAG_MIP_LINEAR
+                1   // D3D11_TEXTURE_ADDRESS_WRAP
+            );
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -179,10 +317,16 @@ public sealed class NotBSUIRenderer : IDisposable
         _projection = Matrix4x4.CreateOrthographicOffCenter(0, width, height, 0, -1, 1);
     }
 
-    private int _debugFrames = 120; // brief logging window
+    private int _debugFrames = 1; // brief logging window
 
     public void Render(IRHICommandBuffer cmd, NotBSUI ui)
     {
+        if (FontAtlas != null)
+        {
+            ui.MeasureTextWidth = text => FontAtlas.MeasureWidth(text.AsSpan());
+            ui.TextLineHeight = FontAtlas.LineHeight;
+        }
+
         var commands = ui.GetDrawCommands();
         TessellateDrawCommands(commands);
 
@@ -215,6 +359,11 @@ public sealed class NotBSUIRenderer : IDisposable
         else if (_whiteTexture != null)
             cmd.SetTexture(_whiteTexture, 0, 0);
 
+        if (_device.Backend == RHIBackend.DirectX11 && cmd is NotBSRenderer.DirectX11.D3D11CommandBuffer d3dCmd && _dx11Sampler != IntPtr.Zero)
+        {
+            d3dCmd.SetSampler(_dx11Sampler, 0);
+        }
+
         cmd.DrawIndexed((uint)_indices.Count);
 
         if (_debugFrames-- > 0)
@@ -230,6 +379,14 @@ public sealed class NotBSUIRenderer : IDisposable
 
     public void RenderTexture(IRHICommandBuffer cmd, IRHITexture texture, float x, float y, float w, float h)
     {
+        // Snap the composited viewport quad to whole pixels so the editor does
+        // not introduce a shimmer/heat-haze look when sampling the offscreen
+        // render target into the docked panel.
+        x = MathF.Round(x);
+        y = MathF.Round(y);
+        w = MathF.Round(w);
+        h = MathF.Round(h);
+
         // Draw an immediate quad with the given texture using the UI pipeline
         var verts = new UIVertex[4];
         var color = new Vector4(1, 1, 1, 1);
@@ -242,21 +399,27 @@ public sealed class NotBSUIRenderer : IDisposable
         ushort[] indices = { 0, 1, 2, 0, 2, 3 };
 
         var vertexBytes = MemoryMarshal.AsBytes(verts.AsSpan());
-        _device.UpdateBuffer(_vertexBuffer!, vertexBytes);
+        _device.UpdateBuffer(_textureVertexBuffer!, vertexBytes);
 
         var indexBytes = MemoryMarshal.AsBytes(indices.AsSpan());
-        _device.UpdateBuffer(_indexBuffer!, indexBytes);
+        _device.UpdateBuffer(_textureIndexBuffer!, indexBytes);
 
         var projBytes = MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref _projection, 1));
         _device.UpdateBuffer(_uniformBuffer!, projBytes);
 
         cmd.SetPipeline(_pipeline!);
-        cmd.SetVertexBuffer(_vertexBuffer!, 0, 0);
-        cmd.SetIndexBuffer(_indexBuffer!, IndexType.UInt16, 0);
+        cmd.SetVertexBuffer(_textureVertexBuffer!, 0, 0);
+        cmd.SetIndexBuffer(_textureIndexBuffer!, IndexType.UInt16, 0);
         cmd.SetUniformBuffer(_uniformBuffer!, 1, 0);
 
         // Bind the viewport texture (slot 0, same as font atlas in Render())
         cmd.SetTexture(texture, 0, 0);
+
+        if (_device.Backend == RHIBackend.DirectX11 && cmd is NotBSRenderer.DirectX11.D3D11CommandBuffer d3dCmd && _dx11Sampler != IntPtr.Zero)
+        {
+            d3dCmd.SetSampler(_dx11Sampler, 0);
+        }
+
         cmd.DrawIndexed(6);
     }
 
@@ -581,10 +744,10 @@ public sealed class NotBSUIRenderer : IDisposable
 
             if (FontAtlas.TryGetGlyphQuad(c, ref x, yBaseline, out var p0, out var p1, out var uv0, out var uv1))
             {
-                if (_debugFrames > 0)
-                {
-                    Console.WriteLine($"[Text] '{c}' bounds: p0={p0.X},{p0.Y} p1={p1.X},{p1.Y} uv0={uv0.X},{uv0.Y} uv1={uv1.X},{uv1.Y}");
-                }
+                // if (_debugFrames > 0)
+                // {
+                //     Console.WriteLine($"[Text] '{c}' bounds: p0={p0.X},{p0.Y} p1={p1.X},{p1.Y} uv0={uv0.X},{uv0.Y} uv1={uv1.X},{uv1.Y}");
+                // }
                 AddGlyphQuad(p0, p1, uv0, uv1, color);
             }
         }
@@ -638,6 +801,8 @@ public sealed class NotBSUIRenderer : IDisposable
         _pipeline?.Dispose();
         _vertexBuffer?.Dispose();
         _indexBuffer?.Dispose();
+        _textureVertexBuffer?.Dispose();
+        _textureIndexBuffer?.Dispose();
         _uniformBuffer?.Dispose();
         _whiteTexture?.Dispose();
     }

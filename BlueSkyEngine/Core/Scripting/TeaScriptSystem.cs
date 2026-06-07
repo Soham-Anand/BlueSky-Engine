@@ -3,6 +3,9 @@ using System.Collections.Generic;
 using BlueSky.Core.ECS;
 using BlueSky.Core.ECS.Builtin;
 using BlueSky.Core.Assets;
+using BlueSky.Runtime.UI;
+using BlueSky.Core.Gameplay;
+using BlueSky.Physics;
 using TeaScript.Bridge;
 
 namespace BlueSky.Core.Scripting;
@@ -14,10 +17,39 @@ public class TeaScriptSystem : SystemBase
 {
     private readonly Dictionary<uint, TeaScriptEngine> _runtimeInstances = new();
     private float _deltaTime = 0.016f;
-    
+    private Func<string, bool>? _keyProvider;
+    private Func<int, bool>? _mouseButtonProvider;
+
+    private static TeaScriptSystem? _instance;
+    public static TeaScriptSystem? Instance => _instance;
+
     public TeaScriptSystem(World world)
     {
+        _instance = this;
         Initialize(world);
+    }
+
+    public static void CallFunctionOnAllScripts(string functionName, params object?[] args)
+    {
+        if (_instance == null) return;
+        
+        foreach (var engine in _instance._runtimeInstances.Values)
+        {
+            try
+            {
+                engine.CallFunction(functionName, args);
+            }
+            catch (Exception)
+            {
+                // Ignore scripts that do not have this function defined
+            }
+        }
+    }
+
+    public void SetInputProviders(Func<string, bool>? keyProvider, Func<int, bool>? mouseButtonProvider = null)
+    {
+        _keyProvider = keyProvider;
+        _mouseButtonProvider = mouseButtonProvider;
     }
     
     /// <summary>
@@ -92,23 +124,29 @@ public class TeaScriptSystem : SystemBase
     {
         try
         {
+            var scriptPath = ResolveScriptPath(script.ScriptAssetId);
+            if (string.IsNullOrEmpty(scriptPath))
+            {
+                Console.WriteLine($"[TeaScript] No script file specified for entity {entity.Id}");
+                script.IsEnabled = false;
+                return;
+            }
+
+            if (!System.IO.File.Exists(scriptPath))
+            {
+                Console.WriteLine($"[TeaScript] Script not found for entity {entity.Id}: {script.ScriptAssetId}");
+                script.IsEnabled = false;
+                return;
+            }
+
             var engine = new TeaScriptEngine();
             
             // Register basic engine functions
             RegisterEngineFunctions(engine, entity);
             
             // Load the actual script file
-            if (!string.IsNullOrEmpty(script.ScriptAssetId))
-            {
-                Console.WriteLine($"[TeaScript] Loading script: {script.ScriptAssetId}");
-                engine.LoadScript(script.ScriptAssetId);
-            }
-            else
-            {
-                Console.WriteLine($"[TeaScript] No script file specified for entity {entity.Id}");
-                script.IsEnabled = false;
-                return;
-            }
+            Console.WriteLine($"[TeaScript] Loading script: {scriptPath}");
+            engine.LoadScript(scriptPath);
             
             // Store instance
             uint instanceId = (uint)_runtimeInstances.Count + 1;
@@ -143,6 +181,52 @@ public class TeaScriptSystem : SystemBase
             Console.WriteLine($"[TeaScript:{entity.Id}] {message}");
             return null;
         });
+
+        // Runtime UI - frame-local HUD drawing. These are rendered by the
+        // runtime UI overlay during play mode, above the viewport.
+        engine.RegisterFunction("uiText", (args) =>
+        {
+            if (args.Count >= 3)
+            {
+                RuntimeUI.Label(
+                    args[0]?.ToString() ?? "",
+                    Convert.ToSingle(args[1]),
+                    Convert.ToSingle(args[2]),
+                    ParseRuntimeUIAnchor(args, 3),
+                    ParseRuntimeUIColor(args, 4, RuntimeUI.TextPrimary));
+            }
+            return null;
+        });
+
+        engine.RegisterFunction("uiPanel", (args) =>
+        {
+            if (args.Count >= 4)
+            {
+                RuntimeUI.Panel(
+                    Convert.ToSingle(args[0]),
+                    Convert.ToSingle(args[1]),
+                    Convert.ToSingle(args[2]),
+                    Convert.ToSingle(args[3]),
+                    ParseRuntimeUIAnchor(args, 4),
+                    ParseRuntimeUIColor(args, 5, RuntimeUI.PanelColor));
+            }
+            return null;
+        });
+
+        engine.RegisterFunction("uiProgressBar", (args) =>
+        {
+            if (args.Count >= 5)
+            {
+                RuntimeUI.ProgressBar(
+                    Convert.ToSingle(args[0]),
+                    Convert.ToSingle(args[1]),
+                    Convert.ToSingle(args[2]),
+                    Convert.ToSingle(args[3]),
+                    Convert.ToSingle(args[4]),
+                    ParseRuntimeUIAnchor(args, 5));
+            }
+            return null;
+        });
         
         // Time
         engine.RegisterFunction("getDeltaTime", (args) =>
@@ -153,6 +237,11 @@ public class TeaScriptSystem : SystemBase
         // Transform - Get Position
         engine.RegisterFunction("getPositionX", (args) =>
         {
+            if (World.HasComponent<RigidbodyComponent>(entity))
+            {
+                return (double)BlueSky.Physics.PhysicsTeaScriptBridge.GetPosition(entity).X;
+            }
+
             if (World.TryGetComponent<TransformComponent>(entity, out var transform))
             {
                 return (double)transform.Position.X;
@@ -162,6 +251,11 @@ public class TeaScriptSystem : SystemBase
         
         engine.RegisterFunction("getPositionY", (args) =>
         {
+            if (World.HasComponent<RigidbodyComponent>(entity))
+            {
+                return (double)BlueSky.Physics.PhysicsTeaScriptBridge.GetPosition(entity).Y;
+            }
+
             if (World.TryGetComponent<TransformComponent>(entity, out var transform))
             {
                 return (double)transform.Position.Y;
@@ -171,6 +265,11 @@ public class TeaScriptSystem : SystemBase
         
         engine.RegisterFunction("getPositionZ", (args) =>
         {
+            if (World.HasComponent<RigidbodyComponent>(entity))
+            {
+                return (double)BlueSky.Physics.PhysicsTeaScriptBridge.GetPosition(entity).Z;
+            }
+
             if (World.TryGetComponent<TransformComponent>(entity, out var transform))
             {
                 return (double)transform.Position.Z;
@@ -186,6 +285,7 @@ public class TeaScriptSystem : SystemBase
                 ref var transform = ref World.GetComponent<TransformComponent>(entity);
                 var pos = transform.Position;
                 transform.Position = new BlueSky.Core.Math.Vector3(Convert.ToSingle(args[0]), pos.Y, pos.Z);
+                SyncPhysicsPosition(entity, transform.Position);
             }
             return null;
         });
@@ -197,6 +297,7 @@ public class TeaScriptSystem : SystemBase
                 ref var transform = ref World.GetComponent<TransformComponent>(entity);
                 var pos = transform.Position;
                 transform.Position = new BlueSky.Core.Math.Vector3(pos.X, Convert.ToSingle(args[0]), pos.Z);
+                SyncPhysicsPosition(entity, transform.Position);
             }
             return null;
         });
@@ -208,6 +309,7 @@ public class TeaScriptSystem : SystemBase
                 ref var transform = ref World.GetComponent<TransformComponent>(entity);
                 var pos = transform.Position;
                 transform.Position = new BlueSky.Core.Math.Vector3(pos.X, pos.Y, Convert.ToSingle(args[0]));
+                SyncPhysicsPosition(entity, transform.Position);
             }
             return null;
         });
@@ -223,6 +325,7 @@ public class TeaScriptSystem : SystemBase
                 float z = Convert.ToSingle(args[2]);
                 var pos = transform.Position;
                 transform.Position = new BlueSky.Core.Math.Vector3(pos.X + x, pos.Y + y, pos.Z + z);
+                SyncPhysicsPosition(entity, transform.Position);
             }
             return null;
         });
@@ -237,12 +340,14 @@ public class TeaScriptSystem : SystemBase
         // Input (placeholder)
         engine.RegisterFunction("getKey", (args) =>
         {
-            return false;
+            string key = args.Count > 0 ? args[0]?.ToString() ?? "" : "";
+            return _keyProvider?.Invoke(key) ?? false;
         });
         
         engine.RegisterFunction("getMouseButton", (args) =>
         {
-            return false;
+            int button = args.Count > 0 ? Convert.ToInt32(args[0]) : 0;
+            return _mouseButtonProvider?.Invoke(button) ?? false;
         });
         
         // Transform - Set Position (all at once)
@@ -255,7 +360,25 @@ public class TeaScriptSystem : SystemBase
                 float y = Convert.ToSingle(args[1]);
                 float z = Convert.ToSingle(args[2]);
                 transform.Position = new BlueSky.Core.Math.Vector3(x, y, z);
+                SyncPhysicsPosition(entity, transform.Position);
             }
+            return null;
+        });
+
+        // Compatibility alias used by the bundled player.tea example.
+        // Two args move in X/Y for simple 2D tests; three args move in 3D.
+        engine.RegisterFunction("movePlayer", (args) =>
+        {
+            if (World == null || args.Count < 2 || !World.HasComponent<TransformComponent>(entity))
+                return null;
+
+            ref var transform = ref World.GetComponent<TransformComponent>(entity);
+            var pos = transform.Position;
+            float x = Convert.ToSingle(args[0]);
+            float y = Convert.ToSingle(args[1]);
+            float z = args.Count >= 3 ? Convert.ToSingle(args[2]) : pos.Z;
+            transform.Position = new BlueSky.Core.Math.Vector3(x, y, z);
+            SyncPhysicsPosition(entity, transform.Position);
             return null;
         });
         
@@ -322,9 +445,218 @@ public class TeaScriptSystem : SystemBase
             return 0.0;
         });
         
-        // ═══════════════════════════════════════════════════════════════
+        // ══════════════════════════════════════════════════════════════
+        //  VEHICLE PHYSICS API (uses static CarControllerSystem lookup)
+        // ════════════════════════════════════════════════════════════
+
+        Func<int, CarController?> getController = (entityId) =>
+            CarControllerSystem.GetController((uint)entityId);
+
+        Func<int, int, WheelState?> getWheel = (entityId, wheelIndex) =>
+        {
+            var ctrl = getController(entityId);
+            if (ctrl == null || ctrl._wheelStates == null) return null;
+            if (wheelIndex < 0 || wheelIndex >= ctrl._wheelStates.Length) return null;
+            return ctrl._wheelStates[wheelIndex];
+        };
+
+        engine.RegisterFunction("getWheelGrounded", (args) =>
+        {
+            if (args.Count >= 1)
+            {
+                int wheelIndex = Convert.ToInt32(args[0]);
+                var w = getWheel(entity.Id, wheelIndex);
+                return w?.IsGrounded ?? false;
+            }
+            return false;
+        });
+
+        engine.RegisterFunction("getWheelSuspension", (args) =>
+        {
+            if (args.Count >= 1)
+            {
+                int wheelIndex = Convert.ToInt32(args[0]);
+                var w = getWheel(entity.Id, wheelIndex);
+                return (double)(w?.SuspensionCompression ?? 0.0);
+            }
+            return 0.0;
+        });
+
+        engine.RegisterFunction("getWheelSlip", (args) =>
+        {
+            if (args.Count >= 2)
+            {
+                int wheelIndex = Convert.ToInt32(args[0]);
+                bool isLongitudinal = Convert.ToBoolean(args[1]);
+                var w = getWheel(entity.Id, wheelIndex);
+                if (w == null) return 0.0;
+                return (double)(isLongitudinal ? w.SlipRatio : w.SlipAngle);
+            }
+            return 0.0;
+        });
+
+        engine.RegisterFunction("getWheelSteerAngle", (args) =>
+        {
+            if (args.Count >= 1)
+            {
+                int wheelIndex = Convert.ToInt32(args[0]);
+                var w = getWheel(entity.Id, wheelIndex);
+                return (double)(w?.SteerAngle ?? 0.0);
+            }
+            return 0.0;
+        });
+
+        engine.RegisterFunction("getWheelAngularVelocity", (args) =>
+        {
+            if (args.Count >= 1)
+            {
+                int wheelIndex = Convert.ToInt32(args[0]);
+                var w = getWheel(entity.Id, wheelIndex);
+                return (double)(w?.AngularVelocity ?? 0.0);
+            }
+            return 0.0;
+        });
+
+        engine.RegisterFunction("getWheelContactNormalX", (args) =>
+        {
+            if (args.Count >= 1)
+            {
+                int wheelIndex = Convert.ToInt32(args[0]);
+                var w = getWheel(entity.Id, wheelIndex);
+                return (double)(w?.ContactNormal.X ?? 0.0);
+            }
+            return 0.0;
+        });
+
+        engine.RegisterFunction("getWheelContactNormalY", (args) =>
+        {
+            if (args.Count >= 1)
+            {
+                int wheelIndex = Convert.ToInt32(args[0]);
+                var w = getWheel(entity.Id, wheelIndex);
+                return (double)(w?.ContactNormal.Y ?? 0.0);
+            }
+            return 0.0;
+        });
+
+        engine.RegisterFunction("getWheelContactNormalZ", (args) =>
+        {
+            if (args.Count >= 1)
+            {
+                int wheelIndex = Convert.ToInt32(args[0]);
+                var w = getWheel(entity.Id, wheelIndex);
+                return (double)(w?.ContactNormal.Z ?? 0.0);
+            }
+            return 0.0;
+        });
+
+        // ══════════════════════════════════════════════════════════════
+        //  BONE MAPPING API (for skeletal mesh vehicle configuration)
+        // ══════════════════════════════════════════════════════════════
+
+        // setWheelBone(slot, boneName)
+        // slot: 0=RightFront, 1=LeftFront, 2=LeftRear, 3=RightRear, 4=MainBody
+        engine.RegisterFunction("setWheelBone", (args) =>
+        {
+            if (args.Count >= 2)
+            {
+                int slot = Convert.ToInt32(args[0]);
+                string boneName = args[1]?.ToString() ?? "";
+                uint eid = (uint)entity.Id;
+                CarController.SetBoneOverride(eid, slot, boneName);
+                Console.WriteLine($"[TeaScript:{entity.Id}] setWheelBone({slot}, \"{boneName}\")");
+            }
+            return null;
+        });
+
+        // setBodyBone(boneName) — shorthand for setWheelBone(4, boneName)
+        engine.RegisterFunction("setBodyBone", (args) =>
+        {
+            if (args.Count >= 1)
+            {
+                string boneName = args[0]?.ToString() ?? "";
+                uint eid = (uint)entity.Id;
+                CarController.SetBodyBoneOverride(eid, boneName);
+                Console.WriteLine($"[TeaScript:{entity.Id}] setBodyBone(\"{boneName}\")");
+            }
+            return null;
+        });
+
+        // refreshBones() — re-resolve bone mapping after setting overrides
+        // Must be called after setWheelBone/setBodyBone and after the car controller is initialized
+        engine.RegisterFunction("refreshBones", (args) =>
+        {
+            var ctrl = getController(entity.Id);
+            if (ctrl != null)
+            {
+                ctrl.RefreshBoneMapping();
+                Console.WriteLine($"[TeaScript:{entity.Id}] Bone mapping refreshed");
+            }
+            else
+            {
+                Console.WriteLine($"[TeaScript:{entity.Id}] refreshBones: car controller not yet initialized");
+            }
+            return null;
+        });
+
+        // setWheelPosition(slot, x, y, z) — override wheel local position
+        // slot: 0=FrontLeft, 1=FrontRight, 2=RearLeft, 3=RearRight
+        engine.RegisterFunction("setWheelPosition", (args) =>
+        {
+            if (args.Count >= 4)
+            {
+                var ctrl = getController(entity.Id);
+                if (ctrl != null)
+                {
+                    int slot = Convert.ToInt32(args[0]);
+                    float x = Convert.ToSingle(args[1]);
+                    float y = Convert.ToSingle(args[2]);
+                    float z = Convert.ToSingle(args[3]);
+                    ctrl.SetWheelLocalPosition(slot, x, y, z);
+                }
+            }
+            return null;
+        });
+
+        // setDriveWheels(fl, fr, rl, rr) — configure which wheels receive motor torque
+        engine.RegisterFunction("setDriveWheels", (args) =>
+        {
+            if (args.Count >= 4)
+            {
+                var ctrl = getController(entity.Id);
+                if (ctrl != null)
+                {
+                    ctrl.SetDriveWheels(
+                        Convert.ToBoolean(args[0]),
+                        Convert.ToBoolean(args[1]),
+                        Convert.ToBoolean(args[2]),
+                        Convert.ToBoolean(args[3]));
+                }
+            }
+            return null;
+        });
+
+        // setSteerWheels(fl, fr, rl, rr) — configure which wheels steer
+        engine.RegisterFunction("setSteerWheels", (args) =>
+        {
+            if (args.Count >= 4)
+            {
+                var ctrl = getController(entity.Id);
+                if (ctrl != null)
+                {
+                    ctrl.SetSteerWheels(
+                        Convert.ToBoolean(args[0]),
+                        Convert.ToBoolean(args[1]),
+                        Convert.ToBoolean(args[2]),
+                        Convert.ToBoolean(args[3]));
+                }
+            }
+            return null;
+        });
+
+        // ═════════════════════════════════════════════════════════════
         //  PHYSICS API
-        // ═══════════════════════════════════════════════════════════════
+        // ══════════════════════════════════════════════════════════════
         
         // Rigidbody - Velocity
         engine.RegisterFunction("getVelocityX", (args) =>
@@ -392,7 +724,7 @@ public class TeaScriptSystem : SystemBase
                 float y = Convert.ToSingle(args[1]);
                 float z = Convert.ToSingle(args[2]);
                 var impulse = new System.Numerics.Vector3(x, y, z);
-                BlueSky.Physics.PhysicsTeaScriptBridge.AddForce(entity, impulse);
+                BlueSky.Physics.PhysicsTeaScriptBridge.AddImpulse(entity, impulse);
             }
             return null;
         });
@@ -413,6 +745,7 @@ public class TeaScriptSystem : SystemBase
             {
                 ref var rb = ref World.GetComponent<RigidbodyComponent>(entity);
                 rb.Mass = Convert.ToSingle(args[0]);
+                BlueSky.Physics.PhysicsTeaScriptBridge.SetMass(entity, rb.Mass);
             }
             return null;
         });
@@ -423,6 +756,7 @@ public class TeaScriptSystem : SystemBase
             {
                 ref var rb = ref World.GetComponent<RigidbodyComponent>(entity);
                 rb.UseGravity = Convert.ToBoolean(args[0]);
+                BlueSky.Physics.PhysicsTeaScriptBridge.SetUseGravity(entity, rb.UseGravity);
             }
             return null;
         });
@@ -433,6 +767,7 @@ public class TeaScriptSystem : SystemBase
             {
                 ref var rb = ref World.GetComponent<RigidbodyComponent>(entity);
                 rb.IsKinematic = Convert.ToBoolean(args[0]);
+                BlueSky.Physics.PhysicsTeaScriptBridge.SetKinematic(entity, rb.IsKinematic);
             }
             return null;
         });
@@ -449,6 +784,11 @@ public class TeaScriptSystem : SystemBase
                 
                 // Simple euler angle rotation (degrees)
                 transform.Rotation = BlueSky.Core.Math.Quaternion.Euler(x, y, z);
+                BlueSky.Physics.PhysicsTeaScriptBridge.SetRotation(entity, new System.Numerics.Quaternion(
+                    transform.Rotation.X,
+                    transform.Rotation.Y,
+                    transform.Rotation.Z,
+                    transform.Rotation.W));
             }
             return null;
         });
@@ -465,11 +805,65 @@ public class TeaScriptSystem : SystemBase
             return false;
         });
     }
+
+    private static void SyncPhysicsPosition(Entity entity, BlueSky.Core.Math.Vector3 position)
+    {
+        BlueSky.Physics.PhysicsTeaScriptBridge.SetPosition(
+            entity,
+            new System.Numerics.Vector3(position.X, position.Y, position.Z));
+    }
+
+    private static string ResolveScriptPath(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            return string.Empty;
+
+        path = path.Trim();
+        if (System.IO.File.Exists(path))
+            return path;
+
+        if (!System.IO.Path.IsPathRooted(path))
+        {
+            string cwdPath = System.IO.Path.GetFullPath(path, Environment.CurrentDirectory);
+            if (System.IO.File.Exists(cwdPath))
+                return cwdPath;
+        }
+
+        return path;
+    }
+
+    private static RuntimeUIAnchor ParseRuntimeUIAnchor(List<object?> args, int index)
+    {
+        if (args.Count <= index || args[index] == null)
+            return RuntimeUIAnchor.TopLeft;
+
+        string value = args[index]!.ToString() ?? "";
+        return Enum.TryParse(value, ignoreCase: true, out RuntimeUIAnchor anchor)
+            ? anchor
+            : RuntimeUIAnchor.TopLeft;
+    }
+
+    private static System.Numerics.Vector4 ParseRuntimeUIColor(List<object?> args, int index, System.Numerics.Vector4 fallback)
+    {
+        if (args.Count < index + 3)
+            return fallback;
+
+        float r = Convert.ToSingle(args[index]);
+        float g = Convert.ToSingle(args[index + 1]);
+        float b = Convert.ToSingle(args[index + 2]);
+        float a = args.Count > index + 3 ? Convert.ToSingle(args[index + 3]) : fallback.W;
+        return new System.Numerics.Vector4(r, g, b, a);
+    }
     
     /// <summary>
     /// Cleanup all script instances.
     /// </summary>
     public void Cleanup()
+    {
+        _runtimeInstances.Clear();
+    }
+
+    public void ResetRuntimeInstances()
     {
         _runtimeInstances.Clear();
     }

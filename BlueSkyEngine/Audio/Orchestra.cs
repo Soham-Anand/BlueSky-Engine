@@ -14,15 +14,16 @@ public class Orchestra : IDisposable
     private readonly IAudioBackend _backend;
     private readonly Dictionary<string, AudioClip> _clips = new();
     private readonly List<AudioSource> _sources = new();
+    
+    public AudioMixer Mixer { get; } = new();
+    public SpatialAudio Spatial { get; } = new();
+    
     private Vector3 _listenerPosition = Vector3.Zero;
+    private Vector3 _listenerVelocity = Vector3.Zero;
     private Vector3 _listenerForward = new Vector3(0, 0, -1);
     private Vector3 _listenerUp = Vector3.UnitY;
     
     private bool _disposed;
-    
-    public float MasterVolume { get; set; } = 1.0f;
-    public float MusicVolume { get; set; } = 0.8f;
-    public float SFXVolume { get; set; } = 1.0f;
     
     public Orchestra(IAudioBackend backend)
     {
@@ -42,7 +43,7 @@ public class Orchestra : IDisposable
         }
     }
     
-    public AudioSource? PlaySound(string clipName, Vector3 position, float volume = 1.0f, bool loop = false)
+    public AudioSource? PlaySound(string clipName, Vector3 position, float volume = 1.0f, bool loop = false, AudioChannel channel = AudioChannel.SFX)
     {
         if (!_clips.TryGetValue(clipName, out var clip))
         {
@@ -54,13 +55,20 @@ public class Orchestra : IDisposable
         {
             Clip = clip,
             Position = position,
-            Volume = volume * SFXVolume * MasterVolume,
+            Volume = volume,
+            Channel = channel,
             Loop = loop,
             Is3D = true,
             IsPlaying = true
         };
         
         _sources.Add(source);
+        Mixer.RegisterSource(source);
+        
+        // Initial process
+        Spatial.ProcessSource(source, 0.0f);
+        source.CalculatedVolume *= Mixer.GetFinalVolumeMultiplier(source.Channel);
+        
         _backend.PlaySource(source);
         
         return source;
@@ -77,13 +85,17 @@ public class Orchestra : IDisposable
         var source = new AudioSource
         {
             Clip = clip,
-            Volume = volume * MusicVolume * MasterVolume,
+            Volume = volume,
+            Channel = AudioChannel.Music,
             Loop = loop,
             Is3D = false,
             IsPlaying = true
         };
         
         _sources.Add(source);
+        Mixer.RegisterSource(source);
+        
+        source.CalculatedVolume = source.Volume * Mixer.GetFinalVolumeMultiplier(source.Channel);
         _backend.PlaySource(source);
         
         return source;
@@ -92,6 +104,7 @@ public class Orchestra : IDisposable
     public void StopSound(AudioSource source)
     {
         source.IsPlaying = false;
+        Mixer.UnregisterSource(source);
         _backend.StopSource(source);
         _sources.Remove(source);
     }
@@ -104,47 +117,45 @@ public class Orchestra : IDisposable
         }
     }
     
-    public void SetListenerPosition(Vector3 position, Vector3 forward, Vector3 up)
+    public void SetListenerPosition(Vector3 position, Vector3 forward, Vector3 up, Vector3 velocity = default)
     {
         _listenerPosition = position;
         _listenerForward = forward;
         _listenerUp = up;
+        _listenerVelocity = velocity;
+        
+        Spatial.UpdateListener(position, forward, up, velocity);
         _backend.SetListenerPosition(position, forward, up);
     }
     
     public void Update(float deltaTime)
     {
-        // Update 3D audio sources
+        Mixer.Update(deltaTime);
+        
         foreach (var source in _sources.ToArray())
         {
             if (!source.IsPlaying)
             {
-                _sources.Remove(source);
+                StopSound(source);
                 continue;
             }
             
             if (source.Is3D)
             {
-                // Calculate distance attenuation
-                var distance = Vector3.Distance(_listenerPosition, source.Position);
-                var attenuation = CalculateAttenuation(distance, source.MinDistance, source.MaxDistance);
-                source.CalculatedVolume = source.Volume * attenuation;
-                
-                // Update backend
-                _backend.UpdateSource(source);
+                Spatial.ProcessSource(source, deltaTime);
             }
+            else
+            {
+                source.CalculatedVolume = source.Volume;
+                source.CalculatedPitch = source.Pitch;
+            }
+            
+            // Apply mixer volume
+            source.CalculatedVolume *= Mixer.GetFinalVolumeMultiplier(source.Channel);
+            
+            // Update backend
+            _backend.UpdateSource(source);
         }
-    }
-    
-    private float CalculateAttenuation(float distance, float minDistance, float maxDistance)
-    {
-        if (distance <= minDistance)
-            return 1.0f;
-        if (distance >= maxDistance)
-            return 0.0f;
-        
-        // Linear falloff
-        return 1.0f - (distance - minDistance) / (maxDistance - minDistance);
     }
     
     public void Dispose()
@@ -169,6 +180,9 @@ public class AudioSource
     public float Volume { get; set; } = 1.0f;
     public float CalculatedVolume { get; set; } = 1.0f;
     public float Pitch { get; set; } = 1.0f;
+    public float CalculatedPitch { get; set; } = 1.0f;
+    public float Pan { get; set; } = 0.0f;
+    public AudioChannel Channel { get; set; } = AudioChannel.SFX;
     public bool Loop { get; set; }
     public bool Is3D { get; set; } = true;
     public bool IsPlaying { get; set; }

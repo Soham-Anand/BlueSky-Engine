@@ -13,6 +13,7 @@ namespace BlueSky.Core.Assets
         Material,
         Shader,
         Scene,
+        Terrain,
         Prefab,
         Audio,
         Script

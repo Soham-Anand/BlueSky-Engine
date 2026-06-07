@@ -7,21 +7,35 @@ internal static class Win32Interop
     // Window Styles
     public const uint WS_OVERLAPPEDWINDOW = 0x00CF0000;
     public const uint WS_VISIBLE = 0x10000000;
+    public const uint WS_EX_ACCEPTFILES = 0x00000010;
     
     // Window Messages
     public const uint WM_DESTROY = 0x0002;
+    public const uint WM_SIZE = 0x0005;
     public const uint WM_CLOSE = 0x0010;
     public const uint WM_KEYDOWN = 0x0100;
     public const uint WM_KEYUP = 0x0101;
+    public const uint WM_CHAR = 0x0102;
+    public const uint WM_SYSKEYDOWN = 0x0104;
+    public const uint WM_SYSKEYUP = 0x0105;
     public const uint WM_MOUSEMOVE = 0x0200;
     public const uint WM_LBUTTONDOWN = 0x0201;
     public const uint WM_LBUTTONUP = 0x0202;
     public const uint WM_RBUTTONDOWN = 0x0204;
     public const uint WM_RBUTTONUP = 0x0205;
+    public const uint WM_MOUSEWHEEL = 0x020A;
+    public const uint WM_DROPFILES = 0x0233;
     
     // ShowWindow commands
     public const int SW_SHOW = 5;
     public const int SW_HIDE = 0;
+    
+    // Open File Dialog flags
+    public const uint OFN_FILEMUSTEXIST = 0x00001000;
+    public const uint OFN_PATHMUSTEXIST = 0x00000800;
+    public const uint OFN_ALLOWMULTISELECT = 0x00000200;
+    public const uint OFN_EXPLORER = 0x00080000;
+    public const uint OFN_NOCHANGEDIR = 0x00000008;
     
     [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     public static extern ushort RegisterClassW(ref WNDCLASS lpWndClass);
@@ -65,6 +79,20 @@ internal static class Win32Interop
     [DllImport("user32.dll")]
     public static extern int ShowCursor(int bShow);
 
+    // ── File Dialog ──────────────────────────────────────────────────────
+    [DllImport("comdlg32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern bool GetOpenFileNameW(ref OPENFILENAME lpofn);
+
+    // ── Drag and Drop ────────────────────────────────────────────────────
+    [DllImport("shell32.dll")]
+    public static extern void DragAcceptFiles(IntPtr hWnd, bool fAccept);
+
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    public static extern uint DragQueryFileW(IntPtr hDrop, uint iFile, char[]? lpszFile, uint cch);
+
+    [DllImport("shell32.dll")]
+    public static extern void DragFinish(IntPtr hDrop);
+
     public delegate IntPtr WndProc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
     
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
@@ -107,5 +135,33 @@ internal static class Win32Interop
         public int top;
         public int right;
         public int bottom;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct OPENFILENAME
+    {
+        public int lStructSize;
+        public IntPtr hwndOwner;
+        public IntPtr hInstance;
+        public string lpstrFilter;
+        public IntPtr lpstrCustomFilter;
+        public int nMaxCustFilter;
+        public int nFilterIndex;
+        public IntPtr lpstrFile;
+        public int nMaxFile;
+        public IntPtr lpstrFileTitle;
+        public int nMaxFileTitle;
+        public string? lpstrInitialDir;
+        public string? lpstrTitle;
+        public uint Flags;
+        public ushort nFileOffset;
+        public ushort nFileExtension;
+        public string? lpstrDefExt;
+        public IntPtr lCustData;
+        public IntPtr lpfnHook;
+        public string? lpTemplateName;
+        public IntPtr pvReserved;
+        public int dwReserved;
+        public uint FlagsEx;
     }
 }

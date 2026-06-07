@@ -31,20 +31,17 @@ namespace BlueSky.Core.ECS.Builtin
         public static TransformComponent Default => new TransformComponent();
 
         /// <summary>
-        /// Gets the world transformation matrix. Recalculates only if dirty.
+        /// Gets the world transformation matrix. Always recalculates to ensure correctness.
+        /// (Caching disabled due to struct copy semantics in ECS)
         /// </summary>
         public Matrix4x4 WorldMatrix
         {
             get
             {
-                if (_isDirty)
-                {
-                    _worldMatrix = Matrix4x4.CreateScale(Scale) * 
-                                 Matrix4x4.CreateRotation(Rotation) * 
-                                 Matrix4x4.CreateTranslation(Position);
-                    _isDirty = false;
-                }
-                return _worldMatrix;
+                // Always recalculate - caching doesn't work reliably with struct copies
+                return Matrix4x4.CreateScale(Scale) * 
+                       Matrix4x4.CreateRotation(Rotation) * 
+                       Matrix4x4.CreateTranslation(Position);
             }
         }
 
@@ -118,35 +115,10 @@ namespace BlueSky.Core.ECS.Builtin
             _isDirty = true;
         }
 
-        /// <summary>
-        /// Looks at a target position
-        /// </summary>
         public void LookAt(Vector3 target, Vector3 up)
         {
             var forward = (target - Position).Normalize();
-            var right = Vector3.Cross(up, forward).Normalize();
-            var actualUp = Vector3.Cross(forward, right);
-
-            // Create rotation matrix from basis vectors
-            var matrix = new Matrix4x4(
-                right.X, actualUp.X, -forward.X, 0,
-                right.Y, actualUp.Y, -forward.Y, 0,
-                right.Z, actualUp.Z, -forward.Z, 0,
-                0, 0, 0, 1
-            );
-
-            // Extract quaternion (simplified - in production you'd use a proper algorithm)
-            var trace = matrix.M11 + matrix.M22 + matrix.M33;
-            if (trace > 0)
-            {
-                var s = (float)System.Math.Sqrt(trace + 1.0) * 2;
-                Rotation = new Quaternion(
-                    (matrix.M32 - matrix.M23) / s,
-                    (matrix.M13 - matrix.M31) / s,
-                    (matrix.M21 - matrix.M12) / s,
-                    s / 4
-                );
-            }
+            Rotation = Quaternion.LookRotation(-forward, up);
             _isDirty = true;
         }
 

@@ -243,6 +243,13 @@ internal class D3D11Device : IRHIDevice
         pipeline.RasterizerState = CreateRasterizerStateObj(desc.RasterizerState);
         pipeline.Topology = D3D11Interop.ToD3D11PrimitiveTopology(desc.Topology);
 
+        if (desc.VertexLayout.Bindings != null)
+        {
+            pipeline.VertexStrides = new uint[desc.VertexLayout.Bindings.Length];
+            for (int i = 0; i < desc.VertexLayout.Bindings.Length; i++)
+                pipeline.VertexStrides[i] = desc.VertexLayout.Bindings[i].Stride;
+        }
+
         return pipeline;
     }
 
@@ -419,31 +426,66 @@ internal class D3D11Device : IRHIDevice
         return shader;
     }
 
+    private struct D3D11_INPUT_ELEMENT_DESC_NATIVE
+    {
+        public IntPtr SemanticName;
+        public uint SemanticIndex;
+        public uint Format;
+        public uint InputSlot;
+        public uint AlignedByteOffset;
+        public uint InputSlotClass;
+        public uint InstanceDataStepRate;
+    }
+
     private IntPtr CreateInputLayout(byte[] vsBytecode, VertexLayoutDesc layout)
     {
         IntPtr inputLayout = IntPtr.Zero;
-        // Build D3D11_INPUT_ELEMENT_DESC array
-        var elements = new D3D11_INPUT_ELEMENT_DESC[layout.Attributes.Length];
+        var elements = new D3D11_INPUT_ELEMENT_DESC_NATIVE[layout.Attributes.Length];
         var semanticNames = new string[] { "POSITION", "NORMAL", "TEXCOORD", "COLOR", "TANGENT", "BINORMAL", "BLENDWEIGHT", "BLENDINDICES" };
+        var allocatedStrings = new List<IntPtr>();
 
-        for (int i = 0; i < layout.Attributes.Length; i++)
+        try
         {
-            var attr = layout.Attributes[i];
-            elements[i] = new D3D11_INPUT_ELEMENT_DESC
+            for (int i = 0; i < layout.Attributes.Length; i++)
             {
-                SemanticName = i < semanticNames.Length ? semanticNames[i] : $"ATTR{i}",
-                SemanticIndex = 0,
-                Format = D3D11Interop.ToDXGIFormat(attr.Format),
-                InputSlot = attr.Binding,
-                AlignedByteOffset = attr.Offset,
-                InputSlotClass = 0, // PER_VERTEX_DATA
-                InstanceDataStepRate = 0
-            };
+                var attr = layout.Attributes[i];
+                string name = i < semanticNames.Length ? semanticNames[i] : $"ATTR{i}";
+                IntPtr pName = Marshal.StringToHGlobalAnsi(name);
+                allocatedStrings.Add(pName);
+
+                elements[i] = new D3D11_INPUT_ELEMENT_DESC_NATIVE
+                {
+                    SemanticName = pName,
+                    SemanticIndex = 0,
+                    Format = D3D11Interop.ToDXGIFormat(attr.Format),
+                    InputSlot = attr.Binding,
+                    AlignedByteOffset = attr.Offset,
+                    InputSlotClass = 0, // PER_VERTEX_DATA
+                    InstanceDataStepRate = 0
+                };
+            }
+
+            // ID3D11Device::CreateInputLayout — vtable slot 11
+            unsafe
+            {
+                fixed (D3D11_INPUT_ELEMENT_DESC_NATIVE* pElements = elements)
+                fixed (byte* pCode = vsBytecode)
+                {
+                    IntPtr vtable = *(IntPtr*)_device;
+                    IntPtr fnPtr = *((IntPtr*)vtable + 11);
+                    var fn = (delegate* unmanaged[Stdcall]<IntPtr, D3D11_INPUT_ELEMENT_DESC_NATIVE*, uint, IntPtr, nuint, out IntPtr, int>)fnPtr;
+                    int hr = fn(_device, pElements, (uint)elements.Length, (IntPtr)pCode, (nuint)vsBytecode.Length, out inputLayout);
+                    if (hr < 0)
+                        Console.WriteLine($"[DX11] CreateInputLayout failed: HRESULT 0x{hr:X8}");
+                }
+            }
+        }
+        finally
+        {
+            foreach (var ptr in allocatedStrings)
+                Marshal.FreeHGlobal(ptr);
         }
 
-        // ID3D11Device::CreateInputLayout — vtable slot 11
-        // Note: this requires marshaling the string pointers, which is complex.
-        // For now we store the desc and create it lazily on first use.
         return inputLayout;
     }
 

@@ -34,11 +34,15 @@ namespace BlueSky.Rendering
     {
         public string Name { get; set; } = string.Empty;
         public Vector3 Albedo { get; set; } = Vector3.One;
+        public float Alpha { get; set; } = 1.0f;
         public float Metallic { get; set; } = 0.0f;
         public float Roughness { get; set; } = 0.5f;
         public string? AlbedoTexture { get; set; }
         public string? NormalTexture { get; set; }
         public string? MetallicRoughnessTexture { get; set; }
+        public string AlphaMode { get; set; } = "OPAQUE";
+        public float AlphaCutoff { get; set; } = 0.5f;
+        public bool DoubleSided { get; set; } = false;
     }
 
     /// <summary>

@@ -62,6 +62,8 @@ public class AnimatedButton
         bool isPressed = isHovered && ui.IsMouseDown;
         bool wasClicked = false;
         
+        bool wasDownOnButton = state.IsPressed;
+
         // Update state
         state.IsHovered = isHovered;
         state.IsPressed = isPressed;
@@ -77,31 +79,16 @@ public class AnimatedButton
             bgColor = Vector4.Lerp(bgColor, pressColor.Value, state.PressAmount.Current);
         }
         
-        // Subtle scale animation on press
-        float scale = 1f - state.PressAmount.Current * 0.03f;
-        float scaledW = w * scale;
-        float scaledH = h * scale;
-        float offsetX = (w - scaledW) * 0.5f;
-        float offsetY = (h - scaledH) * 0.5f;
-        
-        // Draw button background with rounded corners
-        ui.Panel(x + offsetX, y + offsetY, scaledW, scaledH, bgColor);
-        
-        // Glow effect on hover
-        if (state.HoverAmount.Current > 0.01f && enabled)
-        {
-            float glowAlpha = state.HoverAmount.Current * 0.3f;
-            var glowColor = ModernTheme.WithAlpha(pressColor.Value, glowAlpha);
-            ui.Panel(x + offsetX - 1, y + offsetY - 1, scaledW + 2, scaledH + 2, glowColor);
-        }
-        
-        // Border
-        if (state.HoverAmount.Current > 0.5f)
-        {
-            var borderColor = ModernTheme.WithAlpha(pressColor.Value, state.HoverAmount.Current * 0.6f);
-            ui.Panel(x + offsetX, y + offsetY, scaledW, 1, borderColor);
-            ui.Panel(x + offsetX, y + offsetY + scaledH - 1, scaledW, 1, borderColor);
-        }
+        // Draw a flat, sharp button. The transport controls should feel like
+        // editor chrome, not animated launcher UI.
+        ui.Panel(x, y, w, h, enabled ? bgColor : ModernTheme.Bg2);
+        var borderColor = enabled && state.HoverAmount.Current > 0.05f
+            ? ModernTheme.WithAlpha(pressColor.Value, 0.75f)
+            : ModernTheme.Border1;
+        ui.Panel(x, y, w, 1, borderColor);
+        ui.Panel(x, y + h - 1, w, 1, borderColor);
+        ui.Panel(x, y, 1, h, borderColor);
+        ui.Panel(x + w - 1, y, 1, h, borderColor);
         
         // Text with icon
         float textX = x + w * 0.5f;
@@ -130,7 +117,7 @@ public class AnimatedButton
         }
         
         // Detect click (mouse was down and now released while hovering)
-        if (isHovered && !ui.IsMouseDown && state.IsPressed && enabled)
+        if (isHovered && !ui.IsMouseDown && wasDownOnButton && enabled)
         {
             wasClicked = true;
         }

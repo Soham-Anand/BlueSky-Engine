@@ -45,10 +45,17 @@ struct MaterialData {
     float  roughness;
     float  ao;
     float  emission;
+    float  subsurface;
     
     int    useAlbedoTex;
     int    useNormalTex;
     int    useRMATex;
+    int    blendMode;
+    int    useOpacityTex;
+    
+    int    _pad0;
+    int    _pad1;
+    int    _pad2;
 };
 
 // Light types
@@ -69,6 +76,8 @@ struct LightData {
     float  attenuation;
     int    castShadows;
     int    volumetric;
+    float  pad1;
+    float  pad2;
 };
 
 struct LightingSettings {

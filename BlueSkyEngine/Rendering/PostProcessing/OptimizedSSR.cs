@@ -23,6 +23,9 @@ public class OptimizedSSR : IDisposable
     private int _ssrHeight;
     private SSRQuality _quality = SSRQuality.Medium;
     private bool _disposed;
+    private bool _hasRenderedValidFrame;
+
+    public bool HasValidOutput => _hasRenderedValidFrame && _ssrPipeline != null && _ssrTexture != null;
 
     public OptimizedSSR(IRHIDevice device)
     {
@@ -52,6 +55,7 @@ public class OptimizedSSR : IDisposable
     public void Render(IRHICommandBuffer cmd, IRHITexture colorTexture, IRHITexture depthTexture,
                        IRHITexture normalTexture, Matrix4x4 projection, Matrix4x4 view)
     {
+        _hasRenderedValidFrame = false;
         if (_ssrPipeline == null || _ssrTexture == null || _uniformBuffer == null) return;
 
         // Update uniforms
@@ -71,7 +75,7 @@ public class OptimizedSSR : IDisposable
             Resolution = new Vector2(_width, _height),
             InvResolution = new Vector2(1f / _width, 1f / _height),
             MaxDistance = GetMaxDistance(),
-            Thickness = 0.15f,
+            Thickness = 0.08f,
             Stride = 1.0f,
             MaxSteps = GetMaxSteps()
         };
@@ -87,6 +91,7 @@ public class OptimizedSSR : IDisposable
         cmd.SetUniformBuffer(_uniformBuffer, 0);
         cmd.Draw(3, 1, 0, 0); // Fullscreen triangle
         cmd.EndRenderPass();
+        _hasRenderedValidFrame = true;
     }
 
     public IRHITexture? GetReflectionTexture() => _ssrTexture;
@@ -147,10 +152,10 @@ public class OptimizedSSR : IDisposable
             string baseName = "viewport_3d";
             string[] searchPaths = new[]
             {
-                System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Shaders", baseName + ".metallib"),
                 System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Editor", "Shaders", baseName + ".metallib"),
                 System.IO.Path.Combine(System.IO.Directory.GetCurrentDirectory(), "Editor", "Shaders", baseName + ".metallib"),
                 System.IO.Path.Combine(System.IO.Directory.GetCurrentDirectory(), "BlueSkyEngine", "Editor", "Shaders", baseName + ".metallib"),
+                System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Shaders", baseName + ".metallib"),
             };
 
             string? found = Array.Find(searchPaths, System.IO.File.Exists);
@@ -182,20 +187,20 @@ public class OptimizedSSR : IDisposable
 
     private int GetMaxSteps() => _quality switch
     {
-        SSRQuality.Low => 8,
-        SSRQuality.Medium => 16,
-        SSRQuality.High => 24,
-        SSRQuality.Ultra => 32,
-        _ => 16
+        SSRQuality.Low => 12,
+        SSRQuality.Medium => 24,
+        SSRQuality.High => 32,
+        SSRQuality.Ultra => 48,
+        _ => 24
     };
 
     private float GetMaxDistance() => _quality switch
     {
-        SSRQuality.Low => 8f,
-        SSRQuality.Medium => 15f,
-        SSRQuality.High => 30f,
-        SSRQuality.Ultra => 50f,
-        _ => 15f
+        SSRQuality.Low => 12f,
+        SSRQuality.Medium => 25f,
+        SSRQuality.High => 40f,
+        SSRQuality.Ultra => 60f,
+        _ => 25f
     };
 
     public void Dispose()
@@ -210,10 +215,10 @@ public class OptimizedSSR : IDisposable
 
 public enum SSRQuality
 {
-    Low,    // 8 steps, ~0.5ms
-    Medium, // 16 steps, ~0.8ms
-    High,   // 24 steps, ~1.2ms
-    Ultra   // 32 steps, ~1.5ms
+    Low,    // 12 steps, ~0.6ms
+    Medium, // 24 steps, ~1.0ms
+    High,   // 32 steps, ~1.4ms
+    Ultra   // 48 steps, ~2.0ms
 }
 
 /// <summary>

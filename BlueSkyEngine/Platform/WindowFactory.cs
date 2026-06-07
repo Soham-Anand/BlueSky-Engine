@@ -23,7 +23,13 @@ public static class WindowFactory
         }
         else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
         {
-            throw new PlatformNotSupportedException("Linux windowing not yet implemented");
+            if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("DISPLAY")))
+                return new Linux.X11Window(options);
+
+            if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WAYLAND_DISPLAY")))
+                return new Linux.WaylandWindow(options);
+
+            throw new PlatformNotSupportedException("Linux windowing requires DISPLAY or WAYLAND_DISPLAY.");
         }
         else
         {
@@ -45,6 +51,14 @@ public static class WindowFactory
         else if (window is Windows.Win32Window winWindow)
         {
             return new Windows.Win32Input(winWindow);
+        }
+        else if (window is Linux.X11Window x11Window)
+        {
+            return new Linux.LinuxInput(x11Window.GetDisplayHandle(), isWayland: false);
+        }
+        else if (window is Linux.WaylandWindow waylandWindow)
+        {
+            return new Linux.LinuxInput(waylandWindow.GetWaylandDisplay(), isWayland: true);
         }
         else
         {

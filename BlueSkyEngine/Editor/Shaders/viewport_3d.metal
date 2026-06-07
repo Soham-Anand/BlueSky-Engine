@@ -202,22 +202,22 @@ float computeDepth(float3 pos, float4x4 viewProj) {
     return clip.z / clip.w;
 }
 
-// Grid line pattern with anti-aliased edges and proper alpha
+// Grid line pattern with screen-space anti-aliased edges.
+// lineWidth is in pixels, which keeps distant/grazing lines from ballooning.
 float4 gridPattern(float3 worldPos, float scale, float lineWidth, float dist) {
     float2 coord = worldPos.xz * scale;
-    float2 derivative = fwidth(coord);
-    
-    // Adaptive line width — stays readable at distance without getting too thick
-    float adaptiveWidth = lineWidth * (1.0 + dist * 0.005);
-    
+    float2 derivative = max(fwidth(coord), float2(0.0001));
     float2 grid = abs(fract(coord - 0.5) - 0.5) / derivative;
-    float line = min(grid.x, grid.y);
+    float lineDistance = min(grid.x, grid.y);
+    float alpha = 1.0 - smoothstep(lineWidth, lineWidth + 1.0, lineDistance);
+
+    // Fade procedural cells once they are too small to read cleanly.
+    float cellPixels = 1.0 / max(max(derivative.x, derivative.y), 0.0001);
+    float aliasFade = smoothstep(2.0, 8.0, cellPixels);
+    alpha *= aliasFade;
     
-    // Smooth anti-aliased falloff - softer for a more subtle look
-    float alpha = 1.0 - smoothstep(0.0, adaptiveWidth, line);
-    
-    // Grid color — dark gray/subtle silver
-    float3 color = float3(0.25, 0.26, 0.28);
+    // Grid color — restrained graphite instead of heavy black.
+    float3 color = float3(0.18, 0.19, 0.21);
     
     return float4(color, alpha);
 }
@@ -247,8 +247,10 @@ fragment GridFragOut fs_grid(GridVaryings in [[stage_in]],
     // Distance-based fade (world units from camera)
     float dist = length(hitPos - u.cameraPos.xyz);
     
-    // Smooth, long fade for a natural horizon blend
-    float fadeFar = smoothstep(120.0, 30.0, dist);
+    // Fade before the infinite grid turns into horizon moire.
+    float fadeFar = 1.0 - smoothstep(38.0, 95.0, dist);
+    float grazingFade = smoothstep(0.015, 0.09, abs(ray.y));
+    fadeFar *= grazingFade;
     
     // Early discard for performance
     if (fadeFar < 0.001) {
@@ -260,14 +262,15 @@ fragment GridFragOut fs_grid(GridVaryings in [[stage_in]],
     // ═══════════════════════════════════════════════════════════════════
     
     // Fine grid: 1-unit squares (crisp, very thin, highly transparent)
-    float4 fineGrid = gridPattern(hitPos, 1.0, 0.08, dist);
-    fineGrid.a *= 0.4; // Make fine grid very subtle
+    float4 fineGrid = gridPattern(hitPos, 1.0, 0.55, dist);
+    fineGrid.a *= 0.12; // Make fine grid very subtle
     
     // Coarse grid: 10-unit squares (slightly thicker)
-    float4 coarseGrid = gridPattern(hitPos, 0.1, 0.20, dist);
+    float4 coarseGrid = gridPattern(hitPos, 0.1, 0.75, dist);
+    coarseGrid.a *= 0.36;
 
     // Distance-based blending
-    float fineFade = smoothstep(50.0, 10.0, dist);
+    float fineFade = smoothstep(20.0, 6.0, dist);
     
     // Combine grids - coarse is always visible, fine fades out
     float4 gridColor = coarseGrid;
@@ -280,23 +283,23 @@ fragment GridFragOut fs_grid(GridVaryings in [[stage_in]],
     float2 axisDerivative = fwidth(hitPos.xz);
     
     // X axis (Z ≈ 0): Red, crisp
-    float xAxisDist = abs(hitPos.z) / (axisDerivative.y * 1.5);
-    float xAxisLine = 1.0 - smoothstep(0.0, 1.0, xAxisDist);
+    float xAxisDist = abs(hitPos.z) / max(axisDerivative.y, 0.0001);
+    float xAxisLine = 1.0 - smoothstep(0.65, 1.65, xAxisDist);
     
     // Z axis (X ≈ 0): Blue, crisp
-    float zAxisDist = abs(hitPos.x) / (axisDerivative.x * 1.5);
-    float zAxisLine = 1.0 - smoothstep(0.0, 1.0, zAxisDist);
+    float zAxisDist = abs(hitPos.x) / max(axisDerivative.x, 0.0001);
+    float zAxisLine = 1.0 - smoothstep(0.65, 1.65, zAxisDist);
 
     // Blend axis lines
     if (xAxisLine > 0.01) {
         float3 xAxisColor = float3(0.85, 0.20, 0.20); // Darker Red
         gridColor.rgb = mix(gridColor.rgb, xAxisColor, xAxisLine);
-        gridColor.a = max(gridColor.a, xAxisLine);
+        gridColor.a = max(gridColor.a, xAxisLine * 0.78);
     }
     if (zAxisLine > 0.01) {
         float3 zAxisColor = float3(0.20, 0.35, 0.85); // Darker Blue
         gridColor.rgb = mix(gridColor.rgb, zAxisColor, zAxisLine);
-        gridColor.a = max(gridColor.a, zAxisLine);
+        gridColor.a = max(gridColor.a, zAxisLine * 0.78);
     }
 
     // Apply distance fade
@@ -313,6 +316,8 @@ fragment GridFragOut fs_grid(GridVaryings in [[stage_in]],
 
     // Compute proper depth so grid sits at Y=0 in the depth buffer
     float depth = computeDepth(hitPos, u.viewProj);
+    // Add small bias to push grid slightly behind terrain to prevent z-fighting
+    depth = min(depth + 0.00001, 1.0);
     // Clamp depth to valid range
     depth = clamp(depth, 0.0, 1.0);
 
@@ -379,20 +384,7 @@ vertex MeshVaryings vs_mesh(MeshVertexIn in [[stage_in]],
     MeshVaryings out;
     constant EntityUniforms& entity = entities[instance_id];
     
-    float3 localPos = in.position;
-    
-    float3 worldPosBase = (entity.model * float4(in.position, 1.0)).xyz;
-    float windSpeed    = view.windParams.x;
-    float windStrength = view.windParams.y;
-    float windFreq     = view.windParams.z;
-    
-    float wave = sin(worldPosBase.x * windFreq + view.time * windSpeed) * 
-                 cos(worldPosBase.z * windFreq * 0.8 + view.time * windSpeed * 1.1);
-    
-    float foliageMask = saturate(in.position.y * 0.5);
-    localPos.xz += wave * windStrength * foliageMask;
-
-    float4 worldPos   = entity.model * float4(localPos, 1.0);
+    float4 worldPos   = entity.model * float4(in.position, 1.0);
     out.worldPos      = worldPos.xyz;
     out.position      = view.viewProj * worldPos;
     out.normal        = normalize((entity.model * float4(in.normal, 0.0)).xyz);
@@ -611,6 +603,21 @@ fragment float4 fs_mesh(MeshVaryings in [[stage_in]],
     if (material.useAlbedoTex != 0)
         albedo = albedoTex.sample(texSampler, in.uv).rgb;
     
+    // ── TERRAIN CHECKERBOARD PATTERN ───────────────────────────────────────────
+    // Apply to light grey materials (terrain = 0.7, 0.7, 0.7)
+    if (albedo.r > 0.65 && albedo.g > 0.65 && albedo.b > 0.65 &&
+        albedo.r < 0.75 && albedo.g < 0.75 && albedo.b < 0.75) {
+        // World-space checkerboard (2-unit squares)
+        float2 checkerCoord = in.worldPos.xz * 0.5;
+        float2 checker = floor(checkerCoord);
+        float checkerPattern = fmod(checker.x + checker.y, 2.0);
+        
+        // Grey and dark grey
+        float3 lightGrey = float3(0.45, 0.45, 0.45);
+        float3 darkGrey = float3(0.28, 0.28, 0.28);
+        albedo = mix(darkGrey, lightGrey, checkerPattern);
+    }
+    
     float roughness  = max(0.04, material.roughness);
     float ao         = material.ao;
     float subsurface = material.subsurface;
@@ -641,8 +648,8 @@ fragment float4 fs_mesh(MeshVaryings in [[stage_in]],
         N = normalize(T * tangentNormal.x + B * tangentNormal.y + N * tangentNormal.z);
     }
     
-    // Light direction (sun)
-    float3 L = normalize(-view.sunDirection);
+// Light direction (sun) - sunDirection already points TOWARD the sun
+float3 L = normalize(view.sunDirection);
     
     // Half vector for specular
     float3 H = normalize(L + V);
@@ -825,8 +832,8 @@ fragment float4 fs_mesh(MeshVaryings in [[stage_in]],
     // ── Tone Mapping (ACES Fitted — Stephen Hill RRT+ODT) ──────────────────────
     finalColor = ACESFitted(finalColor);
     
-    // Subtle color grading for natural warmth
-    finalColor *= float3(1.02, 1.0, 0.98);
+    // Keep viewport color neutral; grading belongs in configurable post-process.
+    finalColor *= float3(1.0, 1.0, 1.0);
     
     // ── Gamma Correction (sRGB) ────────────────────────────────────────────────
     finalColor = pow(finalColor, float3(1.0 / 2.2));
@@ -981,7 +988,7 @@ fragment float4 fs_ssr(SSRVaryings in [[stage_in]],
     
     float2 uv = in.uv;
     float4 baseColor = sceneColor.sample(samp, uv);
-    float depth = sceneDepth.sample(samp, uv).r;
+    float depth = sceneDepth.sample(samp, uv);
     
     if (depth >= 0.999) return baseColor;
     

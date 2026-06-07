@@ -86,29 +86,28 @@ public static class AudioTeaScriptBridge
         });
         
         // Volume control
-        interpreter.RegisterNativeFunction("setMasterVolume", args =>
+        interpreter.RegisterNativeFunction("setChannelVolume", args =>
         {
-            if (args.Count >= 1 && _orchestra != null)
+            if (args.Count >= 2 && _orchestra != null)
             {
-                _orchestra.MasterVolume = Convert.ToSingle(args[0]);
+                if (Enum.TryParse<AudioChannel>(args[0]?.ToString(), true, out var channel))
+                {
+                    _orchestra.Mixer.SetChannelVolume(channel, Convert.ToSingle(args[1]));
+                }
             }
             return null;
         });
         
-        interpreter.RegisterNativeFunction("setMusicVolume", args =>
+        interpreter.RegisterNativeFunction("duckChannel", args =>
         {
-            if (args.Count >= 1 && _orchestra != null)
+            if (args.Count >= 3 && _orchestra != null)
             {
-                _orchestra.MusicVolume = Convert.ToSingle(args[0]);
-            }
-            return null;
-        });
-        
-        interpreter.RegisterNativeFunction("setSFXVolume", args =>
-        {
-            if (args.Count >= 1 && _orchestra != null)
-            {
-                _orchestra.SFXVolume = Convert.ToSingle(args[0]);
+                if (Enum.TryParse<AudioChannel>(args[0]?.ToString(), true, out var targetChannel))
+                {
+                    float ratio = Convert.ToSingle(args[1]);
+                    float fadeTime = Convert.ToSingle(args[2]);
+                    _orchestra.Mixer.ApplyDucking(targetChannel, ratio, fadeTime);
+                }
             }
             return null;
         });

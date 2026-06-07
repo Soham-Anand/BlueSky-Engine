@@ -73,7 +73,7 @@ public struct BlendState
         DstColorFactor = BlendFactor.OneMinusSrcAlpha,
         ColorOp = BlendOp.Add,
         SrcAlphaFactor = BlendFactor.One,
-        DstAlphaFactor = BlendFactor.Zero,
+        DstAlphaFactor = BlendFactor.OneMinusSrcAlpha,
         AlphaOp = BlendOp.Add
     };
 }

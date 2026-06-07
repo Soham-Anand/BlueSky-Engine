@@ -1,36 +1,7 @@
-# Build outputs
+.aider*
+graphify/
 bin/
 obj/
-*.dll
-*.exe
-*.pdb
-
-# User-specific files
 *.user
 *.suo
-*.userosscache
-*.sln.docstates
-
-# IDE
 .vs/
-.vscode/
-.idea/
-
-# macOS
-.DS_Store
-
-# Temporary files
-*.tmp
-*.log
-*.swp
-*~
-
-# Backup files
-RenderBackup/
-
-# Compiled shaders (source .metal files are tracked)
-*.air
-
-# Temporary documentation
-COMMIT_MESSAGE.txt
-*.md.backup

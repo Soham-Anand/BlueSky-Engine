@@ -22,6 +22,7 @@ public class EntityData
 
 [JsonDerivedType(typeof(TransformComponentData), "Transform")]
 [JsonDerivedType(typeof(StaticMeshComponentData), "StaticMesh")]
+[JsonDerivedType(typeof(SkeletalMeshComponentData), "SkeletalMesh")]
 [JsonDerivedType(typeof(RigidbodyComponentData), "Rigidbody")]
 [JsonDerivedType(typeof(ColliderComponentData), "Collider")]
 [JsonDerivedType(typeof(TeaScriptComponentData), "TeaScript")]
@@ -29,6 +30,7 @@ public class EntityData
 [JsonDerivedType(typeof(MaterialComponentData), "Material")]
 [JsonDerivedType(typeof(LightComponentData), "Light")]
 [JsonDerivedType(typeof(CameraComponentData), "Camera")]
+[JsonDerivedType(typeof(TerrainComponentData), "Terrain")]
 public abstract class ComponentData
 {
     public abstract string Type { get; }
@@ -81,6 +83,29 @@ public class StaticMeshComponentData : ComponentData
     public override string Type => "StaticMesh";
     public string MeshAssetId { get; set; } = "";
     public List<string> MaterialSlots { get; set; } = new();
+}
+
+public class SkeletalMeshComponentData : ComponentData
+{
+    public override string Type => "SkeletalMesh";
+    public string MeshAssetPath { get; set; } = "";
+    public List<string> MaterialSlots { get; set; } = new();
+    public bool IsLoaded { get; set; }
+}
+
+public class TerrainComponentData : ComponentData
+{
+    public override string Type => "Terrain";
+    public string TerrainAssetPath { get; set; } = "";
+    public int Width { get; set; } = 256;
+    public int Height { get; set; } = 256;
+    public float WorldWidth { get; set; } = 100.0f;
+    public float WorldHeight { get; set; } = 100.0f;
+    public float MaxElevation { get; set; } = 20.0f;
+    public int ChunkSize { get; set; } = 32;
+    public int LodCount { get; set; } = 3;
+    public int MaterialMode { get; set; } = 0;
+    public bool CollisionEnabled { get; set; } = true;
 }
 
 public class RigidbodyComponentData : ComponentData

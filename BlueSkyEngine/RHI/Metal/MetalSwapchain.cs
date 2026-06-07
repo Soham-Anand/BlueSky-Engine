@@ -52,6 +52,10 @@ internal class MetalSwapchain : IRHISwapchain
         // Set framebufferOnly to optimize GPU performance
         var setFramebufferOnlySel = GetSelector("setFramebufferOnly:");
         SetBoolNative(_metalLayer, setFramebufferOnlySel, true);
+        
+        // Set displaySyncEnabled based on presentMode (VSync or Immediate)
+        var setDisplaySyncEnabledSel = GetSelector("setDisplaySyncEnabled:");
+        SetBoolNative(_metalLayer, setDisplaySyncEnabledSel, presentMode != PresentMode.Immediate);
     }
     
     public void AcquireNextImage()

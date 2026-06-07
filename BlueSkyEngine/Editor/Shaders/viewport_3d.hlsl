@@ -232,6 +232,8 @@ FS_GRID_OUTPUT fs_grid(VS_GRID_OUTPUT input) {
     gridColor.a *= fadeNear;
 
     float depth = computeDepth(hitPos, ViewProj);
+    // Add small bias to push grid slightly behind terrain to prevent z-fighting
+    depth = min(depth + 0.00001, 1.0);
     depth = clamp(depth, 0.0, 1.0);
 
     // ── 0. Compute Shadow ──────────────────────────────────────────────
@@ -276,6 +278,7 @@ struct VS_MESH_OUTPUT {
     float4 position      : SV_POSITION;
     float4 lightSpacePos : TEXCOORD1;
     float3 normal        : TEXCOORD0;
+    float3 worldPos      : TEXCOORD2;
 };
 
 VS_MESH_OUTPUT vs_mesh(VS_MESH_INPUT input) {
@@ -284,6 +287,7 @@ VS_MESH_OUTPUT vs_mesh(VS_MESH_INPUT input) {
     float4 worldPos = mul(EntityModel, float4(input.position, 1.0));
     output.position = mul(ViewProj, worldPos);
     output.lightSpacePos = mul(LightSpaceMatrix, worldPos);
+    output.worldPos = worldPos.xyz;
     
     output.normal = normalize(mul((float3x3)EntityModel, input.normal));
     
@@ -313,10 +317,30 @@ float4 fs_mesh(VS_MESH_OUTPUT input, bool isFrontFace : SV_IsFrontFace) : SV_Tar
     float3 normal = normalize(input.normal);
     if (!isFrontFace) normal = -normal;
     
-    float3 ambient = 0.2 * EntityColor.rgb;
+    float3 baseColor = EntityColor.rgb;
+    
+    // ── Terrain Checkerboard Pattern (if EntityColor is grey ~0.5) ────────────
+    float greyThreshold = 0.02;
+    bool isGreyish = (abs(baseColor.r - 0.5) < greyThreshold && 
+                      abs(baseColor.g - 0.5) < greyThreshold && 
+                      abs(baseColor.b - 0.5) < greyThreshold);
+    
+    if (isGreyish) {
+        // Use world position for consistent checkerboard across terrain chunks
+        float2 checkerCoord = input.worldPos.xz * 0.5; // Scale for checker size
+        float2 checker = floor(checkerCoord);
+        float checkerPattern = fmod(checker.x + checker.y, 2.0);
+        
+        // Grey (0.45) and dark grey (0.28) checkerboard
+        float3 lightGrey = float3(0.45, 0.45, 0.45);
+        float3 darkGrey = float3(0.28, 0.28, 0.28);
+        baseColor = lerp(darkGrey, lightGrey, checkerPattern);
+    }
+    
+    float3 ambient = 0.2 * baseColor;
     
     float NdotL = max(dot(normal, lightDir), 0.0);
-    float3 diffuse = NdotL * EntityColor.rgb;
+    float3 diffuse = NdotL * baseColor;
     
     // Shadow map sampling
     float3 projCoords = input.lightSpacePos.xyz / input.lightSpacePos.w;
@@ -344,3 +368,39 @@ float4 fs_mesh(VS_MESH_OUTPUT input, bool isFrontFace : SV_IsFrontFace) : SV_Tar
     
     return float4(finalColor, EntityColor.a);
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// WIREFRAME
+// ═════════════════════════════════════════════════════════════════════════════
+float4 fs_wireframe(VS_MESH_OUTPUT input) : SV_Target0 {
+    // Thin semi-transparent outline for depth perception
+    return float4(0.9, 0.9, 1.0, 0.15);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// GIZMO (Translation/Rotation/Scale handles)
+// ═════════════════════════════════════════════════════════════════════════════
+// Reuses the mesh vertex layout (pos + normal + uv)
+
+VS_MESH_OUTPUT vs_gizmo(VS_MESH_INPUT input) {
+    VS_MESH_OUTPUT output;
+    
+    float4 worldPos = mul(EntityModel, float4(input.position, 1.0));
+    output.position = mul(ViewProj, worldPos);
+    output.lightSpacePos = float4(0, 0, 0, 1); // unused for gizmos
+    output.normal = normalize(mul((float3x3)EntityModel, input.normal));
+    output.worldPos = worldPos.xyz;
+    
+    return output;
+}
+
+float4 fs_gizmo(VS_MESH_OUTPUT input) : SV_Target0 {
+    // Gizmo uses EntityColor directly (R/G/B for X/Y/Z axes)
+    // Add slight shading based on normal for depth perception
+    float3 lightDir = normalize(float3(0.5, 0.7, 0.3));
+    float NdotL = max(dot(normalize(input.normal), lightDir), 0.0);
+    float shading = 0.5 + 0.5 * NdotL;
+    
+    return float4(EntityColor.rgb * shading, EntityColor.a);
+}
+

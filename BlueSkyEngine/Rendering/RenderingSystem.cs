@@ -108,6 +108,14 @@ namespace BlueSky.Rendering
                 // TODO: Implement backend-agnostic post-processing passes
                 // For now, we'll just ensure the scene is rendered to the screen
                 _renderer.SetViewport(0, 0, viewportWidth, viewportHeight);
+                
+                // Render object highlights (Runner Vision)
+                // Assuming we can grab a command buffer and a valid viewProj matrix
+                // In a real integration, the renderer would provide these
+                // if (_objectHighlighting != null && _commandBuffer != null)
+                // {
+                //     _objectHighlighting.RenderOutlines(_commandBuffer, World!, _cameraViewProj);
+                // }
             }
             else
             {

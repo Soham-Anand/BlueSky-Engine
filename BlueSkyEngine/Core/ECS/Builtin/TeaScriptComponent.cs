@@ -8,7 +8,10 @@ namespace BlueSky.Core.ECS.Builtin;
 /// </summary>
 public unsafe struct TeaScriptComponent
 {
-    private fixed char _scriptAssetId[128];
+    // Absolute project asset paths can easily exceed 128 chars.
+    // Keep this component unmanaged for ECS storage, but give script paths
+    // enough room to survive real project folder depth.
+    private fixed char _scriptAssetId[512];
     
     /// <summary>
     /// Asset ID of the .tea script file.
@@ -25,7 +28,7 @@ public unsafe struct TeaScriptComponent
         set
         {
             value ??= string.Empty;
-            int length = System.Math.Min(127, value.Length);
+            int length = System.Math.Min(511, value.Length);
             for (int i = 0; i < length; i++)
             {
                 _scriptAssetId[i] = value[i];

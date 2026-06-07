@@ -105,6 +105,12 @@ else
     print_warning "pbr_optimized.metal not found, skipping..."
 fi
 
+# Copy compiled metallibs to main Shaders folder so both copies are kept up-to-date
+cp viewport_3d.metallib ../../Shaders/ 2>/dev/null || true
+cp simple_ui.metallib ../../Shaders/ 2>/dev/null || true
+cp horizon_lighting.metallib ../../Shaders/ 2>/dev/null || true
+cp pbr_optimized.metallib ../../Shaders/ 2>/dev/null || true
+
 cd - > /dev/null
 
 # Step 2: Build the project

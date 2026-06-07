@@ -284,6 +284,7 @@ public class AssetImporter
             AssetType.Texture => "Textures",
             AssetType.Material => "Materials",
             AssetType.Scene => "Scenes",
+            AssetType.Terrain => "Terrains",
             AssetType.Script => "Scripts",
             AssetType.Audio => "Audio",
             _ => "Other"
@@ -1065,6 +1066,63 @@ public class GLTFImportHandler : IAssetImportHandler
             }
         }
     }
+
+    private static void LogGltfSkinBones(BlueSky.Animation.GLTF.GltfRoot root)
+    {
+        if (root.Skins == null || root.Skins.Length == 0)
+        {
+            ErrorHandler.LogInfo("[GLTFImportHandler] Imported skin bones: <none>", "GLTFImportHandler");
+            return;
+        }
+
+        if (root.Nodes == null || root.Nodes.Length == 0)
+        {
+            ErrorHandler.LogWarning("[GLTFImportHandler] Skin exists, but GLTF has no nodes to name bones.", "GLTFImportHandler");
+            return;
+        }
+
+        for (int skinIndex = 0; skinIndex < root.Skins.Length; skinIndex++)
+        {
+            var skin = root.Skins[skinIndex];
+            ErrorHandler.LogInfo(
+                $"[GLTFImportHandler] Imported skin {skinIndex}: joints={skin.Joints.Length}, skeletonRoot={skin.Skeleton?.ToString() ?? "none"}",
+                "GLTFImportHandler");
+
+            for (int jointSlot = 0; jointSlot < skin.Joints.Length; jointSlot++)
+            {
+                int nodeIndex = skin.Joints[jointSlot];
+                if (nodeIndex < 0 || nodeIndex >= root.Nodes.Length)
+                {
+                    ErrorHandler.LogWarning(
+                        $"[GLTFImportHandler]   joint[{jointSlot:00}] references invalid node index {nodeIndex}",
+                        "GLTFImportHandler");
+                    continue;
+                }
+
+                var node = root.Nodes[nodeIndex];
+                string name = string.IsNullOrWhiteSpace(node.Name) ? $"<unnamed node {nodeIndex}>" : node.Name;
+                string translation = FormatFloatArray(node.Translation, 3, "0,0,0");
+                string rotation = FormatFloatArray(node.Rotation, 4, "0,0,0,1");
+                string scale = FormatFloatArray(node.Scale, 3, "1,1,1");
+                string children = node.Children != null && node.Children.Length > 0
+                    ? string.Join(",", node.Children)
+                    : "-";
+
+                ErrorHandler.LogInfo(
+                    $"[GLTFImportHandler]   joint[{jointSlot:00}] node={nodeIndex} name='{name}' children={children} " +
+                    $"T=({translation}) R=({rotation}) S=({scale})",
+                    "GLTFImportHandler");
+            }
+        }
+    }
+
+    private static string FormatFloatArray(float[]? values, int expectedLength, string fallback)
+    {
+        if (values == null || values.Length < expectedLength)
+            return fallback;
+
+        return string.Join(", ", values.Take(expectedLength).Select(v => v.ToString("F3", System.Globalization.CultureInfo.InvariantCulture)));
+    }
     
     /// <summary>
     /// Flip texture horizontally (mirror left-right) to fix GLTF coordinate system mismatch.
@@ -1111,6 +1169,42 @@ public class GLTFImportHandler : IAssetImportHandler
                 return new ImportResult { Success = false, Error = "No meshes found in GLTF file" };
             }
 
+            bool hasSkins = root.Skins != null && root.Skins.Length > 0;
+            bool hasJointAttributes = root.Meshes.Any(mesh =>
+                mesh.Primitives.Any(prim =>
+                    prim.Attributes.ContainsKey("JOINTS_0") ||
+                    prim.Attributes.ContainsKey("WEIGHTS_0")));
+
+            if (hasSkins || hasJointAttributes)
+            {
+                asset.Type = AssetType.SkeletalMesh;
+                asset.Metadata["assetKind"] = "SkeletalMesh";
+                asset.Metadata["skinCount"] = (root.Skins?.Length ?? 0).ToString();
+                asset.Metadata["hasSkins"] = hasSkins.ToString();
+                asset.Metadata["hasJointAttributes"] = hasJointAttributes.ToString();
+                asset.Metadata["hasAnimations"] = (root.Animations != null && root.Animations.Length > 0).ToString();
+                asset.Metadata["animationCount"] = (root.Animations?.Length ?? 0).ToString();
+
+                if (root.Skins != null && root.Skins.Length > 0)
+                {
+                    var skin = root.Skins[0];
+                    asset.Metadata["boneCount"] = skin.Joints.Length.ToString();
+                    if (root.Nodes != null)
+                    {
+                        var boneNames = skin.Joints
+                            .Where(nodeIndex => nodeIndex >= 0 && nodeIndex < root.Nodes.Length)
+                            .Select(nodeIndex => root.Nodes[nodeIndex].Name ?? $"Bone_{nodeIndex}")
+                            .ToArray();
+                        asset.Metadata["boneNames"] = string.Join(",", boneNames);
+                    }
+                }
+
+                ErrorHandler.LogInfo(
+                    $"[GLTFImportHandler] Detected skeletal GLTF data: skins={root.Skins?.Length ?? 0}, jointAttributes={hasJointAttributes}",
+                    "GLTFImportHandler");
+                LogGltfSkinBones(root);
+            }
+
             // Setup directories
             string targetDir = options?.Settings != null && options.Settings.TryGetValue("TargetDirectory", out var td) && td is string tdStr 
                 ? tdStr 
@@ -1121,8 +1215,27 @@ public class GLTFImportHandler : IAssetImportHandler
             if (!Directory.Exists(materialsDir)) Directory.CreateDirectory(materialsDir);
             if (!Directory.Exists(texturesDir)) Directory.CreateDirectory(texturesDir);
 
-            // ── STEP 1: Extract and save all textures ──────────────────────────────────────
+            // ── STEP 1: Identify and Extract all textures ──────────────────────────────────
             var texturePathMap = new Dictionary<int, string>(); // GLTF texture index → .blueskyasset path
+            var mrTextures = new HashSet<int>();
+            var aoTextures = new HashSet<int>();
+            var normalTextures = new HashSet<int>();
+            var albedoTextures = new HashSet<int>();
+
+            if (root.Materials != null)
+            {
+                foreach (var mat in root.Materials)
+                {
+                    if (mat.PbrMetallicRoughness != null)
+                    {
+                        if (mat.PbrMetallicRoughness.BaseColorTexture != null) albedoTextures.Add(mat.PbrMetallicRoughness.BaseColorTexture.Index);
+                        if (mat.PbrMetallicRoughness.MetallicRoughnessTexture != null) mrTextures.Add(mat.PbrMetallicRoughness.MetallicRoughnessTexture.Index);
+                    }
+                    if (mat.NormalTexture != null) normalTextures.Add(mat.NormalTexture.Index);
+                    if (mat.OcclusionTexture != null) aoTextures.Add(mat.OcclusionTexture.Index);
+                }
+            }
+
             if (root.Textures != null && root.Textures.Length > 0)
             {
                 ErrorHandler.LogInfo($"[GLTFImportHandler] ═══════════════════════════════════════════════════════════", "GLTFImportHandler");
@@ -1136,41 +1249,61 @@ public class GLTFImportHandler : IAssetImportHandler
                         var texData = importer.ExtractTexture(i);
                         if (texData != null && texData.Length > 0)
                         {
-                            // Decode image bytes using StbImageSharp
                             StbImageSharp.StbImage.stbi_set_flip_vertically_on_load(0);
                             using var stream = new MemoryStream(texData);
                             var imageResult = StbImageSharp.ImageResult.FromStream(stream, StbImageSharp.ColorComponents.RedGreenBlueAlpha);
                             
                             if (imageResult != null)
                             {
-                                // Use GLTF image name if available, otherwise texture name, otherwise index
                                 string texName = $"Texture_{i}";
-                                
-                                // Try to get name from GLTF texture
                                 if (root.Textures[i].Name != null && !string.IsNullOrWhiteSpace(root.Textures[i].Name))
-                                {
                                     texName = root.Textures[i].Name;
-                                }
-                                // Try to get name from GLTF image
-                                else if (root.Textures[i].Source.HasValue && 
-                                         root.Images != null && 
-                                         root.Textures[i].Source.Value < root.Images.Length &&
-                                         root.Images[root.Textures[i].Source.Value].Name != null)
-                                {
+                                else if (root.Textures[i].Source.HasValue && root.Images != null && root.Textures[i].Source.Value < root.Images.Length && root.Images[root.Textures[i].Source.Value].Name != null)
                                     texName = root.Images[root.Textures[i].Source.Value].Name;
-                                }
                                 
-                                // Sanitize filename
                                 texName = string.Join("_", texName.Split(Path.GetInvalidFileNameChars()));
                                 
+                                // ★ CRITICAL FIX: RMA Channel Packing ★
+                                // GLTF MR: G=Roughness, B=Metallic. AO: R channel of separate texture.
+                                // Engine RMA: R=Roughness, G=Metallic, B=AO.
+                                if (mrTextures.Contains(i) || aoTextures.Contains(i))
+                                {
+                                    bool isMR = mrTextures.Contains(i);
+                                    bool isAO = aoTextures.Contains(i);
+                                    
+                                    for (int p = 0; p < imageResult.Data.Length; p += 4)
+                                    {
+                                        byte r = imageResult.Data[p];
+                                        byte g = imageResult.Data[p + 1];
+                                        byte b = imageResult.Data[p + 2];
+                                        
+                                        if (isMR && isAO) {
+                                            // Combined GLTF texture: R=AO, G=Roughness, B=Metallic
+                                            imageResult.Data[p] = g;     // Roughness -> R
+                                            imageResult.Data[p + 1] = b; // Metallic -> G
+                                            imageResult.Data[p + 2] = r; // AO -> B
+                                        } else if (isMR) {
+                                            // Pure MR: G=Roughness, B=Metallic
+                                            imageResult.Data[p] = g;     // Roughness -> R
+                                            imageResult.Data[p + 1] = b; // Metallic -> G
+                                            imageResult.Data[p + 2] = 255; // Default AO
+                                        } else if (isAO) {
+                                            // Pure AO: R=AO
+                                            imageResult.Data[p] = 255;   // Default Roughness
+                                            imageResult.Data[p + 1] = 0; // Default Metallic
+                                            imageResult.Data[p + 2] = r; // AO -> B
+                                        }
+                                    }
+                                    if (isMR) texName += "_RMA";
+                                    else if (isAO) texName += "_AO";
+                                }
+
                                 var texAsset = new BlueAsset { AssetName = texName, Type = AssetType.Texture, ImportDate = DateTime.UtcNow };
-                                
-                                // Pack texture data into payload (width, height, channels, data)
                                 using var texMs = new MemoryStream();
                                 using var texWriter = new BinaryWriter(texMs);
                                 texWriter.Write(imageResult.Width);
                                 texWriter.Write(imageResult.Height);
-                                texWriter.Write(4); // RGBA channels
+                                texWriter.Write(4);
                                 texWriter.Write(imageResult.Data.Length);
                                 texWriter.Write(imageResult.Data);
                                 
@@ -1178,35 +1311,28 @@ public class GLTFImportHandler : IAssetImportHandler
                                 texAsset.Metadata["width"] = imageResult.Width.ToString();
                                 texAsset.Metadata["height"] = imageResult.Height.ToString();
                                 texAsset.Metadata["format"] = "RGBA8";
-                                texAsset.Metadata["channels"] = "4";
                                 
                                 string texPath = Path.Combine(texturesDir, $"{texName}.blueskyasset");
                                 if (texAsset.Save(texPath))
                                 {
                                     texturePathMap[i] = texPath;
-                                    ErrorHandler.LogInfo($"[GLTFImportHandler] ✓ Texture {i}: '{texName}' ({imageResult.Width}x{imageResult.Height} RGBA)", "GLTFImportHandler");
+                                    ErrorHandler.LogInfo($"[GLTFImportHandler] ✓ Texture {i}: '{texName}'", "GLTFImportHandler");
                                 }
                             }
                         }
                     }
-                    catch (Exception ex)
-                    {
-                        ErrorHandler.LogWarning($"[GLTFImportHandler] Failed to extract texture {i}: {ex.Message}", "GLTFImportHandler");
-                    }
+                    catch (Exception ex) { ErrorHandler.LogWarning($"[GLTFImportHandler] Failed texture {i}: {ex.Message}", "GLTFImportHandler"); }
                 }
-                ErrorHandler.LogInfo($"[GLTFImportHandler] ═══════════════════════════════════════════════════════════", "GLTFImportHandler");
-                ErrorHandler.LogInfo($"[GLTFImportHandler] ✓ EXTRACTED {texturePathMap.Count}/{root.Textures.Length} TEXTURES", "GLTFImportHandler");
-                ErrorHandler.LogInfo($"[GLTFImportHandler] ═══════════════════════════════════════════════════════════", "GLTFImportHandler");
             }
 
             // ── STEP 2: Convert and save all materials ─────────────────────────────────────
-            var materialPathMap = new Dictionary<int, string>(); // GLTF material index → .blueskyasset path
-            if (root.Materials != null && root.Materials.Length > 0)
+            ErrorHandler.LogInfo($"[GLTFImportHandler] texturePathMap has {texturePathMap.Count} entries before material creation", "GLTFImportHandler");
+            foreach (var kvp in texturePathMap)
+                ErrorHandler.LogInfo($"[GLTFImportHandler]   texturePathMap[{kvp.Key}] = {Path.GetFileName(kvp.Value)}", "GLTFImportHandler");
+            
+            var materialPathMap = new Dictionary<int, string>();
+            if (root.Materials != null)
             {
-                ErrorHandler.LogInfo($"[GLTFImportHandler] ═══════════════════════════════════════════════════════════", "GLTFImportHandler");
-                ErrorHandler.LogInfo($"[GLTFImportHandler] CONVERTING {root.Materials.Length} MATERIALS WITH FULL PBR WORKFLOW", "GLTFImportHandler");
-                ErrorHandler.LogInfo($"[GLTFImportHandler] ═══════════════════════════════════════════════════════════", "GLTFImportHandler");
-                
                 for (int i = 0; i < root.Materials.Length; i++)
                 {
                     try
@@ -1215,159 +1341,69 @@ public class GLTFImportHandler : IAssetImportHandler
                         string matName = string.IsNullOrEmpty(gltfMat.Name) ? $"Material_{i}" : gltfMat.Name;
                         matName = string.Join("_", matName.Split(Path.GetInvalidFileNameChars()));
 
-                        ErrorHandler.LogInfo($"[GLTFImportHandler] ─── Material {i}: '{matName}' ───", "GLTFImportHandler");
+                        var matAsset = new MaterialAsset { MaterialName = matName, Albedo = new Vector3Data(1,1,1), Metallic = 0, Roughness = 0.5f, Opacity = 1 };
 
-                        var matAsset = new MaterialAsset 
-                        { 
-                            MaterialName = matName, 
-                            MaterialId = Guid.NewGuid(),
-                            Albedo = new Vector3Data(1.0f, 1.0f, 1.0f), // Default white (textures will override)
-                            Metallic = 0.0f,
-                            Roughness = 0.5f,
-                            Opacity = 1.0f
-                        };
-
-                        // PBR Metallic-Roughness workflow
                         if (gltfMat.PbrMetallicRoughness != null)
                         {
                             var pbr = gltfMat.PbrMetallicRoughness;
-                            
-                            // Base color factor
-                            if (pbr.BaseColorFactor != null && pbr.BaseColorFactor.Length >= 3)
+                            if (pbr.BaseColorFactor != null && pbr.BaseColorFactor.Length >= 4)
                             {
                                 matAsset.Albedo = new Vector3Data(pbr.BaseColorFactor[0], pbr.BaseColorFactor[1], pbr.BaseColorFactor[2]);
-                                if (pbr.BaseColorFactor.Length >= 4)
-                                    matAsset.Opacity = pbr.BaseColorFactor[3];
-                                ErrorHandler.LogInfo($"[GLTFImportHandler]   BaseColor: ({pbr.BaseColorFactor[0]:F3}, {pbr.BaseColorFactor[1]:F3}, {pbr.BaseColorFactor[2]:F3})", "GLTFImportHandler");
+                                matAsset.Opacity = pbr.BaseColorFactor[3];
+                            }
+                            else if (pbr.BaseColorFactor != null && pbr.BaseColorFactor.Length >= 3)
+                            {
+                                matAsset.Albedo = new Vector3Data(pbr.BaseColorFactor[0], pbr.BaseColorFactor[1], pbr.BaseColorFactor[2]);
                             }
                             
                             matAsset.Metallic = pbr.MetallicFactor;
                             matAsset.Roughness = pbr.RoughnessFactor;
-                            ErrorHandler.LogInfo($"[GLTFImportHandler]   Metallic: {pbr.MetallicFactor:F2}, Roughness: {pbr.RoughnessFactor:F2}", "GLTFImportHandler");
+                            
+                            // Adjust opacity based on AlphaMode
+                            if (gltfMat.AlphaMode == "BLEND")
+                                matAsset.Opacity = System.Math.Min(matAsset.Opacity, 0.99f); // Force some transparency
+                            else if (gltfMat.AlphaMode == "MASK")
+                                matAsset.Opacity = 1.0f; // Masking handled by clip in shader
 
-                            // ★ CRITICAL FIX: Albedo/BaseColor texture
-                            if (pbr.BaseColorTexture != null && pbr.BaseColorTexture.Index >= 0)
+                            // Log texture lookup attempts
+                            if (pbr.BaseColorTexture != null)
                             {
-                                if (texturePathMap.TryGetValue(pbr.BaseColorTexture.Index, out var albedoPath))
-                                {
-                                    matAsset.AlbedoTexturePath = albedoPath;
-                                    ErrorHandler.LogInfo($"[GLTFImportHandler]   ✓ Albedo Texture: {Path.GetFileName(albedoPath)}", "GLTFImportHandler");
-                                }
-                                else
-                                {
-                                    ErrorHandler.LogWarning($"[GLTFImportHandler]   ✗ Albedo texture index {pbr.BaseColorTexture.Index} not found in texture map!", "GLTFImportHandler");
-                                }
+                                bool found = texturePathMap.TryGetValue(pbr.BaseColorTexture.Index, out var albedoPath);
+                                ErrorHandler.LogInfo($"[GLTFImportHandler] Mat[{i}] '{matName}': BaseColorTexture.Index={pbr.BaseColorTexture.Index}, found={found}, path={albedoPath ?? "NULL"}", "GLTFImportHandler");
+                                if (found)
+                                    matAsset.AlbedoTexturePath = albedoPath!;
                             }
-                            else
+                            
+                            if (pbr.MetallicRoughnessTexture != null)
                             {
-                                ErrorHandler.LogInfo($"[GLTFImportHandler]   No albedo texture (using base color factor)", "GLTFImportHandler");
-                            }
-
-                            // ★ CRITICAL FIX: Metallic-Roughness texture (packed: R=unused, G=roughness, B=metallic)
-                            if (pbr.MetallicRoughnessTexture != null && pbr.MetallicRoughnessTexture.Index >= 0)
-                            {
-                                if (texturePathMap.TryGetValue(pbr.MetallicRoughnessTexture.Index, out var mrPath))
-                                {
-                                    // ★ FIX: Write to RMATexturePath (what ViewportRenderer reads)
-                                    // AND RoughnessTexturePath (for other consumers)
-                                    matAsset.RMATexturePath = mrPath;
-                                    matAsset.RoughnessTexturePath = mrPath;
-                                    ErrorHandler.LogInfo($"[GLTFImportHandler]   ✓ Metallic-Roughness Texture → RMA+Roughness: {Path.GetFileName(mrPath)}", "GLTFImportHandler");
-                                }
-                                else
-                                {
-                                    ErrorHandler.LogWarning($"[GLTFImportHandler]   ✗ MR texture index {pbr.MetallicRoughnessTexture.Index} not found!", "GLTFImportHandler");
-                                }
+                                bool found = texturePathMap.TryGetValue(pbr.MetallicRoughnessTexture.Index, out var mrPath);
+                                ErrorHandler.LogInfo($"[GLTFImportHandler] Mat[{i}] '{matName}': MetallicRoughnessTex.Index={pbr.MetallicRoughnessTexture.Index}, found={found}", "GLTFImportHandler");
+                                if (found)
+                                    matAsset.RMATexturePath = mrPath!;
                             }
                         }
-
-                        // Normal map
-                        if (gltfMat.NormalTexture != null && gltfMat.NormalTexture.Index >= 0)
+                        else
                         {
-                            if (texturePathMap.TryGetValue(gltfMat.NormalTexture.Index, out var normalPath))
-                            {
-                                matAsset.NormalTexturePath = normalPath;
-                                ErrorHandler.LogInfo($"[GLTFImportHandler]   ✓ Normal Texture: {Path.GetFileName(normalPath)}", "GLTFImportHandler");
-                            }
+                            ErrorHandler.LogWarning($"[GLTFImportHandler] Mat[{i}] '{matName}': NO PbrMetallicRoughness block!", "GLTFImportHandler");
                         }
 
-                        // Occlusion map (AO) - MaterialAsset doesn't have AOTexturePath, skip for now
-                        // TODO: Add AOTexturePath to MaterialAsset class
-                        if (gltfMat.OcclusionTexture != null && gltfMat.OcclusionTexture.Index >= 0)
+                        if (gltfMat.NormalTexture != null && texturePathMap.TryGetValue(gltfMat.NormalTexture.Index, out var normalPath))
+                            matAsset.NormalTexturePath = normalPath;
+
+                        if (gltfMat.OcclusionTexture != null && texturePathMap.TryGetValue(gltfMat.OcclusionTexture.Index, out var aoPath))
                         {
-                            if (texturePathMap.TryGetValue(gltfMat.OcclusionTexture.Index, out var aoPath))
-                            {
-                                // Store in RMA texture path as a workaround (R=roughness, G=metallic, B=AO)
-                                if (string.IsNullOrEmpty(matAsset.RMATexturePath))
-                                {
-                                    matAsset.RMATexturePath = aoPath;
-                                    ErrorHandler.LogInfo($"[GLTFImportHandler]   ✓ AO Texture (as RMA): {Path.GetFileName(aoPath)}", "GLTFImportHandler");
-                                }
-                            }
+                            if (string.IsNullOrEmpty(matAsset.RMATexturePath)) matAsset.RMATexturePath = aoPath;
                         }
 
-                        // Emissive
-                        if (gltfMat.EmissiveFactor != null && gltfMat.EmissiveFactor.Length >= 3 && 
-                            (gltfMat.EmissiveFactor[0] > 0 || gltfMat.EmissiveFactor[1] > 0 || gltfMat.EmissiveFactor[2] > 0))
-                        {
-                            matAsset.Emission = new Vector3Data(gltfMat.EmissiveFactor[0], gltfMat.EmissiveFactor[1], gltfMat.EmissiveFactor[2]);
-                            matAsset.EmissionIntensity = 1.0f;
-                            ErrorHandler.LogInfo($"[GLTFImportHandler]   Emissive: ({gltfMat.EmissiveFactor[0]:F2}, {gltfMat.EmissiveFactor[1]:F2}, {gltfMat.EmissiveFactor[2]:F2})", "GLTFImportHandler");
-                        }
-
-                        // Emissive texture - MaterialAsset doesn't have EmissiveTexturePath, skip for now
-                        // TODO: Add EmissiveTexturePath to MaterialAsset class
-                        if (gltfMat.EmissiveTexture != null && gltfMat.EmissiveTexture.Index >= 0)
-                        {
-                            if (texturePathMap.TryGetValue(gltfMat.EmissiveTexture.Index, out var emissivePath))
-                            {
-                                ErrorHandler.LogInfo($"[GLTFImportHandler]   ⚠ Emissive Texture found but MaterialAsset doesn't support it yet: {Path.GetFileName(emissivePath)}", "GLTFImportHandler");
-                            }
-                        }
-
-                        // Alpha mode
                         if (!string.IsNullOrEmpty(gltfMat.AlphaMode))
-                        {
-                            matAsset.BlendMode = gltfMat.AlphaMode switch
-                            {
-                                "BLEND" => BlueSky.Rendering.Materials.BlendMode.AlphaBlend,
-                                "MASK" => BlueSky.Rendering.Materials.BlendMode.AlphaBlend,
-                                _ => BlueSky.Rendering.Materials.BlendMode.Opaque
-                            };
-                            ErrorHandler.LogInfo($"[GLTFImportHandler]   Alpha Mode: {gltfMat.AlphaMode} → {matAsset.BlendMode}", "GLTFImportHandler");
-                        }
-
-                        // Double-sided
-                        if (gltfMat.DoubleSided)
-                        {
-                            ErrorHandler.LogInfo($"[GLTFImportHandler]   Double-sided: true", "GLTFImportHandler");
-                        }
+                            matAsset.BlendMode = gltfMat.AlphaMode == "BLEND" || gltfMat.AlphaMode == "MASK" ? BlueSky.Rendering.Materials.BlendMode.AlphaBlend : BlueSky.Rendering.Materials.BlendMode.Opaque;
 
                         string matPath = Path.Combine(materialsDir, $"{matName}.blueskyasset");
                         matAsset.Save(matPath);
                         materialPathMap[i] = matPath;
-                        
-                        ErrorHandler.LogInfo($"[GLTFImportHandler]   ✓ Saved: {Path.GetFileName(matPath)}", "GLTFImportHandler");
                     }
-                    catch (Exception ex)
-                    {
-                        ErrorHandler.LogError($"[GLTFImportHandler] Failed to convert material {i}: {ex.Message}", ex, "GLTFImportHandler");
-                        
-                        // Create fallback material
-                        var fallbackMat = new MaterialAsset 
-                        { 
-                            MaterialName = $"Material_{i}", 
-                            MaterialId = Guid.NewGuid(),
-                            Albedo = new Vector3Data(1.0f, 0.0f, 1.0f) // Magenta = missing material
-                        };
-                        string fallbackPath = Path.Combine(materialsDir, $"Material_{i}.blueskyasset");
-                        fallbackMat.Save(fallbackPath);
-                        materialPathMap[i] = fallbackPath;
-                    }
+                    catch (Exception ex) { ErrorHandler.LogError($"[GLTFImportHandler] Failed material {i}: {ex.Message}", ex, "GLTFImportHandler"); }
                 }
-                ErrorHandler.LogInfo($"[GLTFImportHandler] ═══════════════════════════════════════════════════════════", "GLTFImportHandler");
-                ErrorHandler.LogInfo($"[GLTFImportHandler] ✓ CONVERTED {materialPathMap.Count}/{root.Materials.Length} MATERIALS", "GLTFImportHandler");
-                ErrorHandler.LogInfo($"[GLTFImportHandler] ═══════════════════════════════════════════════════════════", "GLTFImportHandler");
             }
 
             // ── STEP 3: Build scene graph and compute node transforms ──────────────────────
@@ -1447,20 +1483,14 @@ public class GLTFImportHandler : IAssetImportHandler
                     {
                         // Apply world transform to position
                         var localPos = prim.Positions[i];
+                        // glTF is right-handed, and the engine's projection/view matrices are also right-handed.
+                        // No handedness conversion is needed.
                         var worldPos = System.Numerics.Vector3.Transform(localPos, worldTransform);
-                        
-                        // COORDINATE SYSTEM FIX: glTF is right-handed, engine is left-handed.
-                        // Negate X to convert handedness. This fixes:
-                        //   - Mirrored text ("ASTON MARTIN" → "NITRAM NOTSA")
-                        //   - Steering wheel on wrong side
-                        //   - All geometry appearing as a mirror image
-                        worldPos.X = -worldPos.X;
                         
                         // Apply node transform to normal (rotation only, no translation/scale)
                         var localNormal = (prim.Normals != null && i < prim.Normals.Length) ? prim.Normals[i] : System.Numerics.Vector3.UnitY;
                         var worldNormal = System.Numerics.Vector3.TransformNormal(localNormal, worldTransform);
                         worldNormal = System.Numerics.Vector3.Normalize(worldNormal);
-                        worldNormal.X = -worldNormal.X; // Match position X-negate
                         
                         var uv = (prim.TexCoords0 != null && i < prim.TexCoords0.Length) ? prim.TexCoords0[i] : System.Numerics.Vector2.Zero;
 
@@ -1486,12 +1516,7 @@ public class GLTFImportHandler : IAssetImportHandler
 
                     int submeshIndexCount = finalIndices.Count - submeshIndexStart;
                     
-                    // WINDING ORDER FIX: Negating X flips triangle winding.
-                    // Swap indices 1 and 2 of each triangle to restore correct front-face orientation.
-                    for (int t = submeshIndexStart; t + 2 < finalIndices.Count; t += 3)
-                    {
-                        (finalIndices[t + 1], finalIndices[t + 2]) = (finalIndices[t + 2], finalIndices[t + 1]);
-                    }
+                    // No winding order fix needed since we didn't flip any axis.
                     
                     if (submeshIndexCount > 0)
                     {

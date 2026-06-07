@@ -231,20 +231,21 @@ internal class MetalPipeline : IRHIPipeline
             else
                 libraryName = "default.metallib";
 
-            // Load library from Shaders directory, fallback to Editor/Shaders for dev runs
+            // Prefer editor shader libraries for editor viewport entry points.
+            // A stale legacy copy can also exist in Shaders/, so keep it as a fallback.
             var exeDir = System.AppContext.BaseDirectory;
-            var libraryPath = System.IO.Path.Combine(exeDir, "Shaders", libraryName);
+            var libraryPath = System.IO.Path.Combine(exeDir, "Editor", "Shaders", libraryName);
             
             if (!System.IO.File.Exists(libraryPath))
-                libraryPath = System.IO.Path.Combine(exeDir, "Editor", "Shaders", libraryName);
+                libraryPath = System.IO.Path.Combine(exeDir, "Shaders", libraryName);
                 
             // Bundle fallback: check ../Resources/Editor/Shaders and ../Resources/Shaders
             if (!System.IO.File.Exists(libraryPath))
             {
                 var bundleResources = System.IO.Path.Combine(exeDir, "..", "Resources");
-                libraryPath = System.IO.Path.Combine(bundleResources, "Shaders", libraryName);
+                libraryPath = System.IO.Path.Combine(bundleResources, "Editor", "Shaders", libraryName);
                 if (!System.IO.File.Exists(libraryPath))
-                    libraryPath = System.IO.Path.Combine(bundleResources, "Editor", "Shaders", libraryName);
+                    libraryPath = System.IO.Path.Combine(bundleResources, "Shaders", libraryName);
             }
 
             if (!System.IO.File.Exists(libraryPath))

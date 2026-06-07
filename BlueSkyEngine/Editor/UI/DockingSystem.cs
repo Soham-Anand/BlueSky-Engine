@@ -287,10 +287,14 @@ public class DockingSystem
 
         // ── Panel background ─────────────────────────────────────
         if (!isTransparent)
-            ui.Panel(b.X, b.Y + tabH, b.W, b.H - tabH, EditorTheme.Bg1);
+        {
+            ui.RoundedPanel(b.X, b.Y, b.W, b.H, EditorTheme.Bg1, EditorTheme.SmallRadius);
+            EditorChrome.Stroke(ui, b.X, b.Y, b.W, b.H, EditorTheme.Border0);
+            ui.Panel(b.X + 1, b.Y + 1, b.W - 2, 1, EditorTheme.Highlight);
+        }
 
         // ── Tab bar ──────────────────────────────────────────────
-        ui.Panel(b.X, b.Y, b.W, tabH, EditorTheme.TabBarBg);
+        ui.GradientPanel(b.X, b.Y, b.W, tabH, EditorTheme.TabBarBg, EditorTheme.Bg0);
         
         // Bottom border of tab bar (skip for transparent panels like viewport)
         if (!isTransparent)
@@ -320,14 +324,15 @@ public class DockingSystem
             else
                 tabColor = EditorTheme.TabInactive;
 
-            ui.Panel(tabX, b.Y, tabWidth, tabH, tabColor);
+            ui.RoundedPanel(tabX, b.Y + 3, tabWidth, tabH - 4, tabColor, EditorTheme.SmallRadius);
 
             // ── Active indicator — 2px accent bar at top ────────
             if (isActive)
             {
-                ui.Panel(tabX, b.Y, tabWidth, 2, EditorTheme.TabIndicator);
+                ui.Panel(tabX + 8, b.Y + 2, tabWidth - 16, 2, EditorTheme.TabIndicator);
                 // Erase bottom border so tab merges with content
                 ui.Panel(tabX, b.Y + tabH - 1, tabWidth, 1, EditorTheme.TabActive);
+                ui.Panel(tabX + 1, b.Y + 4, tabWidth - 2, 1, EditorTheme.Highlight);
             }
 
             // ── Right separator between tabs ────────────────────
@@ -343,9 +348,9 @@ public class DockingSystem
             string icon = GetPanelIcon(panelId);
             if (icon.Length > 0)
             {
-                ui.SetCursor(tabX + 8, b.Y + tabH / 2 - 6);
+                ui.SetCursor(tabX + 9, b.Y + tabH / 2 - 6);
                 ui.Text(icon, isActive ? EditorTheme.Accent : EditorTheme.TextMuted);
-                ui.SetCursor(tabX + 22, b.Y + tabH / 2 - 6);
+                ui.SetCursor(tabX + 25, b.Y + tabH / 2 - 6);
             }
             else
             {
@@ -362,7 +367,7 @@ public class DockingSystem
                 bool closeHot = closeRect.Contains(mouse);
 
                 if (closeHot)
-                    ui.Panel(closeX - 1, closeY - 1, TabCloseSize + 2, TabCloseSize + 2, EditorTheme.Red);
+                    ui.RoundedPanel(closeX - 1, closeY - 1, TabCloseSize + 2, TabCloseSize + 2, EditorTheme.WithAlpha(EditorTheme.Red, 0.35f), EditorTheme.SmallRadius);
 
                 ui.SetCursor(closeX + 3, closeY + 1);
                 ui.Text("×", closeHot ? EditorTheme.TextPrimary : EditorTheme.TextMuted);
@@ -389,6 +394,18 @@ public class DockingSystem
             string activeId = node.Tabs[node.ActiveTab];
             if (_panels.TryGetValue(activeId, out var activePanel))
             {
+                if (!isTransparent)
+                {
+                    string icon = GetPanelIcon(activeId);
+                    var accent = GetPanelAccent(activeId);
+                    ui.Panel(b.X, b.Y + tabH, b.W, 2, EditorTheme.WithAlpha(accent, 0.75f));
+                    if (!string.IsNullOrEmpty(icon) && b.W > 160)
+                    {
+                        ui.SetCursor(b.X + b.W - 28, b.Y + 7);
+                        ui.Text(icon, EditorTheme.WithAlpha(accent, 0.55f));
+                    }
+                }
+
                 var contentRect = new DockRect(b.X, b.Y + tabH, b.W, b.H - tabH);
                 activePanel.DrawContent?.Invoke(ui, contentRect);
             }
@@ -400,12 +417,25 @@ public class DockingSystem
     {
         return panelId switch
         {
-            "viewport"       => "",   // Viewport gets no icon to save space
-            "outliner"       => "◈",
-            "details"        => "⚙",
-            "content"        => "□",
-            "console"        => "▸",
+            "viewport"       => "V",
+            "outliner"       => "O",
+            "details"        => "D",
+            "content"        => "A",
+            "console"        => "L",
             _                => ""
+        };
+    }
+
+    private static Vector4 GetPanelAccent(string panelId)
+    {
+        return panelId switch
+        {
+            "viewport"       => EditorTheme.Accent,
+            "outliner"       => EditorTheme.AccentCyan,
+            "details"        => EditorTheme.Purple,
+            "content"        => EditorTheme.Orange,
+            "console"        => EditorTheme.Green,
+            _                => EditorTheme.Accent
         };
     }
 

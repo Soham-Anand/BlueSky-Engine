@@ -1,0 +1,76 @@
+// Combat AnimScript
+// Handles attack animations and combos
+
+state Idle {
+    animation "combat_idle"
+    speed 1.0
+    loop true
+    blend 0.2
+    
+    transition LightAttack when attackLight
+    transition HeavyAttack when attackHeavy
+    transition Block when isBlocking
+}
+
+state LightAttack {
+    animation "light_attack_1"
+    speed 1.2
+    loop false
+    blend 0.1
+    
+    // Combo into second attack
+    transition LightAttack2 when attackLight
+    
+    // Return to idle when animation finishes
+    transition Idle when animationFinished
+}
+
+state LightAttack2 {
+    animation "light_attack_2"
+    speed 1.2
+    loop false
+    blend 0.1
+    
+    // Combo into third attack
+    transition LightAttack3 when attackLight
+    
+    transition Idle when animationFinished
+}
+
+state LightAttack3 {
+    animation "light_attack_3"
+    speed 1.3
+    loop false
+    blend 0.1
+    
+    // Finisher - back to idle
+    transition Idle when animationFinished
+}
+
+state HeavyAttack {
+    animation "heavy_attack"
+    speed 1.0
+    loop false
+    blend 0.15
+    
+    transition Idle when animationFinished
+}
+
+state Block {
+    animation "block_idle"
+    speed 1.0
+    loop true
+    blend 0.1
+    
+    transition BlockHit when tookDamage
+    transition Idle when isBlocking
+}
+
+state BlockHit {
+    animation "block_hit"
+    speed 1.0
+    loop false
+    blend 0.05
+    
+    transition Block when animationFinished
+}

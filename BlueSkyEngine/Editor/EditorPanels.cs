@@ -512,7 +512,7 @@ partial class Program
                     ui.SetCursor(labelCol, (y + 2) - scrollOffset); ui.Text("Mass", EditorTheme.TextMuted);
                     ui.SetCursor(valueCol, y - scrollOffset);
                     float mass = rbComp.Mass;
-                    if (ui.Slider(ref mass, 0.1f, 100f, 100, 14))
+                    if (ui.Slider(ref mass, 0.1f, 10000f, 100, 14))
                     {
                         rbComp.Mass = mass;
                         _world.AddComponent(entity, rbComp);

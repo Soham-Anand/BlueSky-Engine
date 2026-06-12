@@ -291,8 +291,8 @@ See [LICENSE](LICENSE) file for full details.
 
 ## � Contact
 
-- **Issues**: [GitHub Issues](https://github.com/yourusername/bluesky-engine/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/yourusername/bluesky-engine/discussions)
+- **Issues**: [GitHub Issues](https://github.com/Soham-Anand/BlueSky-Engine/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/Soham-Anand/BlueSky-Engine/discussions)
 
 ---
 

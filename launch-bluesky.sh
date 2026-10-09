@@ -94,22 +94,10 @@ else
     print_warning "horizon_lighting.metal not found, skipping..."
 fi
 
-# Compile pbr_optimized.metal
-if [ -f "pbr_optimized.metal" ]; then
-    echo "  Compiling pbr_optimized.metal..."
-    xcrun -sdk macosx metal -c pbr_optimized.metal -o pbr_optimized.air 2>&1 | grep -v "warning:" || true
-    xcrun -sdk macosx metallib pbr_optimized.air -o pbr_optimized.metallib
-    rm -f pbr_optimized.air
-    echo "  ✓ pbr_optimized.metallib"
-else
-    print_warning "pbr_optimized.metal not found, skipping..."
-fi
-
 # Copy compiled metallibs to main Shaders folder so both copies are kept up-to-date
 cp viewport_3d.metallib ../../Shaders/ 2>/dev/null || true
 cp simple_ui.metallib ../../Shaders/ 2>/dev/null || true
 cp horizon_lighting.metallib ../../Shaders/ 2>/dev/null || true
-cp pbr_optimized.metallib ../../Shaders/ 2>/dev/null || true
 
 cd - > /dev/null
 

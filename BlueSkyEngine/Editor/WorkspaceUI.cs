@@ -11,7 +11,8 @@ using BlueSky.Core.Math;
 using BlueSky.Rendering;
 using BlueSky.Core.Scripting;
 using BlueSky.Core.Scene;
-using NotBSRenderer;
+using BlueSky.Networking;
+using BlueSky.Rendering.RHI;
 
 namespace BlueSky.Editor;
 
@@ -71,16 +72,6 @@ partial class Program
         float projectW = MathF.Min(240, MathF.Max(104, _ui.MeasureText(projName) + 34));
         EditorChrome.Pill(_ui, fpsPillX - projectW - 8, pillY, projectW, pillH, projName, EditorTheme.AccentCyan);
 
-        float searchW = 260;
-        float searchX = fpsPillX - projectW - searchW - 22;
-        if (searchX > menuX + 20)
-        {
-            _ui.RoundedPanel(searchX, pillY, searchW, pillH, EditorTheme.Bg0, EditorTheme.PillRadius);
-            EditorChrome.Stroke(_ui, searchX, pillY, searchW, pillH, EditorTheme.Border1);
-            _ui.SetCursor(searchX + 12, pillY + 3);
-            _ui.Text("Cmd+P  Search commands, assets, tools", EditorTheme.TextDisabled);
-        }
-
         // ═══════════════════════════════════════════════════════════════
         //  TOOLBAR - grouped editor tools
         // ═══════════════════════════════════════════════════════════════
@@ -124,19 +115,6 @@ partial class Program
 
         _ui.Panel(tlX, menuH + 8, 1, toolbarH - 16, EditorTheme.Border1);
         tlX += 8;
-
-        _ui.RoundedPanel(tlX - 6, tlY - 4, 98, btnH + 8, EditorTheme.Bg0, EditorTheme.SmallRadius);
-        _ui.ButtonEx(tlX, tlY, 42, btnH, "Undo",
-            EditorTheme.ToolbarBtnNormal, EditorTheme.ToolbarBtnHover,
-            EditorTheme.AccentDim, new System.Numerics.Vector4(0,0,0,0),
-            EditorTheme.TextSecondary, 601);
-        tlX += 48;
-
-        _ui.ButtonEx(tlX, tlY, 42, btnH, "Redo",
-            EditorTheme.ToolbarBtnNormal, EditorTheme.ToolbarBtnHover,
-            EditorTheme.AccentDim, new System.Numerics.Vector4(0,0,0,0),
-            EditorTheme.TextSecondary, 602);
-        tlX += 48;
 
         // ── Gizmo Mode Buttons (W/E/R like UE5) ─────────────────────
         _ui.Panel(tlX, menuH + 8, 1, toolbarH - 16, EditorTheme.Border1);
@@ -184,14 +162,18 @@ partial class Program
                 _editorViewportRenderer.CurrentGizmoMode = BlueSky.Editor.ViewportRenderer.GizmoMode.Scale;
         }
 
-        // Center: Play / Pause / Stop
-        float tcW = 210;
+        // Right: Strata lives in the dock tab now (no toolbar toggle;
+        // the old flag gate left the dock tab body empty).
+
+        // Center: Play / Pause / Stop + Standalone
+        float tcW = 420; // Wider to fit standalone + instance count field
         float tcX = (w - tcW) / 2;
         float tcY = tlY; // Same Y as left buttons
         _ui.RoundedPanel(tcX - 8, tcY - 5, tcW + 16, btnH + 10, EditorTheme.Bg0, EditorTheme.PillRadius);
         EditorChrome.Stroke(_ui, tcX - 8, tcY - 5, tcW + 16, btnH + 10, EditorTheme.Border1);
         _ui.Panel(tcX + 63, tcY - 1, 1, btnH + 2, EditorTheme.Border1);
         _ui.Panel(tcX + 137, tcY - 1, 1, btnH + 2, EditorTheme.Border1);
+        _ui.Panel(tcX + 210, tcY - 1, 1, btnH + 2, EditorTheme.Border1); // Separator for standalone
 
         // Play button with animated success style
         if (AnimatedButton.RenderSuccess(_ui, tcX, tcY, 58, btnH, "Run", 610,
@@ -208,6 +190,10 @@ partial class Program
                         resetTeaScriptRuntimeInstances: () => _teaScriptSystem?.ResetRuntimeInstances(),
                         log: Log
                     );
+                    _physicsAccumulator = 0.0;
+                    _physicsStepsThisFrame = 0;
+                    _physicsFrame = 0;
+                    ResetEditorPhysicsInterpolation();
                     _notificationSystem?.ShowSuccess("Play mode started", duration: 2f);
                 }
             }
@@ -237,12 +223,152 @@ partial class Program
                 if (_world != null)
                 {
                     PlayMode.Stop(_world, hotReloadScripts: HotReloadScripts, log: Log);
+                    _physicsAccumulator = 0.0;
+                    _physicsStepsThisFrame = 0;
+                    _physicsFrame = 0;
+                    ResetEditorPhysicsInterpolation();
                     _notificationSystem?.ShowInfo("Stopped - scene restored", duration: 2f);
                 }
             }
         }
+        
+        // Instance count selector (for multi-instance local multiplayer)
+        // Arrow buttons + count display — simple, no focus-tracking needed
+        float icX = tcX + 216;
+        _standaloneInstanceCount = Math.Clamp(_standaloneInstanceCount, 1, 4);
+        // "<" button
+        if (_ui.ButtonEx(icX, tcY, 14, btnH, "<",
+            EditorTheme.ToolbarBtnNormal, EditorTheme.ToolbarBtnHover,
+            EditorTheme.AccentDim, new System.Numerics.Vector4(0,0,0,0),
+            EditorTheme.TextSecondary, 614) && _standaloneInstanceCount > 1)
+        {
+            _standaloneInstanceCount--;
+        }
+        // Count label centered in the selector
+        _ui.SetCursor(icX + 14, tcY + 4);
+        _ui.Text($"{_standaloneInstanceCount}", EditorTheme.Accent);
+        // ">" button
+        if (_ui.ButtonEx(icX + 24, tcY, 14, btnH, ">",
+            EditorTheme.ToolbarBtnNormal, EditorTheme.ToolbarBtnHover,
+            EditorTheme.AccentDim, new System.Numerics.Vector4(0,0,0,0),
+            EditorTheme.TextSecondary, 615) && _standaloneInstanceCount < 4)
+        {
+            _standaloneInstanceCount++;
+        }
 
-        string rendererName = _useEaseRenderer ? "Ease+" : "Forward+";
+        // Play Standalone button
+        bool standaloneRunning = _standalonePlay?.IsRunning ?? false;
+        if (AnimatedButton.Render(_ui, tcX + 255, tcY, 120, btnH,
+            standaloneRunning ? "Stop Standalone" : "Play Standalone", 613,
+            normalColor: standaloneRunning ? ModernTheme.WithAlpha(ModernTheme.Red, 0.2f) : ModernTheme.WithAlpha(ModernTheme.Blue, 0.2f),
+            hoverColor: standaloneRunning ? ModernTheme.WithAlpha(ModernTheme.Red, 0.4f) : ModernTheme.WithAlpha(ModernTheme.Blue, 0.4f),
+            pressColor: standaloneRunning ? ModernTheme.Red : ModernTheme.Blue,
+            textColor: standaloneRunning ? ModernTheme.Red : ModernTheme.Blue,
+            enabled: true))
+        {
+            if (standaloneRunning)
+            {
+                _standalonePlay?.Stop();
+                _notificationSystem?.ShowInfo("Standalone stopped", duration: 2f);
+            }
+            else
+            {
+                if (_world != null && !string.IsNullOrEmpty(_currentScenePath))
+                {
+                    if (_standaloneInstanceCount > 1)
+                    {
+                        // Multi-instance launch: all offline — user chooses Host/Join inside each window
+                        var baseOpts = new BlueSky.Networking.StandaloneLaunchOptions
+                        {
+                            ScenePath = _currentScenePath,
+                            Width = 1280,
+                            Height = 720,
+                            Fullscreen = false,
+                            VSync = true,
+                            Multiplayer = new MultiplayerConfig
+                            {
+                                Mode = MultiplayerMode.Offline,
+                                ScenePath = _currentScenePath,
+                            }
+                        };
+
+                        bool launched = _standalonePlay?.LaunchMultiple(baseOpts, _standaloneInstanceCount) ?? false;
+                        if (launched)
+                        {
+                            int count = _standaloneInstanceCount;
+                            _notificationSystem?.ShowSuccess($"Launched {count} instance(s) for local multiplayer", duration: 3f);
+                        }
+                        else
+                        {
+                            _notificationSystem?.ShowError("Failed to launch standalone instances", duration: 3f);
+                        }
+                    }
+                    else
+                    {
+                        // Single instance (original behavior)
+                        bool launchAsHost = _input != null &&
+                            (_input.IsKeyDown(KeyCode.LeftShift) || _input.IsKeyDown(KeyCode.RightShift));
+                        bool launchAsJoin = _input != null &&
+                            (_input.IsKeyDown(KeyCode.LeftControl) || _input.IsKeyDown(KeyCode.RightControl));
+
+                        if (!launchAsHost && !launchAsJoin)
+                        {
+                            NetworkingTeaScriptBridge.Register(null);
+                            bool launched = _standalonePlay?.Launch(_currentScenePath, 1280, 720, false, true) ?? false;
+                            if (launched)
+                                _notificationSystem?.ShowSuccess($"Standalone launched (PID: {_standalonePlay?.ProcessId})", duration: 3f);
+                            else
+                                _notificationSystem?.ShowError("Failed to launch standalone", duration: 3f);
+                            return;
+                        }
+
+                        var multiplayer = new MultiplayerConfig
+                        {
+                            Mode        = launchAsHost ? MultiplayerMode.Host : MultiplayerMode.Join,
+                            SessionName = Path.GetFileNameWithoutExtension(_currentScenePath),
+                            LocalPlayerName = Environment.UserName,
+                            JoinSessionId   = Environment.GetEnvironmentVariable("EOS_JOIN_SESSION_ID") ?? "",
+                            Eos       = EosCredentials.LoadForProject(ProjectManager.CurrentProjectDir ?? ""),
+                            ScenePath = _currentScenePath
+                        };
+
+                        var liveService = MultiplayerServiceFactory.Create(multiplayer);
+                        liveService.Initialize(Log);
+                        NetworkingTeaScriptBridge.Register(liveService, (scenePath, mode, sessionName, joinId) =>
+                        {
+                            Log($"[Net Bridge] loadScene({scenePath}, {mode}, session={sessionName}, join={joinId})");
+                            _notificationSystem?.ShowInfo($"Scene load requested: {Path.GetFileName(scenePath)} [{mode}]", duration: 4f);
+                        });
+
+                        bool launchedWithNet = _standalonePlay?.Launch(new BlueSky.Networking.StandaloneLaunchOptions
+                        {
+                            ScenePath = _currentScenePath,
+                            Width = 1280,
+                            Height = 720,
+                            Fullscreen = false,
+                            VSync = true,
+                            Multiplayer = multiplayer
+                        }) ?? false;
+                        if (launchedWithNet)
+                        {
+                            _notificationSystem?.ShowSuccess(
+                                launchAsHost ? $"Standalone host launched (PID: {_standalonePlay?.ProcessId})" : $"Standalone client launched (PID: {_standalonePlay?.ProcessId})",
+                                duration: 3f);
+                        }
+                        else
+                        {
+                            _notificationSystem?.ShowError("Failed to launch standalone", duration: 3f);
+                        }
+                    }
+                }
+                else
+                {
+                    _notificationSystem?.ShowWarning("No scene loaded - save scene first", duration: 3f);
+                }
+            }
+        }
+
+        string rendererName = "Forward+";
         float readyW = MathF.Max(118, _ui.MeasureText(rendererName) + 52);
         EditorChrome.Pill(_ui, w - readyW - 12, tlY + 3, readyW, 20, $"{rendererName} Ready", EditorTheme.Green, filled: _isPlaying);
 
@@ -274,14 +400,6 @@ partial class Program
             DrawScriptEditor(_ui, w, h);
         }
 
-        if (_materialEditor?.IsOpen ?? false)
-        {
-            float mEditorW = 1000, mEditorH = 700;
-            float mEditorX = (w - mEditorW) / 2;
-            float mEditorY = (h - mEditorH) / 2;
-            _materialEditor.Render(_ui, mEditorX, mEditorY, mEditorW, mEditorH);
-        }
-        
         if (_staticMeshEditor?.IsOpen ?? false)
         {
             float editorW = 1200, editorH = 700;
@@ -296,6 +414,19 @@ partial class Program
             }
         }
 
+        if (_skeletalMeshEditor?.IsOpen ?? false)
+        {
+            float editorW = 1200, editorH = 700;
+            float editorX = (w - editorW) / 2;
+            float editorY = (h - editorH) / 2;
+            _skeletalMeshEditor.Render(_ui, editorX, editorY, editorW, editorH);
+
+            if (!_skeletalMeshEditor.IsOpen && _world != null)
+            {
+                _skeletalMeshEditor.Close(_world);
+            }
+        }
+
         if (_showRenameDialog)
         {
             DrawRenameDialog(_ui, w, h);
@@ -306,7 +437,6 @@ partial class Program
             DrawContextMenu(_ui, _contextMenuX, _contextMenuY);
         }
 
-        _ui.EndFrame();
     }
 
 }

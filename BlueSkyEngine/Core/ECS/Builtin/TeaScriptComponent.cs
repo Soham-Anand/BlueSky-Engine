@@ -46,6 +46,18 @@ public unsafe struct TeaScriptComponent
     /// Whether the script is currently enabled.
     /// </summary>
     public bool IsEnabled;
+
+    /// <summary>
+    /// Allows this script to draw runtime HUD/menu controls.
+    /// Intended for explicit UI Manager entities.
+    /// </summary>
+    public bool AllowRuntimeUI;
+
+    /// <summary>
+    /// Prevents normal runtime gameplay/spectator input while this script is active.
+    /// Useful for menu-only UI Manager scenes.
+    /// </summary>
+    public bool BlockRuntimeInput;
     
     /// <summary>
     /// Runtime instance ID (managed by TeaScriptSystem).

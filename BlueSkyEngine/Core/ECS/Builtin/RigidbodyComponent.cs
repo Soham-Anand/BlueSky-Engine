@@ -2,8 +2,14 @@ using System.Numerics;
 
 namespace BlueSky.Core.ECS.Builtin;
 
-public struct RigidbodyComponent
+/// <summary>
+/// Unified physics component: rigidbody + collider.
+/// .bsphy asset path is stored externally in PhysicsAssetCache to keep the struct unmanaged (ECS requirement).
+/// Replaces the old separate RigidbodyComponent and ColliderComponent.
+/// </summary>
+public struct PhysicsComponent
 {
+    // ── Rigidbody fields ──
     public float Mass;
     public float Drag;
     public float AngularDrag;
@@ -16,7 +22,17 @@ public struct RigidbodyComponent
     public bool FreezeRotationY;
     public bool FreezeRotationZ;
 
-    public RigidbodyComponent()
+    // ── Collider fields ──
+    public ColliderType Type;
+    public Vector3 Center;
+    public Vector3 Size;
+    public float Radius;
+    public float Height;
+    public bool IsTrigger;
+    public float Friction;
+    public float Restitution;
+
+    public PhysicsComponent()
     {
         Mass = 1.0f;
         Drag = 0.0f;
@@ -29,25 +45,6 @@ public struct RigidbodyComponent
         FreezeRotationX = false;
         FreezeRotationY = false;
         FreezeRotationZ = false;
-    }
-}
-
-/// <summary>
-/// Collider component for physics collision detection.
-/// </summary>
-public struct ColliderComponent
-{
-    public ColliderType Type;
-    public Vector3 Center;
-    public Vector3 Size;      // For box collider
-    public float Radius;      // For sphere/capsule collider
-    public float Height;      // For capsule collider
-    public bool IsTrigger;
-    public float Friction;
-    public float Restitution; // Bounciness
-
-    public ColliderComponent()
-    {
         Type = ColliderType.Box;
         Center = Vector3.Zero;
         Size = Vector3.One;
@@ -66,4 +63,53 @@ public enum ColliderType
     Capsule,
     Mesh,
     Convex
+}
+
+/// <summary>
+/// External cache for .bsphy asset paths + loaded PhysicsAssets.
+/// Kept separate from PhysicsComponent to keep the struct unmanaged (ECS requirement).
+/// </summary>
+public static class PhysicsAssetCache
+{
+    private static readonly System.Collections.Generic.Dictionary<uint, string> s_bsphyPaths = new();
+    private static readonly System.Collections.Generic.Dictionary<uint, Motif.PhysicsAsset?> s_cachedAssets = new();
+
+    public static void SetPath(uint entityId, string path)
+    {
+        s_bsphyPaths[entityId] = path ?? "";
+        if (!s_cachedAssets.ContainsKey(entityId))
+            s_cachedAssets[entityId] = null;
+    }
+
+    public static string GetPath(uint entityId)
+    {
+        return s_bsphyPaths.TryGetValue(entityId, out var path) ? path : "";
+    }
+
+    public static void SetCachedAsset(uint entityId, Motif.PhysicsAsset? asset)
+    {
+        s_cachedAssets[entityId] = asset;
+    }
+
+    public static Motif.PhysicsAsset? GetCachedAsset(uint entityId)
+    {
+        return s_cachedAssets.TryGetValue(entityId, out var asset) ? asset : null;
+    }
+
+    public static bool HasEntry(uint entityId)
+    {
+        return s_bsphyPaths.ContainsKey(entityId);
+    }
+
+    public static void Clear(uint entityId)
+    {
+        s_bsphyPaths.Remove(entityId);
+        s_cachedAssets.Remove(entityId);
+    }
+
+    public static void ClearAll()
+    {
+        s_bsphyPaths.Clear();
+        s_cachedAssets.Clear();
+    }
 }

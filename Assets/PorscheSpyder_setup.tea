@@ -1,0 +1,29 @@
+// Porsche Spyder — bone-to-wheel configuration
+// Run this via TeaScriptComponent on the car entity.
+// Adjust bone names to match what you see in Blender.
+
+fn start() {
+    // ── Set the actual bone names from the skeleton ──
+    // Replace these strings with the EXACT names from Blender's Armature
+    setWheelBone(0, "FR")    // BoneSlot 0 = Front Right
+    setWheelBone(1, "FL")    // BoneSlot 1 = Front Left
+    setWheelBone(2, "RL")    // BoneSlot 2 = Rear Left
+    setWheelBone(3, "RR")    // BoneSlot 3 = Rear Right
+    setBodyBone("Root")      // BoneSlot 4 = Root/Body
+
+    // ── Wheel positions (model-space offsets) ──
+    // Adjust these to match the actual wheel positions in your model
+    setWheelPosition(0,  0.8, -0.35,  1.5)   // Front Right
+    setWheelPosition(1, -0.8, -0.35,  1.5)   // Front Left
+    setWheelPosition(2, -0.8, -0.35, -1.5)   // Rear Left
+    setWheelPosition(3,  0.8, -0.35, -1.5)   // Rear Right
+
+    // ── Drivetrain ──
+    setDriveWheels(false, false, true, true)   // RWD
+
+    // ── Steering ──
+    setSteerWheels(true, true, false, false)   // Front steer
+
+    // ── Apply ──
+    refreshBones()
+}

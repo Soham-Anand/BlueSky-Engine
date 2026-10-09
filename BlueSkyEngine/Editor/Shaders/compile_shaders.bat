@@ -2,7 +2,7 @@
 REM ============================================================================
 REM BlueSky Engine — DirectX HLSL Shader Compilation Script
 REM ============================================================================
-REM Compiles all viewport shaders from viewport_3d.hlsl and simple_ui.hlsl
+REM Compiles viewport, UI, and Polaris upscaler shaders from their HLSL sources
 REM into .cso (Compiled Shader Object) files for the DX11 RHI backend.
 REM
 REM NAMING CONVENTION: {entryPoint}.cso
@@ -11,6 +11,8 @@ REM
 REM REQUIREMENTS: fxc.exe from the Windows SDK
 REM   Install from: https://developer.microsoft.com/en-us/windows/downloads/windows-sdk/
 REM ============================================================================
+
+cd /d "%~dp0"
 
 echo.
 echo ╔══════════════════════════════════════════════════════════════╗
@@ -35,8 +37,8 @@ if %ERRORLEVEL% NEQ 0 (
 
 set HLSL_VIEWPORT=viewport_3d.hlsl
 set HLSL_UI=simple_ui.hlsl
-set SM_VS=vs_4_0
-set SM_PS=ps_4_0
+set SM_VS=vs_4_1
+set SM_PS=ps_4_1
 set ERRORS=0
 
 REM ============================================================================
@@ -81,32 +83,43 @@ REM ============================================================================
 REM UI Shaders (simple_ui.hlsl)
 REM ============================================================================
 
-echo [7/7] Compiling UI shaders...
+echo [7/8] Compiling UI shaders...
 fxc.exe /nologo /T %SM_VS% /E vs_ui /Fo vs_ui.cso %HLSL_UI%
 if %ERRORLEVEL% NEQ 0 set /a ERRORS+=1
 fxc.exe /nologo /T %SM_PS% /E fs_ui /Fo fs_ui.cso %HLSL_UI%
 if %ERRORLEVEL% NEQ 0 set /a ERRORS+=1
 
 REM ============================================================================
+REM Polaris edge-aware upscaler (SM 4.0 baseline)
+REM ============================================================================
+echo [8/8] Compiling Polaris upscaler shaders...
+set HLSL_POLARIS=..\..\Rendering\Shaders\PolarisUpscale.hlsl
+fxc.exe /nologo /T vs_4_0 /E VSMain /Fo vs_PolarisUpscale.cso %HLSL_POLARIS%
+if %ERRORLEVEL% NEQ 0 set /a ERRORS+=1
+fxc.exe /nologo /T ps_4_0 /E PSMain /Fo ps_PolarisUpscale.cso %HLSL_POLARIS%
+if %ERRORLEVEL% NEQ 0 set /a ERRORS+=1
+
+REM ============================================================================
 REM Summary
 REM ============================================================================
 echo.
-echo ============================================================================
+echo ============================================================
 if %ERRORS% EQU 0 (
-    echo   [OK] All shaders compiled successfully!
+    echo   OK: All shaders compiled successfully!
 ) else (
-    echo   [WARNING] %ERRORS% shader(s) failed to compile.
+    echo   WARNING: %ERRORS% shaders failed to compile.
 )
-echo ============================================================================
+echo ============================================================
 echo.
 echo Generated .cso files:
-echo   vs_sky.cso, fs_sky.cso           — Procedural sky
-echo   vs_grid.cso, fs_grid.cso         — Infinite grid
-echo   vs_mesh.cso, fs_mesh.cso         — PBR mesh rendering
-echo   vs_shadow.cso, fs_shadow.cso     — Shadow map pass
-echo   vs_gizmo.cso, fs_gizmo.cso       — Editor gizmos
-echo   fs_wireframe.cso                 — Wireframe overlay
-echo   vs_ui.cso, fs_ui.cso             — UI rendering
+echo   vs_sky.cso, fs_sky.cso           - Procedural sky
+echo   vs_grid.cso, fs_grid.cso         - Infinite grid
+echo   vs_mesh.cso, fs_mesh.cso         - PBR mesh rendering
+echo   vs_shadow.cso, fs_shadow.cso     - Shadow map pass
+echo   vs_gizmo.cso, fs_gizmo.cso       - Editor gizmos
+echo   fs_wireframe.cso                 - Wireframe overlay
+echo   vs_ui.cso, fs_ui.cso             - UI rendering
+echo   vs_PolarisUpscale.cso, ps_PolarisUpscale.cso - Polaris upscaler
 echo.
 echo Place these in: BlueSkyEngine/Editor/Shaders/
-echo ============================================================================
+echo ============================================================

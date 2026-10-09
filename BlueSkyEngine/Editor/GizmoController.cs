@@ -11,7 +11,7 @@ using BlueSky.Core.Math;
 using BlueSky.Rendering;
 using BlueSky.Core.Scripting;
 using BlueSky.Core.Scene;
-using NotBSRenderer;
+using BlueSky.Rendering.RHI;
 
 namespace BlueSky.Editor;
 
@@ -29,9 +29,9 @@ partial class Program
         var mousePos = _input!.MousePosition;
         var mouseDown = _input.IsMouseButtonDown(MouseButton.Left);
 
-        // 1. Get the actual entity from the world
-        var entity = _world!.GetAllEntities().FirstOrDefault(e => e.Id == (int)_selectedEntityId);
-        if (entity.Id == 0 || !_world.IsEntityValid(entity)) return;
+        // 1. Get the actual entity from the world (allocation-free resolve).
+        if (!_world!.TryResolveEntity(_selectedEntityId, out var entity)) return;
+        if (!_world.IsEntityValid(entity)) return;
 
         // 2. Get entity position
         if (!_world.HasComponent<TransformComponent>(entity)) return;
@@ -58,6 +58,7 @@ partial class Program
                 _gizmoDragStartEntityPos = entityPos;
                 _gizmoDragStartRot = transform.Rotation;
                 _gizmoDragStartScale = transform.Scale;
+                _gizmoDragStartMouse = mousePos;
                 
                 // Define axis direction
                 BlueSky.Core.Math.Vector3[] dirs = { 
@@ -172,9 +173,10 @@ partial class Program
                 }
                 else
                 {
-                    // Uniform scale (center drag)
-                    // Use mouse delta instead of ray-plane for center scale as it feels better
-                    // ... but for now, let's just do axis-based.
+                    float factor = MathF.Max(0.01f, 1f + (_gizmoDragStartMouse.Y - mousePos.Y) * 0.01f);
+                    transform.SetScale(BlueSky.Core.Math.Vector3.Max(
+                        _gizmoDragStartScale * factor,
+                        new BlueSky.Core.Math.Vector3(0.01f)));
                 }
             }
         }

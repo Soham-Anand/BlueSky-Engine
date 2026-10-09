@@ -4,13 +4,22 @@ using TeaScript.Frontend;
 
 namespace TeaScript.Runtime;
 
+public sealed class TeaScriptExecutionLimitException : InvalidOperationException
+{
+    public TeaScriptExecutionLimitException(string message) : base(message) { }
+}
+
 /// <summary>
 /// The TeaScript interpreter - executes AST nodes.
 /// </summary>
 public class Interpreter
 {
+    private const int MaxExecutionSteps = 10_000;
+    private const int MaxCallDepth = 128;
     private Environment _globalEnvironment;
     private Environment _currentEnvironment;
+    private int _executionSteps;
+    private int _callDepth;
     
     public Interpreter()
     {
@@ -25,12 +34,20 @@ public class Interpreter
     {
         _globalEnvironment.Define(name, new NativeFunction(name, implementation));
     }
+
+    public bool HasFunction(string name)
+    {
+        if (!_globalEnvironment.IsDefined(name))
+            return false;
+        return _globalEnvironment.Get(name) is TeaFunction or NativeFunction;
+    }
     
     /// <summary>
     /// Execute a program.
     /// </summary>
     public void Execute(Program program)
     {
+        _executionSteps = 0;
         foreach (var statement in program.Statements)
         {
             ExecuteStatement(statement);
@@ -42,6 +59,7 @@ public class Interpreter
     /// </summary>
     public object? CallFunction(string name, params object?[] args)
     {
+        _executionSteps = 0;
         var function = _globalEnvironment.Get(name);
         
         if (function is TeaFunction teaFunc)
@@ -59,6 +77,7 @@ public class Interpreter
     
     private void ExecuteStatement(Statement statement)
     {
+        TickExecution();
         switch (statement)
         {
             case LetStatement let:
@@ -117,8 +136,11 @@ public class Interpreter
     
     private void ExecuteWhileStatement(WhileStatement statement)
     {
-        while (IsTruthy(EvaluateExpression(statement.Condition)))
+        while (true)
         {
+            // Empty-body loops still need a budget check on every iteration.
+            TickExecution();
+            if (!IsTruthy(EvaluateExpression(statement.Condition))) break;
             ExecuteBlock(statement.Body, new Environment(_currentEnvironment));
         }
     }
@@ -198,6 +220,10 @@ public class Interpreter
                 var divisor = ToNumber(right);
                 if (divisor == 0) throw new Exception("Division by zero");
                 return ToNumber(left) / divisor;
+            case TokenType.Percent:
+                var modulator = ToNumber(right);
+                if (modulator == 0) throw new Exception("Modulo by zero");
+                return ToNumber(left) % modulator;
             case TokenType.Equal:
                 return IsEqual(left, right);
             case TokenType.NotEqual:
@@ -298,27 +324,44 @@ public class Interpreter
         {
             throw new Exception($"Function '{function.Name}' expects {function.Parameters.Count} arguments but got {arguments.Count}");
         }
-        
-        // Create new environment for function execution
-        var functionEnv = new Environment(function.Closure);
-        
-        // Bind parameters
-        for (int i = 0; i < function.Parameters.Count; i++)
-        {
-            functionEnv.Define(function.Parameters[i], arguments[i]);
-        }
-        
-        // Execute function body
+
+        if (_callDepth >= MaxCallDepth)
+            throw new TeaScriptExecutionLimitException($"TeaScript call depth limit ({MaxCallDepth}) exceeded.");
+
+        _callDepth++;
         try
         {
-            ExecuteBlock(function.Body, functionEnv);
+            // Create new environment for function execution.
+            var functionEnv = new Environment(function.Closure);
+
+            // Bind parameters.
+            for (int i = 0; i < function.Parameters.Count; i++)
+            {
+                functionEnv.Define(function.Parameters[i], arguments[i]);
+            }
+
+            // Execute function body.
+            try
+            {
+                ExecuteBlock(function.Body, functionEnv);
+            }
+            catch (ReturnException ret)
+            {
+                return ret.Value;
+            }
+
+            return null;
         }
-        catch (ReturnException ret)
+        finally
         {
-            return ret.Value;
+            _callDepth--;
         }
-        
-        return null;
+    }
+
+    private void TickExecution()
+    {
+        if (++_executionSteps > MaxExecutionSteps)
+            throw new TeaScriptExecutionLimitException($"TeaScript execution step limit ({MaxExecutionSteps}) exceeded.");
     }
     
     private bool IsTruthy(object? value)

@@ -1,6 +1,6 @@
 using BlueSky.Platform;
 
-namespace NotBSRenderer;
+namespace BlueSky.Rendering.RHI;
 
 internal sealed class ValidationDevice : IRHIDevice, IRHIWrapped<IRHIDevice>
 {
@@ -179,9 +179,5 @@ internal sealed class ValidationDevice : IRHIDevice, IRHIWrapped<IRHIDevice>
 
     // Phase 2/3 additions - pass-through to underlying device
     public RHICapabilities Capabilities => _inner.Capabilities;
-    public DescriptorBindingMode BindingMode => _inner.BindingMode;
     public IRHIPipeline CreateComputePipeline(ComputePipelineDesc desc) => _inner.CreateComputePipeline(desc);
-    public BindlessResourceHandle RegisterBindlessTexture(IRHITexture texture) => _inner.RegisterBindlessTexture(texture);
-    public BindlessResourceHandle RegisterBindlessBuffer(IRHIBuffer buffer) => _inner.RegisterBindlessBuffer(buffer);
-    public void UnregisterBindlessResource(BindlessResourceHandle handle) => _inner.UnregisterBindlessResource(handle);
 }

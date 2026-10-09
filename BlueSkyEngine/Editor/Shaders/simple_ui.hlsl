@@ -1,10 +1,11 @@
 // ──────────────────────────────────────────────────────────────────────────────
-// DirectX 9 HLSL UI Shader
+// DirectX HLSL UI Shader — SM 4.0+
 // Matches simple_ui.metal functionality
 // ──────────────────────────────────────────────────────────────────────────────
 
 float4x4 projection : register(c0);
-sampler2D fontAtlas : register(s0);
+Texture2D fontAtlas : register(t0);
+SamplerState fontSampler : register(s0);
 
 struct VS_INPUT {
     float2 position : POSITION;
@@ -29,9 +30,9 @@ VS_OUTPUT vs_ui(VS_INPUT input) {
     return output;
 }
 
-float4 fs_ui(VS_OUTPUT input) : COLOR0 {
+float4 fs_ui(VS_OUTPUT input) : SV_Target0 {
     if (input.mode > 0.5) {
-        float coverage = tex2D(fontAtlas, input.uv).r;
+        float coverage = fontAtlas.Sample(fontSampler, input.uv).r;
         if (coverage < 0.01) discard;
         return float4(input.color.rgb, input.color.a * coverage);
     }

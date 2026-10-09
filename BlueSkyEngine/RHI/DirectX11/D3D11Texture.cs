@@ -1,6 +1,6 @@
 using System.Runtime.InteropServices;
 
-namespace NotBSRenderer.DirectX11;
+namespace BlueSky.Rendering.RHI.DirectX11;
 
 /// <summary>
 /// DirectX 11 texture implementation wrapping ID3D11Texture2D + shader resource view.
@@ -34,10 +34,7 @@ internal sealed class D3D11Texture : IRHITexture
         DebugName = desc.DebugName ?? "D3D11Texture";
 
         if (device == IntPtr.Zero)
-        {
-            Console.WriteLine($"[D3D11Texture] Warning: null device, texture '{DebugName}' is placeholder");
-            return;
-        }
+            throw new InvalidOperationException($"Cannot create D3D11 texture '{DebugName}' without a valid device.");
 
         uint dxgiFormat = D3D11Interop.ToDXGIFormat(Format);
         bool isDepth = Format == TextureFormat.Depth32Float || Format == TextureFormat.Depth24Stencil8;

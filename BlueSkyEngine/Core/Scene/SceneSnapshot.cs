@@ -22,7 +22,10 @@ public class SceneSnapshot
         public TransformComponent Transform;
         public bool HasTeaScript;
         public TeaScriptComponent? TeaScript;
-        // Add more component types here as needed
+        public bool HasPhysics;
+        public PhysicsComponent? Physics;
+        public bool HasCarController;
+        public CarControllerComponent? CarController;
     }
     
     /// <summary>
@@ -47,6 +50,20 @@ public class SceneSnapshot
             {
                 snapshot.HasTeaScript = true;
                 snapshot.TeaScript = teaScript;
+            }
+            
+            // Capture Physics
+            if (world.TryGetComponent<PhysicsComponent>(entity, out var physics))
+            {
+                snapshot.HasPhysics = true;
+                snapshot.Physics = physics;
+            }
+            
+            // Capture CarController
+            if (world.TryGetComponent<CarControllerComponent>(entity, out var carController))
+            {
+                snapshot.HasCarController = true;
+                snapshot.CarController = carController;
             }
             
             _entityStates[entity] = snapshot;
@@ -90,6 +107,32 @@ public class SceneSnapshot
                 {
                     teaScript.ScriptAssetId = snapshot.TeaScript.Value.ScriptAssetId;
                     teaScript.IsEnabled = snapshot.TeaScript.Value.IsEnabled;
+                    teaScript.AllowRuntimeUI = snapshot.TeaScript.Value.AllowRuntimeUI;
+                    teaScript.BlockRuntimeInput = snapshot.TeaScript.Value.BlockRuntimeInput;
+                }
+            }
+            
+            // Restore Physics — reset velocity/angular state that accumulated during play
+            if (snapshot.HasPhysics && world.HasComponent<PhysicsComponent>(entity))
+            {
+                ref var phys = ref world.GetComponent<PhysicsComponent>(entity);
+                if (snapshot.Physics.HasValue)
+                {
+                    phys = snapshot.Physics.Value;
+                    PhysicsAssetCache.Clear((uint)entity.Id);
+                }
+            }
+            
+            // Restore CarController — reset IsInitialized so it re-initializes on next play
+            if (snapshot.HasCarController && world.HasComponent<CarControllerComponent>(entity))
+            {
+                ref var cc = ref world.GetComponent<CarControllerComponent>(entity);
+                if (snapshot.CarController.HasValue)
+                {
+                    cc = snapshot.CarController.Value;
+                    cc.IsInitialized = false;
+                    cc.IsPossessed = false;
+                    cc.EntityId = 0;
                 }
             }
             

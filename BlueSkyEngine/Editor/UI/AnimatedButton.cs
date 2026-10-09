@@ -1,7 +1,7 @@
 using System;
 using System.Numerics;
 using System.Collections.Generic;
-using NotBSRenderer;
+using BlueSky.Rendering.RHI;
 
 namespace BlueSky.Editor.UI;
 
@@ -33,7 +33,7 @@ public class AnimatedButton
     /// Render an animated button with smooth transitions
     /// </summary>
     public static bool Render(
-        NotBSUI ui,
+        EditorUI ui,
         float x, float y, float w, float h,
         string text,
         uint id,
@@ -129,7 +129,7 @@ public class AnimatedButton
     /// Render a primary action button (more prominent)
     /// </summary>
     public static bool RenderPrimary(
-        NotBSUI ui,
+        EditorUI ui,
         float x, float y, float w, float h,
         string text,
         uint id,
@@ -151,7 +151,7 @@ public class AnimatedButton
     /// Render a danger/destructive button (red)
     /// </summary>
     public static bool RenderDanger(
-        NotBSUI ui,
+        EditorUI ui,
         float x, float y, float w, float h,
         string text,
         uint id,
@@ -173,7 +173,7 @@ public class AnimatedButton
     /// Render a success button (green)
     /// </summary>
     public static bool RenderSuccess(
-        NotBSUI ui,
+        EditorUI ui,
         float x, float y, float w, float h,
         string text,
         uint id,

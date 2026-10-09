@@ -3,7 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using BlueSky.Core.ECS;
 using BlueSky.Core.ECS.Builtin;
-using BlueSky.Physics;
+using BlueSky.Airborne;
 using BSBlueMath = BlueSky.Core.Math.BlueMath;
 using BSMatrix4x4 = BlueSky.Core.Math.Matrix4x4;
 using BSVector2 = BlueSky.Core.Math.Vector2;
@@ -125,9 +125,15 @@ public sealed class TerrainSystem
     {
         data = default;
         if (!TryGetTerrainData(entityId, out var t) || t.Width < 2 || t.Height < 2)
+        {
+            Console.WriteLine($"[TerrainSystem] TryGetPhysicsHeightField failed: Entity {entityId} has invalid dimensions ({t?.Width ?? 0}x{t?.Height ?? 0})");
             return false;
+        }
         if (t.Heights == null || t.Heights.Length != t.Width * t.Height)
+        {
+            Console.WriteLine($"[TerrainSystem] TryGetPhysicsHeightField failed: Entity {entityId} has null or mismatched heights (expected {t.Width * t.Height}, got {t.Heights?.Length ?? 0})");
             return false;
+        }
 
         System.Numerics.Vector3 originOffset = System.Numerics.Vector3.Zero;
         if (TryGetEntity(entityId, out var entity) &&
@@ -145,6 +151,8 @@ public sealed class TerrainSystem
             Samples      = (float[])t.Heights.Clone(),
             OriginOffset = originOffset
         };
+        
+        Console.WriteLine($"[TerrainSystem] Physics heightfield for Entity {entityId}: grid={t.Width}x{t.Height}, world={t.WorldWidth}x{t.WorldDepth}, samples={t.Heights.Length}");
         return true;
     }
 
@@ -154,10 +162,16 @@ public sealed class TerrainSystem
         worldNormal = System.Numerics.Vector3.UnitY;
 
         if (!TryGetTerrainData(entityId, out var data) || data.Width < 2 || data.Height < 2)
+        {
+            Console.WriteLine($"[TerrainSystem] TrySampleWorldHeight: TryGetTerrainData failed for Entity_{entityId}");
             return false;
+        }
 
         if (!TryGetEntity(entityId, out var entity))
+        {
+            Console.WriteLine($"[TerrainSystem] TrySampleWorldHeight: TryGetEntity failed for Entity_{entityId}");
             return false;
+        }
 
         var model = BSMatrix4x4.Identity;
         if (_world.TryGetComponent<TransformComponent>(entity, out var transform))
@@ -165,11 +179,15 @@ public sealed class TerrainSystem
 
         var modelNumerics = ToNumerics(model);
         if (!System.Numerics.Matrix4x4.Invert(modelNumerics, out var inverseModel))
+        {
+            Console.WriteLine($"[TerrainSystem] TrySampleWorldHeight: Invert matrix failed for Entity_{entityId}");
             return false;
+        }
 
         var localPosition = TransformPoint(new BSVector3(worldPosition.X, worldPosition.Y, worldPosition.Z), inverseModel);
-        if (!IsInsideTerrainXZ(localPosition, data))
-            return false;
+        float localX = Math.Clamp(localPosition.X, 0f, data.WorldWidth);
+        float localZ = Math.Clamp(localPosition.Z, 0f, data.WorldDepth);
+        localPosition = new BSVector3(localX, localPosition.Y, localZ);
 
         float gridX = data.GridXFromLocalX(localPosition.X);
         float gridZ = data.GridZFromLocalZ(localPosition.Z);
@@ -338,7 +356,7 @@ public sealed class TerrainSystem
         }
     }
 
-    private void SyncTerrainComponents()
+        private void SyncTerrainComponents()
     {
         var query = _world.CreateQuery()
             .All<TerrainComponent>()
@@ -349,21 +367,58 @@ public sealed class TerrainSystem
             int terrainIndex = chunk.GetComponentIndex(typeof(TerrainComponent));
             var entities = chunk.GetEntities();
 
+            // Console.WriteLine($"[TerrainSystem] SyncTerrainComponents: Processing {chunk.Count} terrain entities");
+
             for (int i = 0; i < chunk.Count; i++)
             {
                 ref var terrain = ref chunk.GetComponent<TerrainComponent>(i, terrainIndex);
                 uint entityId = (uint)entities[i].Id;
 
+                // Console.WriteLine($"[TerrainSystem] SyncTerrainComponents: Entity {entityId} component values: Width={terrain.Width}, Height={terrain.Height}, WorldWidth={terrain.WorldWidth}, WorldHeight={terrain.WorldHeight}");
+
                 if (!_terrains.TryGetValue(entityId, out var data))
                 {
+                    // Console.WriteLine($"[TerrainSystem] SyncTerrainComponents: Creating new terrain data for Entity {entityId} ({terrain.Width}x{terrain.Height})");
                     _terrains[entityId] = new TerrainData(terrain);
                     terrain.NeedsRebuild = true;
                     continue;
                 }
 
-                bool settingsChanged = data.ApplySettings(terrain);
-                if (settingsChanged || terrain.NeedsRebuild)
+                // Console.WriteLine($"[TerrainSystem] SyncTerrainComponents: Entity {entityId} existing data: Width={data.Width}, Height={data.Height}, WorldWidth={data.WorldWidth}, WorldDepth={data.WorldDepth}, AssetLoaded={data.AssetLoaded}");
+
+                // If terrain data was loaded from a binary asset, the data's
+                // dimensions are authoritative. Do NOT call ApplySettings
+                // because the ECS component likely still holds stale values
+                // from the JSON scene file (e.g. WorldHeight=10 instead of 100).
+                // ApplySettings would read those stale values and overwrite the
+                // correct TerrainData dimensions.
+                //
+                // Only clear AssetLoaded when the user explicitly changes
+                // terrain settings via the editor (indicated by NeedsRebuild=true).
+                if (data.AssetLoaded)
+                {
+                    if (terrain.NeedsRebuild)
+                    {
+                        // Console.WriteLine($"[TerrainSystem] SyncTerrainComponents: Entity {entityId} user edited, clearing AssetLoaded flag");
+                        // User explicitly changed settings via editor slider —
+                        // the component values are now intentional, not stale
+                        data.AssetLoaded = false;
+                        bool settingsChanged = data.ApplySettings(terrain);
+                        if (settingsChanged)
+                            data.NeedsRebuild = true;
+                    }
+                    // else: skip ApplySettings entirely — protect the asset data
+
+                    terrain.NeedsRebuild = false;
+                    continue;
+                }
+
+                bool settingsChanged2 = data.ApplySettings(terrain);
+                if (settingsChanged2 || terrain.NeedsRebuild)
+                {
+                    // Console.WriteLine($"[TerrainSystem] SyncTerrainComponents: Entity {entityId} needs rebuild (settingsChanged={settingsChanged2}, NeedsRebuild={terrain.NeedsRebuild})");
                     data.NeedsRebuild = true;
+                }
 
                 terrain.NeedsRebuild = false;
             }
@@ -417,6 +472,7 @@ public sealed class TerrainSystem
         data.Normals = normals;
         data.UVs = uvs;
         data.Indices = indices;
+        data.Version++;
     }
 
     public TerrainMeshData? GetMesh(uint entityId)
@@ -432,7 +488,8 @@ public sealed class TerrainSystem
             Vertices = data.Vertices,
             Normals = data.Normals,
             UVs = data.UVs,
-            Indices = data.Indices
+            Indices = data.Indices,
+            Version = data.Version
         };
     }
 
@@ -447,6 +504,10 @@ public sealed class TerrainSystem
             .All<TerrainComponent>()
             .Build();
 
+        // Collect component updates to write back after iteration
+        // (writing via AddComponent during chunk iteration can invalidate refs)
+        var componentUpdates = new List<(Entity entity, TerrainComponent comp)>();
+
         foreach (var chunk in _world.GetQueryChunks(query))
         {
             int terrainIndex = chunk.GetComponentIndex(typeof(TerrainComponent));
@@ -454,20 +515,29 @@ public sealed class TerrainSystem
 
             for (int i = 0; i < chunk.Count; i++)
             {
-                ref var terrain = ref chunk.GetComponent<TerrainComponent>(i, terrainIndex);
-                uint entityId = (uint)entities[i].Id;
+                var terrain = chunk.GetComponent<TerrainComponent>(i, terrainIndex);
+                var entity = entities[i];
+                uint entityId = (uint)entity.Id;
 
                 if (!string.IsNullOrEmpty(terrain.TerrainAssetPath) &&
                     File.Exists(terrain.TerrainAssetPath) &&
                     TryLoadTerrainAsset(terrain.TerrainAssetPath, out var loaded))
                 {
+                    loaded.AssetLoaded = true;  // Mark as authoritative
                     _terrains[entityId] = loaded;
+
+                    // Correct the ECS component from the binary asset's true dimensions
                     terrain.Width = loaded.Width;
                     terrain.Height = loaded.Height;
                     terrain.WorldWidth = loaded.WorldWidth;
-                    terrain.WorldHeight = loaded.WorldDepth;
+                    terrain.WorldHeight = loaded.WorldDepth;  // WorldDepth (Z-axis) maps to WorldHeight
                     terrain.MaxElevation = loaded.MaxElevation;
                     terrain.NeedsRebuild = false;
+
+                    Console.WriteLine($"[TerrainSystem] Loaded terrain asset for Entity {entityId}: " +
+                        $"{loaded.Width}x{loaded.Height} grid, {loaded.WorldWidth}x{loaded.WorldDepth} world, MaxElev={loaded.MaxElevation}");
+
+                    componentUpdates.Add((entity, terrain));
                     RebuildMesh(entityId);
                 }
                 else
@@ -475,6 +545,13 @@ public sealed class TerrainSystem
                     InitializeTerrain(entityId, terrain);
                 }
             }
+        }
+
+        // Explicitly write corrected components back to ECS
+        // This ensures values persist (ref writes can be lost if chunks reallocate)
+        foreach (var (entity, comp) in componentUpdates)
+        {
+            _world.AddComponent(entity, comp);
         }
     }
 
@@ -725,6 +802,8 @@ public sealed class TerrainSystem
         public BSVector2[]? UVs;
         public uint[]? Indices;
         public bool NeedsRebuild;
+        public bool AssetLoaded;  // True if loaded from binary .blueskyasset — dimensions are authoritative
+        public int Version;
 
         public float CellSizeX => Width > 1 ? WorldWidth / (Width - 1) : WorldWidth;
         public float CellSizeZ => Height > 1 ? WorldDepth / (Height - 1) : WorldDepth;
@@ -756,6 +835,7 @@ public sealed class TerrainSystem
 
             if (newWidth != Width || newHeight != Height)
             {
+                Console.WriteLine($"[TerrainData] ApplySettings: Resizing terrain from {Width}x{Height} to {newWidth}x{newHeight} (component had {terrain.Width}x{terrain.Height})");
                 Heights = ResizeHeights(Heights, Width, Height, newWidth, newHeight);
                 Width = newWidth;
                 Height = newHeight;
@@ -764,18 +844,21 @@ public sealed class TerrainSystem
 
             if (MathF.Abs(newWorldWidth - WorldWidth) > 0.001f)
             {
+                Console.WriteLine($"[TerrainData] ApplySettings: WorldWidth changed from {WorldWidth} to {newWorldWidth}");
                 WorldWidth = newWorldWidth;
                 changed = true;
             }
 
             if (MathF.Abs(newWorldDepth - WorldDepth) > 0.001f)
             {
+                Console.WriteLine($"[TerrainData] ApplySettings: WorldDepth changed from {WorldDepth} to {newWorldDepth}");
                 WorldDepth = newWorldDepth;
                 changed = true;
             }
 
             if (MathF.Abs(newMaxElevation - MaxElevation) > 0.001f)
             {
+                Console.WriteLine($"[TerrainData] ApplySettings: MaxElevation changed from {MaxElevation} to {newMaxElevation}");
                 MaxElevation = newMaxElevation;
                 for (int i = 0; i < Heights.Length; i++)
                     Heights[i] = BSBlueMath.Clamp(Heights[i], 0.0f, MaxElevation);
@@ -836,6 +919,7 @@ public struct TerrainMeshData
     public BSVector3[] Normals;
     public BSVector2[] UVs;
     public uint[] Indices;
+    public int Version;
 }
 
 public struct RaycastHit

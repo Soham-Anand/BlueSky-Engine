@@ -1,5 +1,6 @@
 using System;
 using System.Numerics;
+using BlueSky.Airborne;
 
 namespace BlueSky.Audio;
 
@@ -24,9 +25,10 @@ public class SpatialAudio
     public void UpdateListener(Vector3 position, Vector3 forward, Vector3 up, Vector3 velocity)
     {
         _listenerPosition = position;
-        _listenerForward = Vector3.Normalize(forward);
-        _listenerUp = Vector3.Normalize(up);
-        _listenerRight = Vector3.Cross(_listenerUp, _listenerForward);
+        _listenerForward = NormalizeOr(forward, -Vector3.UnitZ);
+        _listenerUp = NormalizeOr(up, Vector3.UnitY);
+        _listenerRight = NormalizeOr(Vector3.Cross(_listenerUp, _listenerForward), Vector3.UnitX);
+        _listenerUp = NormalizeOr(Vector3.Cross(_listenerForward, _listenerRight), Vector3.UnitY);
         _listenerVelocity = velocity;
     }
 
@@ -41,7 +43,8 @@ public class SpatialAudio
         float distance = sourceToListener.Length();
 
         // 1. Distance Attenuation
-        float attenuation = CalculateAttenuation(distance, source.MinDistance, source.MaxDistance, DistanceAttenuationCurve.Linear); // Assuming linear for now, could add property to source
+        float attenuation = CalculateAttenuation(
+            distance, source.MinDistance, source.MaxDistance, source.AttenuationCurve);
         
         // 2. Occlusion (Simulated with a raycast here, normally you'd query the physics engine)
         float occlusionMultiplier = CalculateOcclusion(source.Position, _listenerPosition);
@@ -54,7 +57,7 @@ public class SpatialAudio
         {
             Vector3 dirToSource = -sourceToListener / distance;
             float pan = Vector3.Dot(_listenerRight, dirToSource);
-            source.Pan = pan; // Requires adding Pan property to AudioSource
+            source.Pan = pan;
         }
         else
         {
@@ -62,12 +65,8 @@ public class SpatialAudio
         }
 
         // 4. Doppler Effect
-        // Approximating relative velocity if source velocity isn't tracked. 
-        // For a full implementation, AudioSource needs a Velocity property.
         float speedOfSound = 343.0f; 
-        Vector3 sourceVelocity = Vector3.Zero; // Assume static for now
-        
-        Vector3 relativeVelocity = _listenerVelocity - sourceVelocity;
+        Vector3 relativeVelocity = _listenerVelocity - source.Velocity;
         if (distance > 0.01f)
         {
             Vector3 dirToSource = -sourceToListener / distance;
@@ -75,7 +74,7 @@ public class SpatialAudio
             
             // f' = f * (c + vr) / (c + vs)
             float dopplerFactor = (speedOfSound + approachSpeed) / speedOfSound;
-            source.CalculatedPitch = source.Pitch * dopplerFactor; // Requires adding CalculatedPitch property
+            source.CalculatedPitch = source.Pitch * dopplerFactor;
         }
         else
         {
@@ -85,6 +84,8 @@ public class SpatialAudio
 
     private float CalculateAttenuation(float distance, float minDistance, float maxDistance, DistanceAttenuationCurve curve)
     {
+        minDistance = MathF.Max(0.0f, minDistance);
+        maxDistance = MathF.Max(minDistance + 1e-4f, maxDistance);
         if (distance <= minDistance) return 1.0f;
         if (distance >= maxDistance) return 0.0f;
 
@@ -99,10 +100,18 @@ public class SpatialAudio
         };
     }
 
-    private float CalculateOcclusion(Vector3 sourcePos, Vector3 listenerPos)
+    private static float CalculateOcclusion(Vector3 sourcePos, Vector3 listenerPos)
     {
-        // TODO: Integrate with Jolt Physics for actual raycast
-        // If raycast hits something that isn't the player, return < 1.0f
-        return 1.0f;
+        Vector3 toListener = listenerPos - sourcePos;
+        float distance = toListener.Length();
+        if (distance <= 1e-4f)
+            return 1.0f;
+
+        return PhysicsTeaScriptBridge.Raycast(sourcePos, toListener / distance, distance, out _)
+            ? 0.25f
+            : 1.0f;
     }
+
+    private static Vector3 NormalizeOr(Vector3 value, Vector3 fallback) =>
+        value.LengthSquared() > 1e-8f ? Vector3.Normalize(value) : fallback;
 }

@@ -106,4 +106,11 @@ public interface IInputContext : IDisposable
     /// Fired when the mouse wheel scrolls.
     /// </summary>
     event Action<Vector2>? MouseScroll;
+
+    /// <summary>
+    /// Enable/disable infinite mouse capture. When captured, mouse deltas are computed
+    /// from a fixed center point and the cursor is warped back — keeps it inside the viewport.
+    /// No-op on platforms that don't need explicit warping (macOS uses CGAssociateMouse).
+    /// </summary>
+    void SetCapture(bool captured, float centerX, float centerY) { }
 }

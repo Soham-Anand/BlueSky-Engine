@@ -1,6 +1,6 @@
 using System;
 using System.Numerics;
-using BlueSky.Physics;
+using BlueSky.Airborne;
 using BlueSky.Core.ECS;
 using BVec3 = BlueSky.Core.Math.Vector3;
 using BQuat = BlueSky.Core.Math.Quaternion;
@@ -8,330 +8,321 @@ using BQuat = BlueSky.Core.Math.Quaternion;
 namespace BlueSky.Core.Gameplay;
 
 /// <summary>
-/// Vehicle physics system for car dynamics simulation.
-/// Handles suspension, tire forces, steering, and drivetrain response.
+/// Container for vehicle inputs passed to VehiclePhysics.Step()
+/// </summary>
+public struct VehicleInput
+{
+    public float Throttle;  // 0 to 1
+    public float Brake;     // 0 to 1
+    public float Steer;     // -1 to +1
+    public float Handbrake; // 0 or 1
+}
+
+/// <summary>
+/// High-precision, Jolt-Authoritative Vehicle Physics Solver.
+/// 
+/// ABSOLUTE INVARIANT:
+/// VehiclePhysics NEVER writes chassis position (x), orientation (q),
+/// linear velocity (v), or angular velocity (w). It ONLY calculates and
+/// applies physical forces and torques to the Jolt dynamic body. Jolt is the
+/// single authoritative owner of body motion and integration.
 /// </summary>
 public class VehiclePhysics
 {
     private readonly IPhysicsWorld _physicsWorld;
     private readonly WheelState[] _wheels;
     private readonly float _vehicleMass;
-    private readonly Vector3 _centerOfMassOffset;
 
-    private const float TireGripCoefficient = 1.15f;
-    private const float RollingResistanceCoefficient = 0.018f;
-    private const float LateralGripResponse = 4.0f;
-    private const float MaxForwardSpeed = 75.0f;       // m/s, about 168 mph
-    private const float MaxGroundedVerticalSpeed = 2.5f;
-    private const float MaxAirborneVerticalSpeed = 10.0f;
-    private const float SuspensionForceSafety = 1.18f; // Gentle assist; the collider carries hard landings.
-    private const float RaycastSkin = 0.08f;
-    private const float AirborneExtraGravityScale = 1.35f;
+    // ── Tunable Vehicle Parameters ─────────────────────────────────────────
+    public float MotorForce { get; set; }           // Max engine drive force (N)
+    public float BrakeForce { get; set; }           // Max braking force (N)
+    public float MaxSteerAngle { get; set; }        // Max steer angle at low speed (degrees)
+    public float SuspensionStiffness { get; set; }  // Spring constant k (N/m)
+    public float SuspensionDamping { get; set; }    // Damper constant c (N*s/m)
+    public float SuspensionRestLength { get; set; }// Rest length (m)
+    public float WheelRadius { get; set; }          // Radius of wheel (m)
+    public float AntiRollStiffness { get; set; }    // Anti-roll bar spring rate (N/m)
+    public float TireGripCoefficient { get; set; }  // Base friction coefficient mu
 
-    public VehiclePhysics(IPhysicsWorld physicsWorld, WheelState[] wheelStates, float mass, BVec3 centerOfMass,
-                          float motorForce = 8000f, float brakeForce = 12000f, float maxSteerAngle = 30f)
+    // ── Drivetrain State ──────────────────────────────────────────────────
+    public float EngineRPM { get; private set; } = 1000f;
+    public int CurrentGear { get; private set; } = 1;
+    public float IdleRPM { get; set; } = 900f;
+    public float RedlineRPM { get; set; } = 7500f;
+
+    private static readonly float[] GearRatios = { 3.66f, 2.15f, 1.52f, 1.15f, 0.92f, 0.74f };
+    private static readonly float FinalDriveRatio = 3.44f;
+
+    public VehiclePhysics(
+        IPhysicsWorld physicsWorld,
+        WheelState[] wheelStates,
+        float mass = 1500f,
+        float motorForce = 9000f,
+        float brakeForce = 14000f,
+        float maxSteerAngle = 32f)
     {
         _physicsWorld = physicsWorld;
         _wheels = wheelStates;
         _vehicleMass = mass;
-        _centerOfMassOffset = new Vector3(centerOfMass.X, centerOfMass.Y, centerOfMass.Z);
         MotorForce = motorForce;
         BrakeForce = brakeForce;
         MaxSteerAngle = maxSteerAngle;
-    }
 
-    public float MotorForce { get; }
-    public float BrakeForce { get; }
-    public float MaxSteerAngle { get; }
+        // Default balanced tuning
+        SuspensionStiffness = 38000f;
+        SuspensionDamping = 4500f;
+        SuspensionRestLength = 0.45f;
+        WheelRadius = 0.35f;
+        AntiRollStiffness = 12000f;
+        TireGripCoefficient = 1.15f;
+    }
 
     /// <summary>
-    /// Main physics solver. Called once per frame.
+    /// Executes ONE simulation step for the vehicle.
+    /// MUST be called on a fixed physics timestep (e.g., 60 Hz = 0.01667s).
     /// </summary>
-    public void Solve(float deltaTime, float throttleInput, float brakePressure, float steerInput,
-                     Entity vehicleEntity, BVec3 vehiclePos, BQuat vehicleRot)
+    public void Step(float fixedDt, in VehicleInput input, Entity chassisEntity)
     {
-        if (_physicsWorld == null || _wheels == null || _wheels.Length == 0)
-            return;
-        if (!_physicsWorld.HasBody(vehicleEntity))
+        if (_physicsWorld == null || !_physicsWorld.HasBody(chassisEntity))
             return;
 
-        Vector3 pos = new(vehiclePos.X, vehiclePos.Y, vehiclePos.Z);
-        Quaternion rot = new(vehicleRot.X, vehicleRot.Y, vehicleRot.Z, vehicleRot.W);
-        if (rot.LengthSquared() < 0.0001f)
-            rot = Quaternion.Identity;
+        float dt = MathF.Max(fixedDt, 0.0001f);
+
+        // 1. Read Jolt authoritative chassis state (READ ONLY — NEVER WRITE!)
+        Vector3 chassisPos = _physicsWorld.GetPosition(chassisEntity);
+        Quaternion chassisRot = _physicsWorld.GetRotation(chassisEntity);
+        Vector3 chassisVel = _physicsWorld.GetVelocity(chassisEntity);
+        Vector3 chassisAngVel = _physicsWorld.GetAngularVelocity(chassisEntity);
+
+        if (chassisRot.LengthSquared() < 0.0001f)
+            chassisRot = Quaternion.Identity;
         else
-            rot = Quaternion.Normalize(rot);
+            chassisRot = Quaternion.Normalize(chassisRot);
 
-        float dt = MathF.Max(deltaTime, 0.0001f);
-        Vector3 forward = SafeNormalize(Vector3.Transform(Vector3.UnitZ, rot), Vector3.UnitZ);
-        Vector3 right = SafeNormalize(Vector3.Transform(Vector3.UnitX, rot), Vector3.UnitX);
-        Vector3 up = SafeNormalize(Vector3.Transform(Vector3.UnitY, rot), Vector3.UnitY);
-        Vector3 velocity = _physicsWorld.GetVelocity(vehicleEntity);
+        // Vehicle local direction vectors
+        Vector3 forward = Vector3.Normalize(Vector3.Transform(Vector3.UnitZ, chassisRot));
+        Vector3 up      = Vector3.Normalize(Vector3.Transform(Vector3.UnitY, chassisRot));
+        Vector3 right   = Vector3.Normalize(Vector3.Cross(forward, up));
 
-        int groundedCount = UpdateWheelContact(vehicleEntity, pos, rot, up, dt);
-
-        if (groundedCount > 0)
-        {
-            ApplySuspension(vehicleEntity, up, dt);
-            ApplyTireForces(vehicleEntity, forward, right, up, velocity, throttleInput, brakePressure, steerInput, groundedCount);
-        }
-        else
-        {
-            _physicsWorld.AddForce(vehicleEntity, Vector3.UnitY * (-_vehicleMass * 9.81f * AirborneExtraGravityScale));
-        }
-
-        ApplyAeroAndStability(vehicleEntity, forward, right, groundedCount);
-        UpdateWheelState(vehicleEntity, forward, right, throttleInput, brakePressure, steerInput, dt);
-    }
-
-    private int UpdateWheelContact(Entity vehicleEntity, Vector3 vehiclePos, Quaternion vehicleRot, Vector3 suspensionUp, float deltaTime)
-    {
-        Vector3 rayDirection = -suspensionUp;
+        // 2. Perform 4-Point Independent Suspension Raycasts
         int groundedCount = 0;
+        float[] compressions = new float[4];
 
-        for (int i = 0; i < _wheels.Length; i++)
+        for (int i = 0; i < 4 && i < _wheels.Length; i++)
         {
             WheelState wheel = _wheels[i];
             WheelConfig config = wheel.Config;
 
-            Vector3 wheelLocalPos = new(config.LocalPosition.X, config.LocalPosition.Y, config.LocalPosition.Z);
-            Vector3 restWheelWorldPos = vehiclePos + Vector3.Transform(wheelLocalPos, vehicleRot);
-            Vector3 rayOrigin = restWheelWorldPos + suspensionUp * RaycastSkin;
-            float raycastDistance = config.SuspensionRestLength + config.WheelRadius + RaycastSkin;
+            Vector3 localMount = new(config.LocalPosition.X, config.LocalPosition.Y, config.LocalPosition.Z);
+            Vector3 mountPointWorld = chassisPos + Vector3.Transform(localMount, chassisRot);
 
-            bool wasGrounded = wheel.IsGrounded;
-            float previousLength = wheel.SuspensionLength > 0.0001f
-                ? wheel.SuspensionLength
-                : config.SuspensionRestLength;
+            // Ray origin is slightly above mount point
+            Vector3 rayOrigin = mountPointWorld + up * 0.4f;
+            Vector3 rayDirection = -up;
+            float maxRayDistance = MathF.Abs(config.LocalPosition.Y) + config.SuspensionRestLength + config.WheelRadius + 1.2f;
 
-            if (_physicsWorld.Raycast(rayOrigin, rayDirection, raycastDistance, out RaycastHit hit, vehicleEntity))
+            if (_physicsWorld.Raycast(rayOrigin, rayDirection, maxRayDistance, out RaycastHit hit, chassisEntity))
             {
-                float centerToGround = MathF.Max(0.0f, hit.Distance - RaycastSkin);
-                float suspensionLength = System.Math.Clamp(centerToGround - config.WheelRadius, 0.0f, config.SuspensionRestLength);
-                float compressionDistance = config.SuspensionRestLength - suspensionLength;
-                float compression01 = compressionDistance / MathF.Max(0.01f, config.SuspensionRestLength);
+                // Contact point geometry
+                Vector3 contactNormal = hit.Normal.LengthSquared() > 0.0001f
+                    ? Vector3.Normalize(hit.Normal)
+                    : up;
+
+                // Calculate distance from mount point to contact along ray
+                float distFromMount = MathF.Max(0.0f, hit.Distance - 0.4f);
+                float currentSuspensionLength = MathF.Max(0.0f, distFromMount - config.WheelRadius);
+                float compression = MathF.Max(0.0f, config.SuspensionRestLength - currentSuspensionLength);
 
                 wheel.IsGrounded = true;
-                wheel.PreviousSuspensionLength = wasGrounded ? previousLength : suspensionLength;
-                wheel.SuspensionLength = suspensionLength;
-                wheel.SuspensionCompression = System.Math.Clamp(compression01, 0.0f, 1.0f);
+                wheel.SuspensionLength = currentSuspensionLength;
+                wheel.SuspensionCompression = System.Math.Clamp(compression / config.SuspensionRestLength, 0f, 1f);
                 wheel.ContactPoint = new BVec3(hit.Point.X, hit.Point.Y, hit.Point.Z);
-                Vector3 normal = SafeNormalize(hit.Normal, Vector3.UnitY);
-                wheel.ContactNormal = new BVec3(normal.X, normal.Y, normal.Z);
-                Vector3 visualWheelPos = hit.Point + normal * config.WheelRadius;
+                wheel.ContactNormal = new BVec3(contactNormal.X, contactNormal.Y, contactNormal.Z);
+
+                // Visual wheel placement
+                Vector3 visualWheelPos = hit.Point + contactNormal * config.WheelRadius;
                 wheel.WorldPosition = new BVec3(visualWheelPos.X, visualWheelPos.Y, visualWheelPos.Z);
+
+                compressions[i] = compression;
                 groundedCount++;
             }
             else
             {
+                // ── RAY MISS SAFETY INVARIANT ──
+                // Ray miss → zero ground forces, wheel free-spins in air
                 wheel.IsGrounded = false;
-                wheel.PreviousSuspensionLength = config.SuspensionRestLength;
                 wheel.SuspensionLength = config.SuspensionRestLength;
-                wheel.SuspensionCompression = 0.0f;
-                wheel.SuspensionForce = 0.0f;
-                wheel.ContactNormal = new BVec3(suspensionUp.X, suspensionUp.Y, suspensionUp.Z);
-                wheel.WorldPosition = new BVec3(restWheelWorldPos.X, restWheelWorldPos.Y, restWheelWorldPos.Z);
+                wheel.SuspensionCompression = 0f;
+                wheel.SuspensionForce = 0f;
+                wheel.ContactNormal = new BVec3(up.X, up.Y, up.Z);
+                Vector3 airWheelPos = mountPointWorld - up * config.SuspensionRestLength;
+                wheel.WorldPosition = new BVec3(airWheelPos.X, airWheelPos.Y, airWheelPos.Z);
+                compressions[i] = 0f;
             }
         }
 
-        return groundedCount;
-    }
+        // 3. Compute Drivetrain & Engine RPM
+        UpdateDrivetrain(input, chassisVel, forward, groundedCount, dt);
 
-    private void ApplySuspension(Entity vehicleEntity, Vector3 suspensionUp, float deltaTime)
-    {
-        float staticWheelLoad = _vehicleMass * 9.81f / MathF.Max(1, _wheels.Length);
-        float maxSuspensionForce = staticWheelLoad * SuspensionForceSafety;
+        // 4. Calculate & Apply Wheel Forces to Jolt Body
+        float staticWheelLoad = _vehicleMass * 9.81f / MathF.Max(1, groundedCount > 0 ? groundedCount : 4);
 
-        for (int i = 0; i < _wheels.Length; i++)
+        // Anti-Roll Bar calculation (Front: 0&1, Rear: 2&3)
+        float frontAntiRollDelta = compressions[0] - compressions[1];
+        float rearAntiRollDelta = compressions[2] - compressions[3];
+
+        for (int i = 0; i < 4 && i < _wheels.Length; i++)
         {
             WheelState wheel = _wheels[i];
+            WheelConfig config = wheel.Config;
+
+            // Speed-sensitive steering angle
+            float speedMPH = chassisVel.Length() * 2.23694f;
+            float speedSteerScale = System.Math.Clamp(1.0f - (speedMPH / 120.0f) * 0.5f, 0.4f, 1.0f);
+            wheel.SteerAngle = config.IsSteerWheel ? input.Steer * config.MaxSteerAngle * speedSteerScale : 0.0f;
+
             if (!wheel.IsGrounded)
+            {
+                // Free-spin angular velocity decay in air
+                wheel.AngularVelocity *= 0.98f;
+                wheel.SpinAngle += wheel.AngularVelocity * dt;
                 continue;
-
-            WheelConfig config = wheel.Config;
-            float compressionDistance = config.SuspensionRestLength - wheel.SuspensionLength;
-            float compressionVelocity = (wheel.PreviousSuspensionLength - wheel.SuspensionLength) / MathF.Max(0.0001f, deltaTime);
-            float springForce = compressionDistance * config.SuspensionStiffness;
-            float dampingForce = compressionVelocity * config.SuspensionDamping;
-            float suspensionForce = System.Math.Clamp(springForce + dampingForce, 0.0f, maxSuspensionForce);
-
-            wheel.SuspensionForce = suspensionForce;
-            _physicsWorld.AddForce(vehicleEntity, Vector3.UnitY * suspensionForce);
-        }
-    }
-
-    private void ApplyTireForces(Entity vehicleEntity, Vector3 forward, Vector3 right, Vector3 up,
-                                 Vector3 velocity, float throttleInput, float brakePressure,
-                                 float steerInput, int groundedCount)
-    {
-        int driveWheelCount = 0;
-        for (int i = 0; i < _wheels.Length; i++)
-        {
-            if (_wheels[i].IsGrounded && _wheels[i].Config.IsDriveWheel)
-                driveWheelCount++;
-        }
-        driveWheelCount = System.Math.Max(1, driveWheelCount);
-
-        for (int i = 0; i < _wheels.Length; i++)
-        {
-            WheelState wheel = _wheels[i];
-            if (!wheel.IsGrounded)
-                continue;
-
-            WheelConfig config = wheel.Config;
-            Vector3 normal = ToNumerics(wheel.ContactNormal, Vector3.UnitY);
-
-            float steerRadians = config.IsSteerWheel
-                ? steerInput * config.MaxSteerAngle * (MathF.PI / 180.0f)
-                : 0.0f;
-            Vector3 wheelForward = SafeNormalize(forward * MathF.Cos(steerRadians) + right * MathF.Sin(steerRadians), forward);
-            wheelForward = ProjectOnPlane(wheelForward, Vector3.UnitY, forward);
-            Vector3 wheelRight = ProjectOnPlane(Vector3.Cross(Vector3.UnitY, wheelForward), Vector3.UnitY, right);
-
-            float forwardSpeed = Vector3.Dot(velocity, wheelForward);
-            float lateralSpeed = Vector3.Dot(velocity, wheelRight);
-            float normalLoad = MathF.Max(_vehicleMass * 9.81f / MathF.Max(1, groundedCount), wheel.SuspensionForce);
-            float gripLimit = normalLoad * TireGripCoefficient * MathF.Max(0.2f, config.TractionMultiplier);
-
-            Vector3 totalForce = Vector3.Zero;
-
-            if (config.IsDriveWheel && MathF.Abs(throttleInput) > 0.005f)
-            {
-                totalForce += wheelForward * (MotorForce * throttleInput / driveWheelCount);
             }
 
-            if (brakePressure > 0.005f && MathF.Abs(forwardSpeed) > 0.05f)
+            Vector3 contactNormal = new(wheel.ContactNormal.X, wheel.ContactNormal.Y, wheel.ContactNormal.Z);
+            Vector3 contactPoint  = new(wheel.ContactPoint.X, wheel.ContactPoint.Y, wheel.ContactPoint.Z);
+
+            // ── GRAM-SCHMIDT CONTACT TANGENT BASIS ──
+            // Construct tangent plane vectors on exact road surface geometry
+            float steerRad = wheel.SteerAngle * (MathF.PI / 180f);
+            Vector3 steeredForward = Vector3.Normalize(forward * MathF.Cos(steerRad) + right * MathF.Sin(steerRad));
+
+            Vector3 fwdProjected = Vector3.Normalize(steeredForward - contactNormal * Vector3.Dot(steeredForward, contactNormal));
+            Vector3 rightProjected = Vector3.Normalize(Vector3.Cross(contactNormal, fwdProjected));
+
+            Vector3 localMount = new(config.LocalPosition.X, config.LocalPosition.Y, config.LocalPosition.Z);
+            Vector3 mountPointWorld = chassisPos + Vector3.Transform(localMount, chassisRot);
+
+            // ── SUSPENSION FORCE (Hooke's Law + Damping) ──
+            float compression = compressions[i];
+            float suspensionVel = (wheel.PreviousSuspensionLength - wheel.SuspensionLength) / dt;
+            wheel.PreviousSuspensionLength = wheel.SuspensionLength;
+
+            float springForce = compression * SuspensionStiffness;
+            float damperForce = System.Math.Clamp(suspensionVel * SuspensionDamping, -staticWheelLoad * 1.5f, staticWheelLoad * 1.5f);
+
+            // Anti-roll bar adjustment
+            float antiRollForce = 0f;
+            if (i == 0) antiRollForce = frontAntiRollDelta * AntiRollStiffness;
+            else if (i == 1) antiRollForce = -frontAntiRollDelta * AntiRollStiffness;
+            else if (i == 2) antiRollForce = rearAntiRollDelta * AntiRollStiffness;
+            else if (i == 3) antiRollForce = -rearAntiRollDelta * AntiRollStiffness;
+
+            // Clamp total suspension normal load to prevent 100,000 N rocket launches
+            float maxAllowedNormalLoad = staticWheelLoad * 2.5f;
+            float totalNormalLoad = System.Math.Clamp(springForce + damperForce + antiRollForce + staticWheelLoad * 0.5f, 0.0f, maxAllowedNormalLoad);
+            wheel.SuspensionForce = totalNormalLoad;
+
+            // Apply suspension force at wheel mount point on chassis frame (mountPointWorld), NOT ground contact point.
+            // This keeps vertical suspension forces at chassis frame level, eliminating ground lever-arm flip torques!
+            _physicsWorld.AddForceAtPosition(chassisEntity, contactNormal * totalNormalLoad, mountPointWorld);
+
+            // ── CONTACT PATCH VELOCITY & SLIP ──
+            Vector3 leverArm = contactPoint - chassisPos;
+            Vector3 vPatch = chassisVel + Vector3.Cross(chassisAngVel, leverArm);
+
+            float vLong = Vector3.Dot(vPatch, fwdProjected);
+            float vLat  = Vector3.Dot(vPatch, rightProjected);
+
+            // Integrate wheel rotational speed (omega) from drivetrain / road speed
+            if (config.IsDriveWheel && MathF.Abs(input.Throttle) > 0.01f)
             {
-                float brakeForce = MathF.Min(BrakeForce * brakePressure / groundedCount, gripLimit);
-                totalForce += -wheelForward * MathF.Sign(forwardSpeed) * brakeForce;
+                float targetWheelSpeed = (input.Throttle * MotorForce / MathF.Max(100f, _vehicleMass)) * 0.5f;
+                wheel.AngularVelocity = MathF.Max(wheel.AngularVelocity, vLong / config.WheelRadius + targetWheelSpeed * 0.1f);
+            }
+            else
+            {
+                wheel.AngularVelocity = vLong / MathF.Max(0.05f, config.WheelRadius);
+            }
+            wheel.SpinAngle += wheel.AngularVelocity * dt;
+
+            // ── LOAD-SENSITIVE PACEJKA & TRACTION CIRCLE ──
+            float slipAngle = MathF.Atan2(vLat, MathF.Abs(vLong) + 0.5f);
+
+            // Pacejka lateral force curve: F_y = D * sin(C * atan(B * alpha))
+            float B = 8.5f, C = 1.3f, D = TireGripCoefficient;
+            float fyNormalized = D * MathF.Sin(C * MathF.Atan(B * slipAngle));
+
+            float maxTireGrip = totalNormalLoad * TireGripCoefficient;
+            float longitudinalForce = 0f;
+
+            if (config.IsDriveWheel && MathF.Abs(input.Throttle) > 0.01f)
+            {
+                longitudinalForce = input.Throttle * (MotorForce / MathF.Max(1, groundedCount));
+            }
+            if (input.Brake > 0.01f)
+            {
+                longitudinalForce -= MathF.Sign(vLong) * input.Brake * (BrakeForce / MathF.Max(1, groundedCount));
+            }
+            if (input.Handbrake > 0.5f && !config.IsSteerWheel)
+            {
+                longitudinalForce -= MathF.Sign(vLong) * BrakeForce * 1.5f;
             }
 
-            totalForce += -wheelForward * forwardSpeed * normalLoad * RollingResistanceCoefficient;
-            totalForce += -wheelRight * lateralSpeed * normalLoad * LateralGripResponse / MathF.Max(1.0f, MathF.Abs(forwardSpeed) + 4.0f);
+            float lateralForce = -fyNormalized * totalNormalLoad;
 
-            totalForce = ClampMagnitude(totalForce, gripLimit);
-            totalForce.Y = 0.0f;
-            _physicsWorld.AddForce(vehicleEntity, totalForce);
-        }
+            // Enforce Traction Circle: (Fx/Fx_max)^2 + (Fy/Fy_max)^2 <= 1
+            float longRatio = longitudinalForce / MathF.Max(1f, maxTireGrip);
+            float latRatio  = lateralForce / MathF.Max(1f, maxTireGrip);
+            float combinedSq = longRatio * longRatio + latRatio * latRatio;
 
-        ApplySteeringYaw(vehicleEntity, steerInput, velocity, groundedCount);
-    }
-
-    private void ApplyAeroAndStability(Entity vehicleEntity, Vector3 forward, Vector3 right, int groundedCount)
-    {
-        Vector3 velocity = _physicsWorld.GetVelocity(vehicleEntity);
-        float speed = velocity.Length();
-
-        if (speed > 0.1f)
-        {
-            Vector3 dragDir = -velocity / speed;
-            _physicsWorld.AddForce(vehicleEntity, dragDir * speed * speed * 0.42f);
-        }
-
-        if (groundedCount > 0 && speed > 6.0f)
-        {
-            _physicsWorld.AddForce(vehicleEntity, Vector3.UnitY * (-speed * speed * 18.0f));
-        }
-
-        Vector3 angVel = _physicsWorld.GetAngularVelocity(vehicleEntity);
-        if (angVel.LengthSquared() > 0.0001f)
-        {
-            float damping = groundedCount > 0 ? 0.84f : 0.96f;
-            _physicsWorld.SetAngularVelocity(vehicleEntity, angVel * damping);
-        }
-
-        velocity = _physicsWorld.GetVelocity(vehicleEntity);
-        float maxVerticalSpeed = groundedCount > 0 ? MaxGroundedVerticalSpeed : MaxAirborneVerticalSpeed;
-        float verticalSpeed = System.Math.Clamp(velocity.Y, -maxVerticalSpeed, maxVerticalSpeed);
-        Vector3 horizontal = new(velocity.X, 0.0f, velocity.Z);
-        float horizontalSpeed = horizontal.Length();
-        if (horizontalSpeed > MaxForwardSpeed)
-        {
-            horizontal *= MaxForwardSpeed / horizontalSpeed;
-        }
-
-        Vector3 clamped = new(horizontal.X, verticalSpeed, horizontal.Z);
-        if ((clamped - velocity).LengthSquared() > 0.0001f)
-            _physicsWorld.SetVelocity(vehicleEntity, clamped);
-    }
-
-    private void ApplySteeringYaw(Entity vehicleEntity, float steerInput, Vector3 velocity, int groundedCount)
-    {
-        if (groundedCount <= 0 || MathF.Abs(steerInput) < 0.01f)
-            return;
-
-        float planarSpeed = new Vector2(velocity.X, velocity.Z).Length();
-        if (planarSpeed < 1.0f)
-            return;
-
-        Vector3 angularVelocity = _physicsWorld.GetAngularVelocity(vehicleEntity);
-        float desiredYaw = steerInput * MathF.Min(2.2f, planarSpeed * 0.28f);
-        angularVelocity.Y += (desiredYaw - angularVelocity.Y) * 0.18f;
-        _physicsWorld.SetAngularVelocity(vehicleEntity, angularVelocity);
-    }
-
-    private void UpdateWheelState(Entity vehicleEntity, Vector3 forward, Vector3 right,
-                                  float throttleInput, float brakePressure, float steerInput, float deltaTime)
-    {
-        Vector3 velocity = _physicsWorld.GetVelocity(vehicleEntity);
-
-        for (int i = 0; i < _wheels.Length; i++)
-        {
-            WheelState wheel = _wheels[i];
-            WheelConfig config = wheel.Config;
-
-            wheel.SteerAngle = config.IsSteerWheel ? steerInput * config.MaxSteerAngle : 0.0f;
-
-            float steerRadians = config.IsSteerWheel
-                ? steerInput * config.MaxSteerAngle * (MathF.PI / 180.0f)
-                : 0.0f;
-            Vector3 wheelForward = SafeNormalize(forward * MathF.Cos(steerRadians) + right * MathF.Sin(steerRadians), forward);
-            Vector3 wheelRight = SafeNormalize(Vector3.Cross(Vector3.UnitY, wheelForward), right);
-            float forwardSpeed = Vector3.Dot(velocity, wheelForward);
-            float lateralSpeed = Vector3.Dot(velocity, wheelRight);
-
-            if (config.WheelRadius > 0.001f)
+            if (combinedSq > 1.0f)
             {
-                float rollingAngularVelocity = forwardSpeed / config.WheelRadius;
-                float spinTarget = rollingAngularVelocity;
-                if (config.IsDriveWheel && MathF.Abs(throttleInput) > 0.05f && wheel.IsGrounded)
-                    spinTarget += throttleInput * 18.0f;
-                if (brakePressure > 0.05f && wheel.IsGrounded)
-                    spinTarget *= 1.0f - System.Math.Clamp(brakePressure, 0.0f, 1.0f);
-
-                float response = wheel.IsGrounded ? 10.0f : 2.5f;
-                wheel.AngularVelocity += (spinTarget - wheel.AngularVelocity) * System.Math.Clamp(response * deltaTime, 0.0f, 1.0f);
-                wheel.SlipRatio = System.Math.Clamp((wheel.AngularVelocity * config.WheelRadius - forwardSpeed) / MathF.Max(2.0f, MathF.Abs(forwardSpeed)), -2.0f, 2.0f);
-                wheel.SlipAngle = System.Math.Clamp(MathF.Atan2(lateralSpeed, MathF.Max(1.0f, MathF.Abs(forwardSpeed))), -1.2f, 1.2f);
+                float scale = 1.0f / MathF.Sqrt(combinedSq);
+                longitudinalForce *= scale;
+                lateralForce *= scale;
             }
 
-            wheel.SpinAngle += wheel.AngularVelocity * deltaTime;
+            // Apply combined tire forces at chassis mount point
+            Vector3 totalTireForce = fwdProjected * longitudinalForce + rightProjected * lateralForce;
+            _physicsWorld.AddForceAtPosition(chassisEntity, totalTireForce, mountPointWorld);
+        }
+
+        // 5. Aerodynamic Drag & Downforce
+        float speed = chassisVel.Length();
+        if (speed > 1.0f)
+        {
+            Vector3 airDrag = -Vector3.Normalize(chassisVel) * (0.35f * speed * speed);
+            _physicsWorld.AddForce(chassisEntity, airDrag);
+
+            if (groundedCount > 0)
+            {
+                Vector3 downforce = -up * (0.45f * speed * speed);
+                _physicsWorld.AddForce(chassisEntity, downforce);
+            }
         }
     }
 
-    private static Vector3 ToNumerics(BVec3 value, Vector3 fallback)
+    private void UpdateDrivetrain(in VehicleInput input, Vector3 chassisVel, Vector3 forward, int groundedCount, float dt)
     {
-        Vector3 result = new(value.X, value.Y, value.Z);
-        return result.LengthSquared() > 0.000001f ? result : fallback;
-    }
+        float speedMPS = Vector3.Dot(chassisVel, forward);
+        float driveWheelSpeed = MathF.Abs(speedMPS);
 
-    private static Vector3 SafeNormalize(Vector3 value, Vector3 fallback)
-    {
-        float lenSq = value.LengthSquared();
-        return lenSq > 0.000001f ? value / MathF.Sqrt(lenSq) : fallback;
-    }
+        float gearRatio = CurrentGear > 0 && CurrentGear <= GearRatios.Length ? GearRatios[CurrentGear - 1] : 1.0f;
+        float wheelRPM = (driveWheelSpeed / (MathF.Tau * WheelRadius)) * 60f;
+        float calculatedRPM = wheelRPM * gearRatio * FinalDriveRatio;
 
-    private static Vector3 ProjectOnPlane(Vector3 value, Vector3 normal, Vector3 fallback)
-    {
-        Vector3 projected = value - normal * Vector3.Dot(value, normal);
-        return SafeNormalize(projected, fallback);
-    }
+        EngineRPM = System.Math.Clamp(MathF.Max(IdleRPM, calculatedRPM), IdleRPM, RedlineRPM);
 
-    private static Vector3 ClampMagnitude(Vector3 value, float maxLength)
-    {
-        float lenSq = value.LengthSquared();
-        if (lenSq <= maxLength * maxLength)
-            return value;
-        return value / MathF.Sqrt(lenSq) * maxLength;
+        // Auto-shift up
+        if (EngineRPM >= RedlineRPM * 0.92f && CurrentGear < GearRatios.Length)
+        {
+            CurrentGear++;
+        }
+        // Auto-shift down
+        else if (EngineRPM <= IdleRPM * 1.3f && CurrentGear > 1 && input.Throttle > 0.1f)
+        {
+            CurrentGear--;
+        }
     }
 }

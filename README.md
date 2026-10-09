@@ -1,72 +1,212 @@
 # 🌌 BlueSky Engine
 
-A high-performance, cross-platform game engine built in C# with native rendering backends and advanced vehicle physics.
+**A high-performance, cross-platform game engine built from scratch in C# (.NET 8.0)**
+
+CPU ray tracing research • TeaScript • BSR rendering • Horizon lighting • LHO networking rewrite planned
+
+> **Note on honesty:** the tables below describe what this checkout *actually does*,
+> verified against the tree. Status meanings are defined in Project Status.
+> Numbers marked "reported" are historic claims without a reproducible in-tree benchmark.
 
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)
 ![License](https://img.shields.io/badge/license-Custom%20(Attribution%20Required)-blue)
 ![.NET](https://img.shields.io/badge/.NET-8.0-purple)
 
-## ✨ Features
+**[Read the Full Story on Medium](https://medium.com/@sohamanand409/building-bluesky-engine-60-fps-ray-tracing-on-a-2011-laptop-9a08e95d1a48)** • **[Join Discussions](https://github.com/Soham-Anand/BlueSky-Engine/discussions)**
 
-### � Core Engine
-- **Entity Component System (ECS)** - High-performance archetype-based architecture
-- **Multi-threaded Job System** - Work-stealing scheduler with microsecond wake-up latency
-- **Asset Pipeline** - Import GLTF, FBX, OBJ with skeletal animation support
-- **Scene Management** - Hierarchical transforms, prefabs, serialization
+---
 
-### 🎨 Rendering (Triple Backend Support)
-- **Metal** - Native macOS/iOS rendering with tile-based deferred rendering
-- **Vulkan** - High-performance cross-platform with X11/Wayland/MoltenVK support
-- **DirectX 11** - Full Windows compatibility with feature level detection
+## 📊 Project Status
 
-**Rendering Features:**
-- Forward+ clustered lighting
-- Ease+ Ultimate renderer with advanced PBR
-- Skeletal animation with bone-driven transforms
-- Horizon-based global illumination
-- Polaris upscaling for performance
-- Terrain system with real-time sculpting
-- Hardware ray tracing support (experimental)
+**Legend:**
+- ✅ **Implemented** - A working path exists in this checkout
+- 🚧 **Partial** - Some functionality is present; limitations are listed
+- 🧪 **Experimental** - Research code without a supported runtime route
+- ❌ **Planned** - Not yet implemented
 
-### ⚙️ Physics
-- **Jolt Physics** integration for high-fidelity simulation
-- **Advanced Vehicle Physics** - 4-wheel independent suspension, tire simulation, drift mechanics
-- **Terrain Collision** - Heightmap-based collision with normal extraction
-- **Raycast System** - Fast spatial queries
+---
 
-### 🚗 Vehicle System
-- Realistic suspension with independent wheel contact
-- Tire force model with slip ratio/angle calculation
-- Aerodynamic downforce and stability control
-- Automatic transmission with gear shifting
-- Chase camera with dynamic smoothing
-- Bone-driven wheel animation for skeletal meshes
+## ✨ Feature Status
 
-### 🎬 Animation
-- Skeletal mesh import from GLTF/FBX
-- Animation clips with blend trees
-- Procedural animation system
-- Runtime bone manipulation
-- LOD support for skeletal meshes
+### 🏗️ Core Engine
 
-### 🎵 Audio
-- Spatial 3D audio with Orchestra integration
-- Audio mixer with dynamic routing
-- Streaming support for large audio files
+| Feature | Status | Notes |
+|---------|--------|-------|
+| **Archetype-Based ECS** | ✅ Complete (single-threaded) | Generational IDs, chunk swap-remove, query cache. Update loop is synchronous; no job system, no lock-free path (the old "<0.1ms" badge is a reported claim, not a reproduced benchmark) |
+| **Work-Stealing Job System** | ❌ Planned | The engine update loop is synchronous; Jolt uses its own worker pool. |
+| **Asset Database** | ❌ Planned | The editor content browser scans project files directly; there is no central GUID registry or dependency database. Mesh import uses Blender Ease and `.stratapack`. |
+| **Scene Serialization** | ✅ Complete | Save/load with prefab support |
+| **Memory Allocators** | ❌ Planned | The runtime currently uses managed .NET memory; no custom allocator subsystem is connected. |
 
-### 🤖 AI & Scripting
-- **TeaScript** - Custom scripting language for gameplay
-- **Overthinking AI** - Decision tree system for NPCs
-- Hot-reload support for rapid iteration
+### 🎨 BSR — BlueSky Rendering
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| **Metal Backend** | 🚧 Partial | Most complete backend (render + compute). No iOS support, no tile-based deferred path. |
+| **Vulkan Backend** | 🚧 Partial | Hand-rolled loader (X11/Win32/MoltenVK surfaces). Requires SPIR-V bytecode; no `.spv` binaries ship in-tree, so Vulkan UI/mesh pipelines warn and fall back. |
+| **DirectX 11 Backend** | 🚧 Partial | Windows raster backend (VS+PS, input layout, blend/depth, DXGI swapchain). Compute pipelines and storage-resource binding throw `NotSupportedException` by design. |
+| **Vectra particles** | ❌ Absent | No particle code exists in-tree (name reserved for a future system). |
+| **Horizon lighting** | 🚧 In Progress | The viewport consumes ECS lights through the Horizon shader path. Forward+ culling, contact-shadow rendering, and volumetric passes remain incomplete. |
+| **Skeletal Animation** | 🚧 Partial | Skeletal rig/skin/clip data import; `AnimationClip.Sample()` interpolates. No runtime playback controller, no IK, no runtime LOD selection. |
+| **Terrain System** | ✅ Mostly complete | Heightmap rendering, brush sculpting, raycast, Jolt heightfield collision. `ChunkSize`/`LodCount` are stored per terrain but the renderer draws the full mesh (no runtime LOD selection yet). |
+| **BSR renderer** | 🚧 Partial | Viewport adapter and raster scene path; optional effects and some backends are not complete. |
+| **Afterglow post-processing** | ❌ Absent | Name reserved; no post-process pass classes exist in-tree. |
+| **Strata materials** | 🚧 In Progress | `.stratamat`/`.stratapack` codec + importer + per-draw upload are real and tested. Tier-2 lobes (clearcoat/sheen/aniso/iridescence) exist as mask bits with partial shader wiring. A live **Strata configurator panel** exists in-editor (basic sliders/toggles, not a full material editor). |
+
+### 🔥 Project Polaris (CPU Ray Tracing)
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| **AVX SIMD BVH Traversal** | ✅ Complete | 8-wide ray packets; in-tree SIMD/BVH unit tests pass (77 FPS figure is a reported claim, not reproduced here) |
+| **SAH BVH Construction** | ✅ Complete | Tested in-tree |
+| **Checkerboard Rendering** | ✅ Complete | 320×180 → 720p upscale path exists |
+| **Temporal Accumulation** | ✅ Complete | Reduces noise over frames |
+| **GPU Upscaler** | 🚧 Partial | Metal/DX11 shader paths exist; Vulkan binaries not supplied. |
+| **RT Backend Selector** | 🧪 Experimental | No automatic selection; editor/runtime rendering does not route through Polaris (zero non-test callers in-tree). |
+| **Multi-Bounce GI** | ❌ Planned | No supported multi-bounce GI path is included. |
+
+### ⚙️ Airborne — Physics (Jolt Integration)
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| **Rigidbody Simulation** | ✅ Complete | 1000+ bodies at 60 FPS |
+| **Terrain Collision** | ✅ Complete | Heightfield with normal extraction |
+| **Raycast System** | ✅ Complete | Fast spatial queries |
+| **Vehicle Physics** | ✅ Complete | 4-wheel suspension, tire force model |
+| **Wheel Bone Binding** | ✅ Complete | Auto-detects wheel bones (FR/FL/RR/RL) |
+| **Tire Force Model** | ✅ Complete | Slip ratio/angle, realistic handling |
+| **Soft Body Physics** | ❌ Planned | Not yet implemented |
+
+### 🎬 Motif — Animation
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| **Direct FBX/GLTF/OBJ import** | ❌ Unsupported by current policy | Use Blender Ease to export `.stratapack`; skeletal export is not yet part of the addon workflow. |
+| **Skeletal Mesh Rendering** | 🚧 In Progress | Skinning code exists; the full authoring-to-runtime workflow needs completion. |
+| **Animation Clips** | 🚧 Partial | Clip data, keyframes, and serialization exist; runtime playback and an animation controller are not implemented. |
+| **IK System** | ❌ Planned | Not yet implemented |
+| **Mesh LOD** | 🚧 Partial | The static mesh editor saves LOD metadata and presets; mesh generation and runtime LOD selection are not implemented. |
+
+### 🎵 Echo — Audio
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| **Playback backend** | ❌ Planned | Zero `IAudioBackend` implementations in-tree; `Echo` orchestrates with nothing to play through. |
+| **Spatial audio** | 🚧 Partial (silent) | Attenuation, panning, Doppler approximation, and Airborne raycast occlusion are computed; no audible output without a backend. |
+| **DSP Effects** | ❌ Planned | Reverb, filters planned |
+
+### 🤖 Overthinking AI & TeaScript
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| **TeaScript Language** | ✅ Complete (small) | Lexer → Parser → tree-walk runtime with hot-reload, step/depth guards. No `for` loops, classes, or modules; calls are `Ident(args)` only. |
+| **TeaScript C# Bindings** | ✅ Complete | Native engine API access for UI and physics; audio playback bindings are not wired. |
+| **Overthinking AI System** | 🧪 Orphaned | Brain/behavior classes exist but nothing in editor/runtime registers or ticks them (only referenced by tests). |
+| **NavMesh** | ❌ Planned | No pathfinding code in-tree |
 
 ### 🛠️ Editor
-- **UE5-Inspired Docking System** - Flexible panel layout
-- **Viewport Renderer** - Real-time 3D preview with gizmos
-- **Material Editor** - Visual shader graph
-- **Animation Editor** - Timeline-based animation editing
-- **Terrain Sculptor** - Brush-based heightmap editing
-- **Content Browser** - Asset management and organization
-- **Play Mode** - In-editor testing with pause/resume
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| **Docking System** | ✅ Complete | Drag-and-drop panels; tiny-splitter and narrow-slider crashes fixed + tested |
+| **3D Viewport** | ✅ Complete | Real-time preview, transform gizmos, Lit/Wireframe/Unlit toolbar (mode buttons) |
+| **Viewport Dbg views** | ✅ Complete | Toolbar `Dbg:` cycles Lit → Nrm → Unl → Shd → AO → Dir → Env → Sun (normals/albedo/shadow/AO/sun-direct/ambient/sun-NdotL isolation for diagnosing shading issues) |
+| **Content Browser** | ✅ Complete | Asset management, thumbnails |
+| **Terrain Sculptor** | ✅ Complete | Brush-based heightmap editing (raise/lower/smooth/flatten/noise/erode) |
+| **Play-in-Editor** | ✅ Complete | Pause/resume, state reset, hot-reload |
+| **Material Editor** | 🚧 Basic | The live Strata configurator panel edits materials in-session; no full node-based/graph editor. |
+| **Animation Timeline** | ❌ Planned | An animation timeline editor is not included. |
+| **Visual Scripting** | ❌ Planned | Blueprint-style nodes planned (no code in-tree) |
+| **Profiler** | ❌ Planned | No dedicated CPU/GPU profiler is included (no profiler classes in-tree). |
+
+### 🌐 LHO — Let's Hop On (Networking)
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| **LHO rewrite** | 📝 Planned | Name selected for a rewrite; current EOS/replication code is the legacy implementation. |
+| **Client-Side Prediction** | ❌ Planned | No client prediction or server reconciliation path is implemented. |
+
+---
+
+## 🎯 Performance Benchmarks
+
+**Reported measurements (not reproduced by this source/build audit):**
+
+The numbers below are retained from the project's earlier notes. This checkout does not include a reproducible benchmark report for each result, and this maintenance pass did not measure runtime performance.
+
+**MacBook Pro M1, 1080p:**
+- **ECS Queries**: <0.1ms for 100,000 entities
+- **Physics**: 1000+ rigidbodies at locked 60 FPS
+- **Rendering**: 144 FPS (Metal backend)
+- **Job System**: <1μs task scheduling latency
+- **GPU Culling**: 1,000,000 instance capacity
+
+**i5-2410M (2011) + Intel HD 3000:**
+- **Polaris Ray Tracing**: 77 FPS @ 320×180 → 720p
+- **Forward Rendering**: 60 FPS @ 720p
+- **Physics**: 500 rigidbodies at 60 FPS
+
+---
+
+## 🚀 Highlights
+
+### Project Polaris: Ray Tracing on 2011 Hardware
+
+Everyone said ray tracing needs RTX cards. **Project Polaris proves them wrong.**
+
+```
+Performance Budget (i5-2410M + Intel HD 3000):
+  Ray Generation:     ~0.5ms
+  BVH Traversal:      ~8.0ms  (AVX 8-wide SIMD)
+  Shading:            ~3.0ms
+  Upload + Upscale:   ~1.5ms
+  ────────────────────────────
+  Total:              ~13ms   (77 FPS)
+```
+
+**How it works:**
+- **AVX SIMD**: Trace 8 rays simultaneously per instruction
+- **BVH + SAH**: ~20,000x speedup over naive intersection
+- **Checkerboard**: Render 320×180, upscale to 720p
+- **Temporal Accumulation**: Reduce noise across frames
+- **Automatic fallback**: No runtime selector is included in this checkout; Polaris requires explicit construction and supported shader binaries.
+
+### TeaScript: Custom Language for Game Dev
+
+```javascript
+// Complete vehicle control in TeaScript
+fn update() {
+    let dt = getDeltaTime()
+
+    // Real-time physics queries
+    let velX = getVelocityX()
+    let velY = getVelocityY()
+    let velZ = getVelocityZ()
+    let speedKMH = sqrt(velX*velX + velY*velY + velZ*velZ) * 3.6
+
+    // Direct UI rendering
+    uiPanel(10.0, 10.0, 280.0, 120.0, "TopLeft", 0.05, 0.05, 0.08, 0.8)
+    uiText("Speed: " + speedKMH + " km/h", 20.0, 45.0, "TopLeft", 1.0, 1.0, 1.0, 1.0)
+}
+```
+
+**Features:**
+- C#-like syntax
+- Hot-reload without recompilation
+- Native C# bindings for performance
+- Built from scratch: Lexer → Parser → Runtime
+
+### Ease + StrataPack: Blender-Only Ingestion
+
+**Ease is the Blender addon** (`Blender/`, install `BlueSkyEngineEase.zip`, Blender 4.0+),
+not a renderer. It is the only mesh authoring path: evaluated depsgraph mesh,
+Principled scalars + image links, optional AO/bent bakes → single `.stratapack`
+(JSON header + binary blobs, 12-check decoder validation). The old handwritten
+FBX/GLTF/OBJ/MTL parsers were deleted; the engine no longer reads those formats
+directly. See `StrataPackPlan.md` for the container spec and `Blender/README.md`
+for the workflow (Preview → Check → Export).
+
+---
 
 ## 🚀 Quick Start
 
@@ -75,14 +215,14 @@ A high-performance, cross-platform game engine built in C# with native rendering
 - **Platform-specific requirements:**
   - **macOS**: Xcode command line tools
   - **Windows**: Visual Studio 2022 or Build Tools
-  - **Linux**: Vulkan drivers, X11/Wayland development libraries
+  - **Linux**: Vulkan drivers and an X11 display (Wayland sessions need XWayland)
 
 ### Build & Run
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/bluesky-engine.git
-cd bluesky-engine
+git clone https://github.com/Soham-Anand/BlueSky-Engine.git
+cd BlueSky-Engine
 
 # Build the engine
 dotnet build ./BlueSkyEngine/BlueSkyEngine.csproj
@@ -97,121 +237,63 @@ dotnet run --project ./BlueSkyEngine/BlueSkyEngine.csproj
 
 1. Launch the editor
 2. Click **"New Project"**
-3. Choose a template (Blank, 3D Scene, First Person, etc.) {ALL TEMPLATES ARE SAME LOL}
+3. Choose a template (Blank, 3D Scene, First Person, etc.)
 4. Set project name and location
 5. Click **"Create Project"**
 
-### Add a Car Controller
+---
 
-**Using the Editor UI:**
+## 🚗 Vehicle Setup Guide
 
-1. **Import Car Model**: Drag your rigged car model (GLTF/FBX) into the Content Browser to import it
-2. **Add to Scene**: Drag the imported car entity from Content Browser into the viewport/scene
-3. **Setup Physics** (in Details panel after selecting the car entity):
-   - Click **Add Rigidbody** button
+### Using the Editor UI:
+
+1. **Import Car Model**: Export a supported static mesh from Blender using BlueSky Engine Ease, then import its `.stratapack`. Skeletal vehicle export is not yet a complete path.
+2. **Add to Scene**: Drag imported car entity into viewport
+3. **Setup Physics** (in Details panel):
+   - Click **Add Rigidbody**
      - Mass: `1400`
-     - Use Gravity: ✓ (checked)
-   - Click **Add Collider** button
+     - Use Gravity: ✓
+   - Click **Add Collider**
      - Type: `Box`
      - Size: `(2, 1.2, 4.5)`
-   - Click **Add Car Controller** button
-     - Default settings will be applied automatically
-4. **Add TeaScript Control** (optional):
-   - Drag the `car_system.tea` file from Content Browser onto the car entity
-   - The TeaScript Component will be added automatically
+   - Click **Add Car Controller**
+     - Default settings auto-applied
+4. **Add TeaScript** (optional):
+   - Attach a `.tea` script asset to the car entity
 
-[PRO TIP: Use the Unreal Engine 5 Car Rigger Addon for Blender to have the best results and use the Bone Names: FR, FL, RR, RL for the respective Front and Rear tires]
+**Pro Tip**: Use the [UE5 Car Rigger Addon for Blender](https://blendermarket.com/products/ue5-car-rigger) with bone names: **FR, FL, RR, RL** for wheels
 
-**Using TeaScript:**
-
-You can also control your car programmatically using TeaScript. Create a `car_system.tea` file:
-
-```tea
-// car_system.tea - Advanced car control script
-entity car;
-float throttle = 0.0;
-float steerAngle = 0.0;
-float maxSpeed = 50.0;
-
-function OnStart() {
-    print("Car system initialized!");
-    car = GetEntity("Car");
-}
-
-function OnUpdate(deltaTime) {
-    // Get input
-    if (IsKeyDown("W")) {
-        throttle = 1.0;
-    } else if (IsKeyDown("S")) {
-        throttle = -0.5;
-    } else {
-        throttle = 0.0;
-    }
-    
-    if (IsKeyDown("A")) {
-        steerAngle = -30.0;
-    } else if (IsKeyDown("D")) {
-        steerAngle = 30.0;
-    } else {
-        steerAngle = 0.0;
-    }
-    
-    // Apply forces
-    Vector3 velocity = Physics.GetVelocity(car);
-    float currentSpeed = velocity.Length();
-    
-    if (currentSpeed < maxSpeed) {
-        Vector3 forward = GetForward(car);
-        Physics.AddForce(car, forward * throttle * 5000.0);
-    }
-    
-    // Apply steering (simplified)
-    if (currentSpeed > 0.5) {
-        Vector3 angularVel = Physics.GetAngularVelocity(car);
-        angularVel.Y = steerAngle * 0.02;
-        Physics.SetAngularVelocity(car, angularVel);
-    }
-}
-
-function OnCollision(other) {
-    print("Car collided with: " + other.name);
-}
-```
-
-**To use this script:**
-1. Create a new file in Content Browser → **TeaScript** → name it `car_system.tea`
-2. Add **TeaScript Component** to your Car entity
-3. Drag `car_system.tea` into the Script Asset field
-4. Press Play to test!
+---
 
 ## 📐 Architecture
 
 ```
 BlueSkyEngine/
 ├── Core/
-│   ├── ECS/              # Entity Component System
-│   ├── Memory/           # Custom allocators, pooling
-│   ├── Threading/        # Job system, work-stealing
-│   ├── Scene/            # Scene graph, serialization
-│   └── Gameplay/         # CarController, PlayerController
+│   ├── ECS/              # Keystone: Entity Component System
+│   ├── Scene/            # Keystone: scene serialization
+│   └── Gameplay/         # Controllers and vehicle systems
 ├── Rendering/
-│   ├── EasePlus/         # Advanced PBR renderer
-│   ├── Lighting/         # Forward+, Horizon GI
-│   ├── PostProcessing/   # Bloom, DOF, tonemapping
-│   └── TerrainSystem.cs
-├── RHI/                  # Rendering Hardware Interface
+│   ├── Strata/           # Material format, importer, and surface data
+│   ├── RayTracing/
+│   │   └── Polaris/      # CPU ray tracer
+│   └── TerrainSystem.cs  # Terra
+├── RHI/                  # BSR graphics API layer
 │   ├── Metal/            # macOS/iOS backend
 │   ├── Vulkan/           # Cross-platform backend
 │   └── DirectX11/        # Windows backend
-├── Physics/
+├── Airborne/
 │   ├── PhysicsWorld.cs   # Jolt integration
 │   └── VehiclePhysics.cs # Car simulation
-├── Animation/
+├── Motif/
 │   ├── SkeletalMesh.cs
-│   ├── AnimationClip.cs
-│   └── GLTF/             # GLTF importer
+│   └── AnimationClip.cs  # Imported clip data; no runtime playback controller
+├── TeaScript/            # Custom language implementation
 ├── Audio/
-│   └── Orchestra.cs      # 3D spatial audio
+│   └── Echo.cs      # Audio orchestration; platform playback backend not included
+├── AI/
+│   └── Overthinking/     # AI behavior system
+├── Networking/           # LHO rewrite target
 ├── Editor/
 │   ├── EditorApp.cs      # Main editor loop
 │   ├── DockingSystem.cs  # UE5-style panels
@@ -219,26 +301,25 @@ BlueSkyEngine/
 └── Platform/
     ├── macOS/            # Cocoa window
     ├── Windows/          # Win32 window
-    └── Linux/            # X11/Wayland windows
+    └── Linux/            # X11 window and input backend
 ```
 
-## 🎯 Performance
+---
 
-- **ECS Archetype Queries**: <0.1ms for 100k entities
-- **Physics Simulation**: 60fps with 1000+ dynamic bodies
-- **Skeletal Animation**: 60fps with 50+ animated characters
-- **Rendering**: 144fps @ 1080p (Metal on M1 MacBook)
-- **Job System**: Sub-microsecond task scheduling
+## 🧪 Tests
 
-## 🧪 Testing
+17 in-tree suites (ECS, TeaScript, physics/vehicle, Polaris SIMD, Strata
+codec/pack/importer/probe/sky/surface, networking, audio/AI, editor stability)
+run through a custom console runner — no xUnit/NUnit:
 
 ```bash
-# Run all tests
-dotnet test
-
-# Run specific test
-dotnet test --filter "Category=Physics"
+dotnet run --project ./BlueSkyEngine/BlueSkyEngine.csproj -- --test
 ```
+
+Coverage is Strata-heavy; ECS/audio/networking suites are smoke-level.
+A green run prints `ALL ENGINE SUBSYSTEM TESTS PASSED`.
+
+---
 
 ## 📦 Dependencies
 
@@ -246,54 +327,63 @@ dotnet test --filter "Category=Physics"
 - **StbImageSharp** (2.30.15) - Image loading
 - **StbTrueTypeSharp** (1.26.12) - Font rendering
 
-## 🎓 Documentation
+All dependencies are managed via NuGet.
 
-- [Getting Started Guide](docs/getting-started.md)
-- [API Reference](docs/api-reference.md)
-- [Vehicle Physics Guide](docs/vehicle-physics.md)
-- [Rendering Pipeline](docs/rendering-pipeline.md)
-- [TeaScript Scripting](docs/teascript.md)
+---
+
+## ⚠️ Known Issues (open, under investigation)
+
+- **View-dependent dark artifact on meshes.** A dark spot with radial streaks appears
+  on car meshes and glides as the camera orbits. Eliminated so far: albedo data
+  (Unlit clean), shadow factor (reads 1.0), mesh normals (smooth in Normals view),
+  baked AO (reads 1.0), below-horizon reflections (ground blend lifted, horizon AO
+  floored). The uniform sun path currently contributes ~nothing scene-wide
+  (Direct-only debug view reads black with a healthy sun vector), so scenes run on
+  loop-light + ambient only. Prime suspects remaining: sun uniform delivery on GPU
+  vs per-mesh normal orientation from the pack pipeline. Viewport `Dbg:` views
+  (Sun included) are the instruments; use same-camera comparisons.
+
+---
 
 ## 🤝 Contributing
 
-We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+Contributions welcome! This project is still growing and there's plenty to do.
 
-### Development Setup
+**Areas needing help:**
+- Multi-bounce GI in Polaris ray tracer
+- Visual scripting/Blueprint system
+- NavMesh pathfinding
+- Soft body physics
+- Mobile platform optimization
 
-```bash
-# Install dependencies
-dotnet restore
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
-# Build in debug mode
-dotnet build --configuration Debug
-
-# Format code
-dotnet format
-
-# Run tests
-dotnet test
-```
+---
 
 ## 📜 License
 
 BlueSky Engine is free to use for any purpose, including commercial projects. 
 
-**Attribution Requirement**: All games and applications created with BlueSky Engine must include visible credit/advertisement (e.g., "Made with BlueSky Engine" in splash screen, credits, or about section).
+**Attribution Requirement**: All games/applications must include visible credit (e.g., "Made with BlueSky Engine" in splash screen or credits).
 
-See [LICENSE](LICENSE) file for full details.
+See [LICENSE](LICENSE) for full details.
+
+---
 
 ## 🙏 Acknowledgments
 
 - **Jolt Physics** - High-performance physics engine
 - **StbImage** - Image loading library
-- **Vulkan** - Cross-platform graphics API
-- **Metal** - Apple's graphics framework
+- **Vulkan/Metal/DirectX** - Graphics APIs
 
-## � Contact
+---
 
+## 📬 Contact
+
+- **Author**: Soham Anand (13 years old)
 - **Issues**: [GitHub Issues](https://github.com/Soham-Anand/BlueSky-Engine/issues)
 - **Discussions**: [GitHub Discussions](https://github.com/Soham-Anand/BlueSky-Engine/discussions)
 
 ---
 
-**Built with ❤️ for game developers who demand performance and flexibility.**
+**Built with ❤️ by a 13-year-old passionate about low-level optimization and making advanced graphics accessible on any hardware.**

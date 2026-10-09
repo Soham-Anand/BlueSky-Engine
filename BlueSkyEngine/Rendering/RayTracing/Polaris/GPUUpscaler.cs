@@ -17,7 +17,7 @@
 using System;
 using System.Numerics;
 using System.Runtime.InteropServices;
-using NotBSRenderer;
+using BlueSky.Rendering.RHI;
 
 namespace BlueSky.Rendering.RayTracing.Polaris;
 
@@ -79,9 +79,17 @@ public class GPUUpscaler : IDisposable
         
         Console.WriteLine($"[Polaris Upscaler] {inputWidth}×{inputHeight} → {outputWidth}×{outputHeight} ({UpscaleFactor:F1}x)");
         
-        CreateTextures();
-        CreateFullscreenQuad();
-        CreateUpscalePipeline();
+        try
+        {
+            CreateUpscalePipeline();
+            CreateTextures();
+            CreateFullscreenQuad();
+        }
+        catch
+        {
+            Dispose();
+            throw;
+        }
     }
     
     private void CreateTextures()
@@ -183,7 +191,7 @@ public class GPUUpscaler : IDisposable
     
     private void CreateUpscalePipeline()
     {
-        // The upscale shader uses SM 4.1 features only (DX10.1 compatible)
+        // The compiler emits a backend-specific shader library/binary.
         var shaderLoader = new CompatibleShaderLoader(_device);
         
         var upscaleLayout = new VertexLayoutDesc
@@ -233,10 +241,12 @@ public class GPUUpscaler : IDisposable
             DebugName = "PolarisUpscalePipeline"
         });
         
-        if (_upscalePipeline != null)
-            Console.WriteLine("[Polaris Upscaler] Upscale pipeline created (SM 4.1 compatible)");
-        else
-            Console.WriteLine("[Polaris Upscaler] WARNING: Pipeline creation failed, will use CPU fallback");
+        if (_upscalePipeline == null)
+            throw new InvalidOperationException(
+                $"Polaris upscaling shader binaries for {_device.Backend} were not found or the pipeline could not be created. " +
+                "Compile the platform shaders before constructing PolarisRayTracer.");
+
+        Console.WriteLine($"[Polaris Upscaler] Upscale pipeline created for {_device.Backend}");
     }
     
     /// <summary>

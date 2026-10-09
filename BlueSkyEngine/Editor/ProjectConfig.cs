@@ -16,6 +16,7 @@ namespace BlueSky.Editor
     public static class ProjectConfig
     {
         public static List<ProjectMetadata> RecentProjects { get; private set; } = new();
+        private static Task<List<ProjectMetadata>>? _desktopScanTask;
 
         private static string ConfigPath => Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
@@ -91,59 +92,92 @@ namespace BlueSky.Editor
             Save();
         }
 
-        public static void ScanDesktopForProjects()
+        public static void StartDesktopProjectScan()
         {
+            _desktopScanTask ??= Task.Run(ScanDesktopForProjects);
+        }
+
+        /// <summary>Applies background scan results on the caller thread once ready.</summary>
+        public static void ApplyCompletedDesktopProjectScan()
+        {
+            var scan = _desktopScanTask;
+            if (scan == null || !scan.IsCompleted)
+                return;
+
+            _desktopScanTask = null;
+            try
+            {
+                if (!scan.IsCompletedSuccessfully)
+                {
+                    if (scan.Exception != null)
+                        Console.WriteLine($"Failed to scan desktop: {scan.Exception.GetBaseException().Message}");
+                    return;
+                }
+
+                bool added = false;
+                foreach (var project in scan.Result)
+                {
+                    bool exists = RecentProjects.Any(p => string.Equals(p.Path, project.Path, StringComparison.OrdinalIgnoreCase));
+                    if (!exists)
+                    {
+                        RecentProjects.Add(project);
+                        added = true;
+                    }
+                }
+
+                RecentProjects = RecentProjects.OrderByDescending(p => p.LastOpened).ToList();
+                if (added)
+                    Save();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to apply desktop project scan: {ex.Message}");
+            }
+        }
+
+        private static List<ProjectMetadata> ScanDesktopForProjects()
+        {
+            var discovered = new List<ProjectMetadata>();
             try
             {
                 string desktop = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
-                // Scan depth 3 to avoid massive slowdowns
-                ScanDirectory(desktop, 3);
-                
-                RecentProjects = RecentProjects.OrderByDescending(p => p.LastOpened).ToList();
-                Save();
+                if (!string.IsNullOrWhiteSpace(desktop) && Directory.Exists(desktop))
+                    ScanDirectory(desktop, 3, discovered);
             }
+
             catch (Exception ex)
             {
                 Console.WriteLine($"Failed to scan desktop: {ex.Message}");
             }
+
+            return discovered;
         }
 
-        private static void ScanDirectory(string root, int maxDepth, int currentDepth = 0)
+        private static void ScanDirectory(string root, int maxDepth, List<ProjectMetadata> discovered, int currentDepth = 0)
         {
             if (currentDepth > maxDepth) return;
 
             try
             {
-                // Is this a project?
-                if (Directory.GetFiles(root, "*.BlueSkyProj").Length > 0)
+                // Stop descending once a project root has been found.
+                if (Directory.EnumerateFiles(root, "*.BlueSkyProj").Any())
                 {
-                    DiscoverProject(root);
-                    return; // Don't scan inside a project
+                    string projectPath = Path.GetFullPath(root);
+                    discovered.Add(new ProjectMetadata
+                    {
+                        Name = Path.GetFileName(projectPath),
+                        Path = projectPath,
+                        LastOpened = DateTime.MinValue
+                    });
+                    return;
                 }
 
-                foreach (var dir in Directory.GetDirectories(root))
-                {
-                    ScanDirectory(dir, maxDepth, currentDepth + 1);
-                }
+                foreach (var dir in Directory.EnumerateDirectories(root))
+                    ScanDirectory(dir, maxDepth, discovered, currentDepth + 1);
             }
-            catch (UnauthorizedAccessException) { /* ignore */ }
-            catch (Exception) { /* ignore */ }
-        }
-
-        private static void DiscoverProject(string projectPath)
-        {
-            projectPath = Path.GetFullPath(projectPath);
-            var existing = RecentProjects.FirstOrDefault(p => string.Equals(p.Path, projectPath, StringComparison.OrdinalIgnoreCase));
-            if (existing == null)
-            {
-                RecentProjects.Add(new ProjectMetadata
-                {
-                    Name = Path.GetFileName(projectPath),
-                    Path = projectPath,
-                    // Give it an old date so actively used ones stay on top
-                    LastOpened = DateTime.MinValue 
-                });
-            }
+            catch (UnauthorizedAccessException) { /* ignore inaccessible branches */ }
+            catch (DirectoryNotFoundException) { /* ignore folders removed mid-scan */ }
+            catch (IOException) { /* ignore filesystem errors in one branch */ }
         }
     }
 }

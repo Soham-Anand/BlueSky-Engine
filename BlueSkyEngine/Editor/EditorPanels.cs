@@ -11,20 +11,33 @@ using BlueSky.Core.Math;
 using BlueSky.Rendering;
 using BlueSky.Core.Scripting;
 using BlueSky.Core.Scene;
-using NotBSRenderer;
+using BlueSky.Rendering.RHI;
 
 namespace BlueSky.Editor;
 
 partial class Program
 {
+    // ── Details/Outliner per-frame caches (freeze fixes) ──────────────
+    // Resolving selection via GetAllEntities().FirstOrDefault 6x/frame allocates
+    // a full snapshot per call. Resolve once per DrawDetailsPanel instead.
+    // Mesh headers hit disk+JSON; cache by asset id, reload only on change.
+    private static uint _detailsCachedId = uint.MaxValue;
+    private static Entity _detailsCachedEntity = default;
+    private static bool _detailsCachedFound = false;
+    private static string _detailsCachedMeshId = "";
+    private static int _detailsCachedSubmeshCount = 0;
+    // Debug view selector (toolbar): 0 Lit, 1 Normals, 2 Unlit, 3 Shadow, 4 AO.
+    // Consumed as flags bits 14-16 by fs_mesh (mesh-vs-shader diagnosis).
+    internal static int _debugView = 0;
+    internal static readonly string[] DebugViewNames = { "Lit", "Nrm", "Unl", "Shd", "AO", "Dir", "Env", "Sun" };
     // ── Dockable Panel Content Callbacks ──────────────────────────────
 
-    private static void DrawViewportPanel(NotBSUI ui, DockRect rect)
+    private static void DrawViewportPanel(EditorUI ui, DockRect rect)
     {
         _lastViewportRect = rect;
 
         // Skip 3D rendering when modals are open
-        if ((_materialEditor?.IsOpen ?? false) || _showScriptEditor || _showImportDialog || _showRenameDialog)
+        if (_showScriptEditor || _showImportDialog || _showRenameDialog)
         {
             ui.Panel(rect.X, rect.Y, rect.W, rect.H, EditorTheme.Bg0);
             float cx = rect.X + rect.W / 2, cy = rect.Y + rect.H / 2;
@@ -122,6 +135,22 @@ partial class Program
                 tx += mw + 4;
             }
 
+            // Debug view cycle (Lit -> Nrm -> Unl -> Shd): pinpoints whether a
+            // viewport artifact lives in mesh data, albedo, lighting or shadow.
+            {
+                string modeName = DebugViewNames[_debugView];
+                float mw = modeName.Length * 7.2f + 22;
+                if (ui.ButtonEx(tx, rect.Y + 14, mw, 22, "Dbg:" + modeName,
+                    _debugView != 0 ? EditorTheme.WithAlpha(EditorTheme.Accent, 0.45f)
+                       : EditorTheme.WithAlpha(EditorTheme.ToolbarBtnNormal, 0.6f),
+                    EditorTheme.WithAlpha(EditorTheme.ToolbarBtnHover, 0.8f),
+                    EditorTheme.Accent,
+                    new System.Numerics.Vector4(0, 0, 0, 0),
+                    _debugView != 0 ? EditorTheme.TextPrimary : EditorTheme.TextMuted, 713u))
+                    _debugView = (_debugView + 1) % 8;
+                tx += mw + 4;
+            }
+
             // ── Camera info overlay (bottom-left) ────────────────────────
             var camPos = _viewport.GetCameraPositionNumerics();
             float infoH = 26;
@@ -135,7 +164,7 @@ partial class Program
         }
     }
 
-    private static void DrawOutlinerPanel(NotBSUI ui, DockRect rect)
+    private static void DrawOutlinerPanel(EditorUI ui, DockRect rect)
     {
         float inset = EditorTheme.Pad;
         float iconCol = rect.X + inset + 6;
@@ -219,9 +248,21 @@ partial class Program
             for (int i = 0; i < entities.Count; i++)
             {
                 var entity = entities[i];
+                float drawY = listY - scrollOffset;
+                // Cull off-screen rows: advance layout, skip all component
+                // lookups and draw commands. This keeps 100k-entity scenes
+                // at ~30 visible rows instead of 100k draw cards per frame.
+                bool visible = drawY + EditorTheme.RowH >= scrollAreaY && drawY <= scrollAreaY + scrollAreaH;
+                if (!visible)
+                {
+                    listY += EditorTheme.RowH + 1;
+                    continue;
+                }
+                // Skip internal editor camera entity (no layout space, as before).
+                if (_world.TryGetComponent<CameraComponent>(entity, out _))
+                    continue;
                 uint id = (uint)entity.Id;
                 bool isSel = _selectedEntityId == id;
-                float drawY = listY - scrollOffset;
 
                 if (ui.ClickableCard(rect.X + 6, drawY, rect.W - 12, EditorTheme.RowH,
                     id,
@@ -264,8 +305,37 @@ partial class Program
             {
                 CreateTerrain();
             }
+            // Create Empty Entity button
+            if (ui.ButtonEx(rect.X + inset, rect.Y + rect.H - 50, rect.W - inset * 2, 24, "+ Empty Entity",
+                EditorTheme.Bg3, EditorTheme.Bg2, EditorTheme.Bg1,
+                new System.Numerics.Vector4(0,0,0,0), EditorTheme.Green, 9901))
+            {
+                var entity = _world.CreateEntity();
+                var transform = new TransformComponent
+                {
+                    Position = new BlueSky.Core.Math.Vector3(0, 1, 0),
+                    Rotation = BlueSky.Core.Math.Quaternion.Identity,
+                    Scale = BlueSky.Core.Math.Vector3.One
+                };
+                _world.AddComponent(entity, transform);
+                Log($"Created empty entity Entity_{entity.Id}");
+            }
             
-            ui.SetCursor(iconCol, rect.Y + rect.H - 52);
+            // ── RIGHT-CLICK CONTEXT MENU on outliner ───────────────────
+            if (_input!.IsMouseButtonDown(MouseButton.Right) &&
+                ui.IsHovering(rect.X, scrollAreaY, rect.W, scrollAreaH))
+            {
+                _showOutlinerContextMenu = true;
+                _outlinerContextMenuX = ui.MousePosition.X;
+                _outlinerContextMenuY = ui.MousePosition.Y;
+            }
+
+            if (_showOutlinerContextMenu)
+            {
+                DrawOutlinerContextMenu(ui, _outlinerContextMenuX, _outlinerContextMenuY);
+            }
+
+            ui.SetCursor(iconCol, rect.Y + rect.H - 78);
             ui.Text($"{entities.Count} actors", EditorTheme.TextDisabled);
         }
         else
@@ -275,7 +345,7 @@ partial class Program
         }
     }
 
-    private static void DrawDetailsPanel(NotBSUI ui, DockRect rect)
+    private static void DrawDetailsPanel(EditorUI ui, DockRect rect)
     {
         float inset = EditorTheme.Pad;
         float labelCol = rect.X + inset + 4;
@@ -283,12 +353,14 @@ partial class Program
 
         ui.Panel(rect.X, rect.Y, rect.W, rect.H, EditorTheme.Bg1);
 
-        // Get selected entity info
+        // Get selected entity info — resolve ONCE per frame (no 6x snapshot scans).
         string entityName = "None Selected";
         string pos = "0.0, 0.0, 0.0";
         string rot = "0.0, 0.0, 0.0";
         string scale = "1.0, 1.0, 1.0";
         bool hasMesh = false;
+        Entity selectedEntity = default;
+        bool hasSelectedEntity = false;
 
         if (_world != null && _selectedEntityId > 0)
         {
@@ -300,16 +372,30 @@ partial class Program
             }
             else
             {
-                var entity = _world.GetAllEntities().FirstOrDefault(e => e.Id == _selectedEntityId);
-                if (entity.Id != 0)
+                if (_detailsCachedId != _selectedEntityId)
                 {
-                    entityName = $"Entity_{entity.Id}";
-                    if (_world.TryGetComponent<TransformComponent>(entity, out var transform))
+                    _detailsCachedId = _selectedEntityId;
+                    _detailsCachedFound = _world.TryResolveEntity(_selectedEntityId, out _detailsCachedEntity);
+                }
+                if (_detailsCachedFound)
+                {
+                    selectedEntity = _detailsCachedEntity;
+                    // Generation may have recycled; validate before use.
+                    if (_world.IsEntityValid(selectedEntity))
                     {
-                        pos = $"{transform.Position.X:F1}, {transform.Position.Y:F1}, {transform.Position.Z:F1}";
-                        scale = $"{transform.Scale.X:F1}, {transform.Scale.Y:F1}, {transform.Scale.Z:F1}";
+                        hasSelectedEntity = true;
+                        entityName = $"Entity_{selectedEntity.Id}";
+                        if (_world.TryGetComponent<TransformComponent>(selectedEntity, out var transform))
+                        {
+                            pos = $"{transform.Position.X:F1}, {transform.Position.Y:F1}, {transform.Position.Z:F1}";
+                            scale = $"{transform.Scale.X:F1}, {transform.Scale.Y:F1}, {transform.Scale.Z:F1}";
+                        }
+                        hasMesh = _world.TryGetComponent<MeshComponent>(selectedEntity, out _);
                     }
-                    hasMesh = _world.TryGetComponent<MeshComponent>(entity, out _);
+                    else
+                    {
+                        _detailsCachedFound = false;
+                    }
                 }
             }
         }
@@ -376,30 +462,35 @@ partial class Program
         ui.Text("Mesh", EditorTheme.TextMuted);
         
         string meshName = "None";
-        string assignedMaterialPath = "";
         int submeshCount = 0;
-        if (_world != null && _selectedEntityId > 0 && _selectedEntityId < 200)
+        StaticMeshComponent cachedMeshComp = default;
+        bool hasCachedMeshComp = false;
+        if (hasSelectedEntity && _world != null)
         {
-            var meshEntity = _world.GetAllEntities().FirstOrDefault(e => e.Id == _selectedEntityId);
-            if (meshEntity.Id != 0 && _world.TryGetComponent<BlueSky.Core.ECS.Builtin.StaticMeshComponent>(meshEntity, out var meshComp))
+            if (_world.TryGetComponent<BlueSky.Core.ECS.Builtin.StaticMeshComponent>(selectedEntity, out var meshComp))
             {
                 hasMesh = true;
+                hasCachedMeshComp = true;
+                cachedMeshComp = meshComp;
                 meshName = string.IsNullOrEmpty(meshComp.MeshAssetId) ? "None" : Path.GetFileNameWithoutExtension(meshComp.MeshAssetId);
-                assignedMaterialPath = meshComp.MaterialAssetId ?? "";
-                
-                // Read actual submesh count from asset metadata — not the inline slot cap (8)
+
+                // Cached header: disk+JSON once per asset id, not 60x/sec.
                 if (!string.IsNullOrEmpty(meshComp.MeshAssetId))
                 {
-                    var meshHeader = BlueSky.Core.Assets.BlueAsset.LoadHeader(meshComp.MeshAssetId);
-                    if (meshHeader != null && meshHeader.Metadata.TryGetValue("submeshCount", out var scStr)
-                        && int.TryParse(scStr, out int sc))
-                        submeshCount = sc;
-                    else
-                        submeshCount = meshComp.InlineSlotCount;
+                    if (_detailsCachedMeshId != meshComp.MeshAssetId)
+                    {
+                        _detailsCachedMeshId = meshComp.MeshAssetId;
+                        _detailsCachedSubmeshCount = 0;
+                        var meshHeader = BlueSky.Core.Assets.BlueAsset.LoadHeader(meshComp.MeshAssetId);
+                        if (meshHeader != null && meshHeader.Metadata.TryGetValue("submeshCount", out var scStr)
+                            && int.TryParse(scStr, out int sc))
+                            _detailsCachedSubmeshCount = sc;
+                    }
+                    submeshCount = _detailsCachedSubmeshCount;
                 }
                 else
                 {
-                    submeshCount = meshComp.InlineSlotCount;
+                    submeshCount = 0;
                 }
             }
         }
@@ -413,22 +504,20 @@ partial class Program
         y += 28;
 
         // ── Static Mesh Actions ──
-        if (hasMesh && _world != null && _selectedEntityId > 0)
+        if (hasMesh && hasCachedMeshComp && _world != null && hasSelectedEntity)
         {
-            var meshEntity = _world.GetAllEntities().FirstOrDefault(e => e.Id == _selectedEntityId);
-            if (meshEntity.Id != 0 && _world.TryGetComponent<BlueSky.Core.ECS.Builtin.StaticMeshComponent>(meshEntity, out var meshComp))
             {
                 // Open Mesh Editor button
-                if (ui.ButtonEx(labelCol, y - scrollOffset, rect.W - inset * 2 - (labelCol - rect.X - inset), 28, "🔧 Edit Materials & Mesh",
+                if (ui.ButtonEx(labelCol, y - scrollOffset, rect.W - inset * 2 - (labelCol - rect.X - inset), 28, "🔧 Edit Mesh",
                     EditorTheme.WithAlpha(EditorTheme.Purple, 0.2f), 
                     EditorTheme.WithAlpha(EditorTheme.Purple, 0.3f), 
                     EditorTheme.WithAlpha(EditorTheme.Purple, 0.4f), 
                     new System.Numerics.Vector4(0,0,0,0), 
                     EditorTheme.Purple, 9702))
                 {
-                    if (!string.IsNullOrEmpty(meshComp.MeshAssetId))
+                    if (!string.IsNullOrEmpty(cachedMeshComp.MeshAssetId))
                     {
-                        OpenStaticMeshEditor(meshComp.MeshAssetId);
+                        OpenStaticMeshEditor(cachedMeshComp.MeshAssetId);
                     }
                 }
                 y += 32;
@@ -443,20 +532,64 @@ partial class Program
             ui.Text("No mesh assigned", EditorTheme.TextDisabled);
             y += 26;
         }
+
+        // ── Skeletal Mesh Section ──
+        bool hasSkelMesh = false;
+        if (hasSelectedEntity && _world != null)
+        {
+            if (_world.TryGetComponent<BlueSky.Core.ECS.Builtin.SkeletalMeshComponent>(selectedEntity, out var skelComp))
+            {
+                hasSkelMesh = true;
+                string skelMeshName = string.IsNullOrEmpty(skelComp.MeshAssetPath) ? "None" : Path.GetFileNameWithoutExtension(skelComp.MeshAssetPath);
+
+                ui.Panel(rect.X + inset, y - scrollOffset, rect.W - inset * 2, EditorTheme.SectionH, EditorTheme.Bg2);
+                ui.Panel(rect.X + inset, y - scrollOffset, 3, EditorTheme.SectionH, new System.Numerics.Vector4(0.5f, 0.8f, 1.0f, 1.0f));
+                ui.SetCursor(labelCol + 2, y - scrollOffset + 8);
+                ui.Text("Skeletal Mesh", EditorTheme.TextPrimary);
+                y += EditorTheme.SectionH + EditorTheme.Pad;
+
+                ui.SetCursor(labelCol, y - scrollOffset + 2);
+                ui.Text("Mesh", EditorTheme.TextMuted);
+                ui.SetCursor(valueCol, y - scrollOffset + 2);
+                ui.Text(skelMeshName, hasSkelMesh ? EditorTheme.Purple : EditorTheme.TextDisabled);
+                y += 26;
+
+                // Open Skeletal Mesh Editor button
+                if (ui.ButtonEx(labelCol, y - scrollOffset, rect.W - inset * 2 - (labelCol - rect.X - inset), 28, "Edit Skeletal Mesh & Physics",
+                    EditorTheme.WithAlpha(EditorTheme.Purple, 0.2f),
+                    EditorTheme.WithAlpha(EditorTheme.Purple, 0.3f),
+                    EditorTheme.WithAlpha(EditorTheme.Purple, 0.4f),
+                    new System.Numerics.Vector4(0,0,0,0),
+                    EditorTheme.Purple, 9703))
+                {
+                    if (!string.IsNullOrEmpty(skelComp.MeshAssetPath))
+                    {
+                        OpenSkeletalMeshEditor(skelComp.MeshAssetPath);
+                    }
+                }
+                y += 32;
+                y += EditorTheme.PadLg;
+            }
+        }
         
         // TeaScript Section
         bool hasScript = false;
         string scriptPath = "None";
         bool scriptEnabled = false;
+        bool scriptAllowRuntimeUI = false;
+        bool scriptBlockRuntimeInput = false;
+        Entity selectedScriptEntity = default;
         
-        if (_world != null && _selectedEntityId > 0 && _selectedEntityId < 200)
+        if (hasSelectedEntity && _world != null)
         {
-            var entity = _world.GetAllEntities().FirstOrDefault(e => e.Id == _selectedEntityId);
-            if (entity.Id != 0 && _world.TryGetComponent<TeaScriptComponent>(entity, out var scriptComp))
+            if (_world.TryGetComponent<TeaScriptComponent>(selectedEntity, out var scriptComp))
             {
+                selectedScriptEntity = selectedEntity;
                 hasScript = true;
                 scriptPath = string.IsNullOrEmpty(scriptComp.ScriptAssetId) ? "None" : Path.GetFileName(scriptComp.ScriptAssetId);
                 scriptEnabled = scriptComp.IsEnabled;
+                scriptAllowRuntimeUI = scriptComp.AllowRuntimeUI;
+                scriptBlockRuntimeInput = scriptComp.BlockRuntimeInput;
             }
         }
         
@@ -483,79 +616,105 @@ partial class Program
         ui.Text(scriptEnabled ? "Yes" : "No", scriptEnabled ? EditorTheme.Green : EditorTheme.TextDisabled);
         y += 30;
 
-        // ── Physics Inspector Section ──
-        bool hasRb = false;
-        bool hasCol = false;
-        if (_world != null && _selectedEntityId > 0 && _selectedEntityId < 200)
+        ui.SetCursor(labelCol, (y + 2) - scrollOffset);
+        ui.Text("Runtime UI", EditorTheme.TextMuted);
+        if (ui.ButtonEx(valueCol, y - scrollOffset, 72, 20, scriptAllowRuntimeUI ? "Allowed" : "Blocked",
+            scriptAllowRuntimeUI ? EditorTheme.WithAlpha(EditorTheme.Green, 0.2f) : EditorTheme.Bg3,
+            scriptAllowRuntimeUI ? EditorTheme.WithAlpha(EditorTheme.Green, 0.35f) : EditorTheme.Bg2,
+            EditorTheme.AccentDim, new System.Numerics.Vector4(0,0,0,0),
+            scriptAllowRuntimeUI ? EditorTheme.Green : EditorTheme.TextDisabled, 9701) &&
+            hasScript && selectedScriptEntity.Id != 0 && _world != null)
         {
-            var entity = _world.GetAllEntities().FirstOrDefault(e => e.Id == _selectedEntityId);
-            if (entity.Id != 0)
+            ref var script = ref _world.GetComponent<TeaScriptComponent>(selectedScriptEntity);
+            script.AllowRuntimeUI = !script.AllowRuntimeUI;
+        }
+        y += 28;
+
+        ui.SetCursor(labelCol, (y + 2) - scrollOffset);
+        ui.Text("Block Input", EditorTheme.TextMuted);
+        if (ui.ButtonEx(valueCol, y - scrollOffset, 72, 20, scriptBlockRuntimeInput ? "On" : "Off",
+            scriptBlockRuntimeInput ? EditorTheme.WithAlpha(EditorTheme.Orange, 0.2f) : EditorTheme.Bg3,
+            scriptBlockRuntimeInput ? EditorTheme.WithAlpha(EditorTheme.Orange, 0.35f) : EditorTheme.Bg2,
+            EditorTheme.AccentDim, new System.Numerics.Vector4(0,0,0,0),
+            scriptBlockRuntimeInput ? EditorTheme.Orange : EditorTheme.TextDisabled, 9702) &&
+            hasScript && selectedScriptEntity.Id != 0 && _world != null)
+        {
+            ref var script = ref _world.GetComponent<TeaScriptComponent>(selectedScriptEntity);
+            script.BlockRuntimeInput = !script.BlockRuntimeInput;
+        }
+        y += 30;
+
+        // ── Physics Inspector Section ──
+        bool hasPhysics = false;
+        if (hasSelectedEntity && _world != null)
+        {
+            var entity = selectedEntity;
             {
-                // Rigidbody
-                if (_world.TryGetComponent<BlueSky.Core.ECS.Builtin.RigidbodyComponent>(entity, out var rbComp))
+                // Physics (merged Rigidbody + Collider)
+                if (_world.TryGetComponent<BlueSky.Core.ECS.Builtin.PhysicsComponent>(entity, out var physComp))
                 {
-                    hasRb = true;
+                    hasPhysics = true;
                     ui.Panel(rect.X + inset, y - scrollOffset, rect.W - inset * 2, EditorTheme.SectionH, EditorTheme.Bg2);
                     ui.Panel(rect.X + inset, y - scrollOffset, 3, EditorTheme.SectionH, EditorTheme.Orange);
                     ui.SetCursor(labelCol + 2, (y + 8) - scrollOffset);
-                    ui.Text("Rigidbody", EditorTheme.TextPrimary);
+                    ui.Text("Physics", EditorTheme.TextPrimary);
                     
                     // Remove button
                     if (ui.ButtonEx(rect.X + rect.W - inset - 30, (y + 6) - scrollOffset, 24, 20, "×",
                         EditorTheme.WithAlpha(EditorTheme.Red, 0.2f), EditorTheme.Red, EditorTheme.Red,
                         new System.Numerics.Vector4(0,0,0,0), EditorTheme.Red, 9801))
                     {
-                        _world.RemoveComponent<BlueSky.Core.ECS.Builtin.RigidbodyComponent>(entity);
+                        _world.RemoveComponent<BlueSky.Core.ECS.Builtin.PhysicsComponent>(entity);
                     }
                     y += EditorTheme.SectionH + EditorTheme.Pad;
 
                     ui.SetCursor(labelCol, (y + 2) - scrollOffset); ui.Text("Mass", EditorTheme.TextMuted);
                     ui.SetCursor(valueCol, y - scrollOffset);
-                    float mass = rbComp.Mass;
+                    float mass = physComp.Mass;
                     if (ui.Slider(ref mass, 0.1f, 10000f, 100, 14))
                     {
-                        rbComp.Mass = mass;
-                        _world.AddComponent(entity, rbComp);
+                        physComp.Mass = mass;
+                        _world.AddComponent(entity, physComp);
                     }
                     y += 24;
 
                     ui.SetCursor(labelCol, (y + 2) - scrollOffset); ui.Text("Drag", EditorTheme.TextMuted);
                     ui.SetCursor(valueCol, y - scrollOffset);
-                    float drag = rbComp.Drag;
+                    float drag = physComp.Drag;
                     if (ui.Slider(ref drag, 0f, 10f, 100, 14))
                     {
-                        rbComp.Drag = drag;
-                        _world.AddComponent(entity, rbComp);
+                        physComp.Drag = drag;
+                        _world.AddComponent(entity, physComp);
                     }
                     y += 24;
 
                     ui.SetCursor(labelCol, (y + 2) - scrollOffset); ui.Text("Ang. Drag", EditorTheme.TextMuted);
                     ui.SetCursor(valueCol, y - scrollOffset);
-                    float angDrag = rbComp.AngularDrag;
+                    float angDrag = physComp.AngularDrag;
                     if (ui.Slider(ref angDrag, 0f, 10f, 100, 14))
                     {
-                        rbComp.AngularDrag = angDrag;
-                        _world.AddComponent(entity, rbComp);
+                        physComp.AngularDrag = angDrag;
+                        _world.AddComponent(entity, physComp);
                     }
                     y += 24;
 
                     ui.SetCursor(labelCol, (y + 2) - scrollOffset); ui.Text("Use Gravity", EditorTheme.TextMuted);
-                    if (ui.ButtonEx(valueCol, y - scrollOffset, 40, 20, rbComp.UseGravity ? "ON" : "OFF",
-                        rbComp.UseGravity ? EditorTheme.Green : EditorTheme.Bg3, EditorTheme.AccentHover, EditorTheme.AccentDim,
+                    if (ui.ButtonEx(valueCol, y - scrollOffset, 40, 20, physComp.UseGravity ? "ON" : "OFF",
+                        physComp.UseGravity ? EditorTheme.Green : EditorTheme.Bg3, EditorTheme.AccentHover, EditorTheme.AccentDim,
                         new System.Numerics.Vector4(0,0,0,0), EditorTheme.TextPrimary, 9802))
                     {
-                        rbComp.UseGravity = !rbComp.UseGravity;
-                        _world.AddComponent(entity, rbComp);
+                        physComp.UseGravity = !physComp.UseGravity;
+                        _world.AddComponent(entity, physComp);
                     }
                     y += 24;
 
                     ui.SetCursor(labelCol, (y + 2) - scrollOffset); ui.Text("Kinematic", EditorTheme.TextMuted);
-                    if (ui.ButtonEx(valueCol, y - scrollOffset, 40, 20, rbComp.IsKinematic ? "ON" : "OFF",
-                        rbComp.IsKinematic ? EditorTheme.Green : EditorTheme.Bg3, EditorTheme.AccentHover, EditorTheme.AccentDim,
+                    if (ui.ButtonEx(valueCol, y - scrollOffset, 40, 20, physComp.IsKinematic ? "ON" : "OFF",
+                        physComp.IsKinematic ? EditorTheme.Green : EditorTheme.Bg3, EditorTheme.AccentHover, EditorTheme.AccentDim,
                         new System.Numerics.Vector4(0,0,0,0), EditorTheme.TextPrimary, 9806))
                     {
-                        rbComp.IsKinematic = !rbComp.IsKinematic;
-                        _world.AddComponent(entity, rbComp);
+                        physComp.IsKinematic = !physComp.IsKinematic;
+                        _world.AddComponent(entity, physComp);
                     }
                     y += 24;
 
@@ -563,200 +722,184 @@ partial class Program
                     ui.SetCursor(labelCol, (y + 2) - scrollOffset); ui.Text("Freeze Pos", EditorTheme.TextMuted);
                     float freezeX = valueCol;
                     if (ui.ButtonEx(freezeX, y - scrollOffset, 28, 20, "X",
-                        rbComp.FreezePositionX ? EditorTheme.Red : EditorTheme.Bg3, EditorTheme.AccentHover, EditorTheme.AccentDim,
+                        physComp.FreezePositionX ? EditorTheme.Red : EditorTheme.Bg3, EditorTheme.AccentHover, EditorTheme.AccentDim,
                         new System.Numerics.Vector4(0,0,0,0), EditorTheme.TextPrimary, 9807))
                     {
-                        rbComp.FreezePositionX = !rbComp.FreezePositionX;
-                        _world.AddComponent(entity, rbComp);
+                        physComp.FreezePositionX = !physComp.FreezePositionX;
+                        _world.AddComponent(entity, physComp);
                     }
                     if (ui.ButtonEx(freezeX + 32, y - scrollOffset, 28, 20, "Y",
-                        rbComp.FreezePositionY ? EditorTheme.Red : EditorTheme.Bg3, EditorTheme.AccentHover, EditorTheme.AccentDim,
+                        physComp.FreezePositionY ? EditorTheme.Red : EditorTheme.Bg3, EditorTheme.AccentHover, EditorTheme.AccentDim,
                         new System.Numerics.Vector4(0,0,0,0), EditorTheme.TextPrimary, 9808))
                     {
-                        rbComp.FreezePositionY = !rbComp.FreezePositionY;
-                        _world.AddComponent(entity, rbComp);
+                        physComp.FreezePositionY = !physComp.FreezePositionY;
+                        _world.AddComponent(entity, physComp);
                     }
                     if (ui.ButtonEx(freezeX + 64, y - scrollOffset, 28, 20, "Z",
-                        rbComp.FreezePositionZ ? EditorTheme.Red : EditorTheme.Bg3, EditorTheme.AccentHover, EditorTheme.AccentDim,
+                        physComp.FreezePositionZ ? EditorTheme.Red : EditorTheme.Bg3, EditorTheme.AccentHover, EditorTheme.AccentDim,
                         new System.Numerics.Vector4(0,0,0,0), EditorTheme.TextPrimary, 9809))
                     {
-                        rbComp.FreezePositionZ = !rbComp.FreezePositionZ;
-                        _world.AddComponent(entity, rbComp);
+                        physComp.FreezePositionZ = !physComp.FreezePositionZ;
+                        _world.AddComponent(entity, physComp);
                     }
                     y += 24;
 
                     // Freeze Rotation
                     ui.SetCursor(labelCol, (y + 2) - scrollOffset); ui.Text("Freeze Rot", EditorTheme.TextMuted);
                     if (ui.ButtonEx(freezeX, y - scrollOffset, 28, 20, "X",
-                        rbComp.FreezeRotationX ? EditorTheme.Red : EditorTheme.Bg3, EditorTheme.AccentHover, EditorTheme.AccentDim,
+                        physComp.FreezeRotationX ? EditorTheme.Red : EditorTheme.Bg3, EditorTheme.AccentHover, EditorTheme.AccentDim,
                         new System.Numerics.Vector4(0,0,0,0), EditorTheme.TextPrimary, 9810))
                     {
-                        rbComp.FreezeRotationX = !rbComp.FreezeRotationX;
-                        _world.AddComponent(entity, rbComp);
+                        physComp.FreezeRotationX = !physComp.FreezeRotationX;
+                        _world.AddComponent(entity, physComp);
                     }
                     if (ui.ButtonEx(freezeX + 32, y - scrollOffset, 28, 20, "Y",
-                        rbComp.FreezeRotationY ? EditorTheme.Red : EditorTheme.Bg3, EditorTheme.AccentHover, EditorTheme.AccentDim,
+                        physComp.FreezeRotationY ? EditorTheme.Red : EditorTheme.Bg3, EditorTheme.AccentHover, EditorTheme.AccentDim,
                         new System.Numerics.Vector4(0,0,0,0), EditorTheme.TextPrimary, 9811))
                     {
-                        rbComp.FreezeRotationY = !rbComp.FreezeRotationY;
-                        _world.AddComponent(entity, rbComp);
+                        physComp.FreezeRotationY = !physComp.FreezeRotationY;
+                        _world.AddComponent(entity, physComp);
                     }
                     if (ui.ButtonEx(freezeX + 64, y - scrollOffset, 28, 20, "Z",
-                        rbComp.FreezeRotationZ ? EditorTheme.Red : EditorTheme.Bg3, EditorTheme.AccentHover, EditorTheme.AccentDim,
+                        physComp.FreezeRotationZ ? EditorTheme.Red : EditorTheme.Bg3, EditorTheme.AccentHover, EditorTheme.AccentDim,
                         new System.Numerics.Vector4(0,0,0,0), EditorTheme.TextPrimary, 9812))
                     {
-                        rbComp.FreezeRotationZ = !rbComp.FreezeRotationZ;
-                        _world.AddComponent(entity, rbComp);
+                        physComp.FreezeRotationZ = !physComp.FreezeRotationZ;
+                        _world.AddComponent(entity, physComp);
                     }
-                    y += 26;
-                }
-                
-                // Collider
-                if (_world.TryGetComponent<BlueSky.Core.ECS.Builtin.ColliderComponent>(entity, out var colComp))
-                {
-                    hasCol = true;
-                    ui.Panel(rect.X + inset, y - scrollOffset, rect.W - inset * 2, EditorTheme.SectionH, EditorTheme.Bg2);
-                    ui.Panel(rect.X + inset, y - scrollOffset, 3, EditorTheme.SectionH, EditorTheme.Teal);
-                    ui.SetCursor(labelCol + 2, (y + 8) - scrollOffset);
-                    ui.Text("Collider", EditorTheme.TextPrimary);
-                    
-                    // Remove button
-                    if (ui.ButtonEx(rect.X + rect.W - inset - 30, (y + 6) - scrollOffset, 24, 20, "×",
-                        EditorTheme.WithAlpha(EditorTheme.Red, 0.2f), EditorTheme.Red, EditorTheme.Red,
-                        new System.Numerics.Vector4(0,0,0,0), EditorTheme.Red, 9803))
-                    {
-                        _world.RemoveComponent<BlueSky.Core.ECS.Builtin.ColliderComponent>(entity);
-                    }
-                    y += EditorTheme.SectionH + EditorTheme.Pad;
+                    y += 24;
 
-                    // Type selector
+                    // ── Separator ──
+                    y += 6;
+
+                    // Collider Type selector
                     ui.SetCursor(labelCol, (y + 2) - scrollOffset); ui.Text("Type", EditorTheme.TextMuted);
                     float typeX = valueCol;
                     if (ui.ButtonEx(typeX, y - scrollOffset, 36, 20, "Box",
-                        colComp.Type == BlueSky.Core.ECS.Builtin.ColliderType.Box ? EditorTheme.Teal : EditorTheme.Bg3,
+                        physComp.Type == BlueSky.Core.ECS.Builtin.ColliderType.Box ? EditorTheme.Teal : EditorTheme.Bg3,
                         EditorTheme.AccentHover, EditorTheme.AccentDim,
                         new System.Numerics.Vector4(0,0,0,0), EditorTheme.TextPrimary, 9820))
                     {
-                        colComp.Type = BlueSky.Core.ECS.Builtin.ColliderType.Box;
-                        _world.AddComponent(entity, colComp);
+                        physComp.Type = BlueSky.Core.ECS.Builtin.ColliderType.Box;
+                        _world.AddComponent(entity, physComp);
                     }
                     if (ui.ButtonEx(typeX + 40, y - scrollOffset, 48, 20, "Sphere",
-                        colComp.Type == BlueSky.Core.ECS.Builtin.ColliderType.Sphere ? EditorTheme.Teal : EditorTheme.Bg3,
+                        physComp.Type == BlueSky.Core.ECS.Builtin.ColliderType.Sphere ? EditorTheme.Teal : EditorTheme.Bg3,
                         EditorTheme.AccentHover, EditorTheme.AccentDim,
                         new System.Numerics.Vector4(0,0,0,0), EditorTheme.TextPrimary, 9821))
                     {
-                        colComp.Type = BlueSky.Core.ECS.Builtin.ColliderType.Sphere;
-                        _world.AddComponent(entity, colComp);
+                        physComp.Type = BlueSky.Core.ECS.Builtin.ColliderType.Sphere;
+                        _world.AddComponent(entity, physComp);
                     }
                     if (ui.ButtonEx(typeX + 92, y - scrollOffset, 56, 20, "Capsule",
-                        colComp.Type == BlueSky.Core.ECS.Builtin.ColliderType.Capsule ? EditorTheme.Teal : EditorTheme.Bg3,
+                        physComp.Type == BlueSky.Core.ECS.Builtin.ColliderType.Capsule ? EditorTheme.Teal : EditorTheme.Bg3,
                         EditorTheme.AccentHover, EditorTheme.AccentDim,
                         new System.Numerics.Vector4(0,0,0,0), EditorTheme.TextPrimary, 9822))
                     {
-                        colComp.Type = BlueSky.Core.ECS.Builtin.ColliderType.Capsule;
-                        _world.AddComponent(entity, colComp);
+                        physComp.Type = BlueSky.Core.ECS.Builtin.ColliderType.Capsule;
+                        _world.AddComponent(entity, physComp);
                     }
                     y += 24;
 
                     // Size/Radius/Height based on type
-                    if (colComp.Type == BlueSky.Core.ECS.Builtin.ColliderType.Box)
+                    if (physComp.Type == BlueSky.Core.ECS.Builtin.ColliderType.Box)
                     {
                         ui.SetCursor(labelCol, (y + 2) - scrollOffset); ui.Text("Size X", EditorTheme.TextMuted);
                         ui.SetCursor(valueCol, y - scrollOffset);
-                        float sizeX = colComp.Size.X;
+                        float sizeX = physComp.Size.X;
                         if (ui.Slider(ref sizeX, 0.1f, 10f, 100, 14))
                         {
-                            colComp.Size = new System.Numerics.Vector3(sizeX, colComp.Size.Y, colComp.Size.Z);
-                            _world.AddComponent(entity, colComp);
+                            physComp.Size = new System.Numerics.Vector3(sizeX, physComp.Size.Y, physComp.Size.Z);
+                            _world.AddComponent(entity, physComp);
                         }
                         y += 20;
 
                         ui.SetCursor(labelCol, (y + 2) - scrollOffset); ui.Text("Size Y", EditorTheme.TextMuted);
                         ui.SetCursor(valueCol, y - scrollOffset);
-                        float sizeY = colComp.Size.Y;
+                        float sizeY = physComp.Size.Y;
                         if (ui.Slider(ref sizeY, 0.1f, 10f, 100, 14))
                         {
-                            colComp.Size = new System.Numerics.Vector3(colComp.Size.X, sizeY, colComp.Size.Z);
-                            _world.AddComponent(entity, colComp);
+                            physComp.Size = new System.Numerics.Vector3(physComp.Size.X, sizeY, physComp.Size.Z);
+                            _world.AddComponent(entity, physComp);
                         }
                         y += 20;
 
                         ui.SetCursor(labelCol, (y + 2) - scrollOffset); ui.Text("Size Z", EditorTheme.TextMuted);
                         ui.SetCursor(valueCol, y - scrollOffset);
-                        float sizeZ = colComp.Size.Z;
+                        float sizeZ = physComp.Size.Z;
                         if (ui.Slider(ref sizeZ, 0.1f, 10f, 100, 14))
                         {
-                            colComp.Size = new System.Numerics.Vector3(colComp.Size.X, colComp.Size.Y, sizeZ);
-                            _world.AddComponent(entity, colComp);
+                            physComp.Size = new System.Numerics.Vector3(physComp.Size.X, physComp.Size.Y, sizeZ);
+                            _world.AddComponent(entity, physComp);
                         }
                         y += 24;
                     }
-                    else if (colComp.Type == BlueSky.Core.ECS.Builtin.ColliderType.Sphere)
+                    else if (physComp.Type == BlueSky.Core.ECS.Builtin.ColliderType.Sphere)
                     {
                         ui.SetCursor(labelCol, (y + 2) - scrollOffset); ui.Text("Radius", EditorTheme.TextMuted);
                         ui.SetCursor(valueCol, y - scrollOffset);
-                        float radius = colComp.Radius;
+                        float radius = physComp.Radius;
                         if (ui.Slider(ref radius, 0.1f, 10f, 100, 14))
                         {
-                            colComp.Radius = radius;
-                            _world.AddComponent(entity, colComp);
+                            physComp.Radius = radius;
+                            _world.AddComponent(entity, physComp);
                         }
                         y += 24;
                     }
-                    else if (colComp.Type == BlueSky.Core.ECS.Builtin.ColliderType.Capsule)
+                    else if (physComp.Type == BlueSky.Core.ECS.Builtin.ColliderType.Capsule)
                     {
                         ui.SetCursor(labelCol, (y + 2) - scrollOffset); ui.Text("Radius", EditorTheme.TextMuted);
                         ui.SetCursor(valueCol, y - scrollOffset);
-                        float radius = colComp.Radius;
+                        float radius = physComp.Radius;
                         if (ui.Slider(ref radius, 0.1f, 10f, 100, 14))
                         {
-                            colComp.Radius = radius;
-                            _world.AddComponent(entity, colComp);
+                            physComp.Radius = radius;
+                            _world.AddComponent(entity, physComp);
                         }
                         y += 20;
 
                         ui.SetCursor(labelCol, (y + 2) - scrollOffset); ui.Text("Height", EditorTheme.TextMuted);
                         ui.SetCursor(valueCol, y - scrollOffset);
-                        float height = colComp.Height;
+                        float height = physComp.Height;
                         if (ui.Slider(ref height, 0.1f, 10f, 100, 14))
                         {
-                            colComp.Height = height;
-                            _world.AddComponent(entity, colComp);
+                            physComp.Height = height;
+                            _world.AddComponent(entity, physComp);
                         }
                         y += 24;
                     }
 
                     ui.SetCursor(labelCol, (y + 2) - scrollOffset); ui.Text("Is Trigger", EditorTheme.TextMuted);
-                    if (ui.ButtonEx(valueCol, y - scrollOffset, 40, 20, colComp.IsTrigger ? "ON" : "OFF",
-                        colComp.IsTrigger ? EditorTheme.Green : EditorTheme.Bg3, EditorTheme.AccentHover, EditorTheme.AccentDim,
+                    if (ui.ButtonEx(valueCol, y - scrollOffset, 40, 20, physComp.IsTrigger ? "ON" : "OFF",
+                        physComp.IsTrigger ? EditorTheme.Green : EditorTheme.Bg3, EditorTheme.AccentHover, EditorTheme.AccentDim,
                         new System.Numerics.Vector4(0,0,0,0), EditorTheme.TextPrimary, 9823))
                     {
-                        colComp.IsTrigger = !colComp.IsTrigger;
-                        _world.AddComponent(entity, colComp);
+                        physComp.IsTrigger = !physComp.IsTrigger;
+                        _world.AddComponent(entity, physComp);
                     }
                     y += 24;
 
                     ui.SetCursor(labelCol, (y + 2) - scrollOffset); ui.Text("Friction", EditorTheme.TextMuted);
                     ui.SetCursor(valueCol, y - scrollOffset);
-                    float friction = colComp.Friction;
+                    float friction = physComp.Friction;
                     if (ui.Slider(ref friction, 0f, 1f, 100, 14))
                     {
-                        colComp.Friction = friction;
-                        _world.AddComponent(entity, colComp);
+                        physComp.Friction = friction;
+                        _world.AddComponent(entity, physComp);
                     }
                     y += 20;
 
                     ui.SetCursor(labelCol, (y + 2) - scrollOffset); ui.Text("Restitution", EditorTheme.TextMuted);
                     ui.SetCursor(valueCol, y - scrollOffset);
-                    float restitution = colComp.Restitution;
+                    float restitution = physComp.Restitution;
                     if (ui.Slider(ref restitution, 0f, 1f, 100, 14))
                     {
-                        colComp.Restitution = restitution;
-                        _world.AddComponent(entity, colComp);
+                        physComp.Restitution = restitution;
+                        _world.AddComponent(entity, physComp);
                     }
                     y += 24;
                 }
-
+                
                 // ── Terrain Inspector Section ──
                 if (_world.TryGetComponent<TerrainComponent>(entity, out var terrainComp))
                 {
@@ -791,22 +934,28 @@ partial class Program
                     ui.SetCursor(labelCol, (y + 2) - scrollOffset); ui.Text("World Width", EditorTheme.TextMuted);
                     ui.SetCursor(valueCol, y - scrollOffset);
                     float worldWidth = terrainComp.WorldWidth;
-                    if (ui.Slider(ref worldWidth, 10f, 500f, 100, 14))
+                    bool worldWidthChanged = ui.Slider(ref worldWidth, 10f, 500f, 100, 14);
+                    // Only update if slider was actually moved AND value changed
+                    if (worldWidthChanged && Math.Abs(worldWidth - terrainComp.WorldWidth) > 0.01f)
                     {
                         terrainComp.WorldWidth = worldWidth;
                         terrainComp.NeedsRebuild = true;
                         _world.AddComponent(entity, terrainComp);
+                        Console.WriteLine($"[Inspector] WorldWidth changed to {worldWidth}");
                     }
                     y += 20;
 
                     ui.SetCursor(labelCol, (y + 2) - scrollOffset); ui.Text("World Height", EditorTheme.TextMuted);
                     ui.SetCursor(valueCol, y - scrollOffset);
                     float worldHeight = terrainComp.WorldHeight;
-                    if (ui.Slider(ref worldHeight, 10f, 500f, 100, 14))
+                    bool worldHeightChanged = ui.Slider(ref worldHeight, 10f, 500f, 100, 14);
+                    // Only update if slider was actually moved AND value changed
+                    if (worldHeightChanged && Math.Abs(worldHeight - terrainComp.WorldHeight) > 0.01f)
                     {
                         terrainComp.WorldHeight = worldHeight;
                         terrainComp.NeedsRebuild = true;
                         _world.AddComponent(entity, terrainComp);
+                        Console.WriteLine($"[Inspector] WorldHeight changed to {worldHeight}");
                     }
                     y += 20;
 
@@ -935,21 +1084,12 @@ partial class Program
 
                 // Add Components
                 y += 10;
-                if (!hasRb)
+                if (!hasPhysics)
                 {
-                    if (ui.ButtonEx(rect.X + inset, y - scrollOffset, rect.W - inset * 2, 24, "+ Add Rigidbody",
+                    if (ui.ButtonEx(rect.X + inset, y - scrollOffset, rect.W - inset * 2, 24, "+ Add Physics",
                         EditorTheme.Bg3, EditorTheme.Bg2, EditorTheme.Bg1, new System.Numerics.Vector4(0,0,0,0), EditorTheme.Orange, 9804))
                     {
-                        _world.AddComponent(entity, new BlueSky.Core.ECS.Builtin.RigidbodyComponent());
-                    }
-                    y += 28;
-                }
-                if (!hasCol)
-                {
-                    if (ui.ButtonEx(rect.X + inset, y - scrollOffset, rect.W - inset * 2, 24, "+ Add Collider",
-                        EditorTheme.Bg3, EditorTheme.Bg2, EditorTheme.Bg1, new System.Numerics.Vector4(0,0,0,0), EditorTheme.Teal, 9805))
-                    {
-                        _world.AddComponent(entity, new BlueSky.Core.ECS.Builtin.ColliderComponent());
+                        _world.AddComponent(entity, new BlueSky.Core.ECS.Builtin.PhysicsComponent());
                     }
                     y += 28;
                 }
@@ -959,14 +1099,169 @@ partial class Program
                 if (!hasCarController)
                 {
                     if (ui.ButtonEx(rect.X + inset, y - scrollOffset, rect.W - inset * 2, 24, "🚗 Add Car Controller",
-                        EditorTheme.WithAlpha(EditorTheme.Purple, 0.2f), 
-                        EditorTheme.WithAlpha(EditorTheme.Purple, 0.3f), 
-                        EditorTheme.WithAlpha(EditorTheme.Purple, 0.4f), 
+                        EditorTheme.WithAlpha(EditorTheme.Purple, 0.2f),
+                        EditorTheme.WithAlpha(EditorTheme.Purple, 0.3f),
+                        EditorTheme.WithAlpha(EditorTheme.Purple, 0.4f),
                         new System.Numerics.Vector4(0,0,0,0), EditorTheme.Purple, 9806))
                     {
                         _carControllerSystem?.AddCarController(entity);
                         Log("🚗 Car Controller added! It will auto-possess on next frame. Press E to exit.");
                     }
+                    y += 28;
+                }
+
+                // Check if entity has network manager
+                bool hasNetworkManager = _world.TryGetComponent<BlueSky.Core.ECS.Builtin.NetworkManagerComponent>(entity, out _);
+                if (!hasNetworkManager)
+                {
+                    if (ui.ButtonEx(rect.X + inset, y - scrollOffset, rect.W - inset * 2, 24, "🌐 Add Network Manager",
+                        EditorTheme.WithAlpha(EditorTheme.AccentCyan, 0.2f),
+                        EditorTheme.WithAlpha(EditorTheme.AccentCyan, 0.3f),
+                        EditorTheme.WithAlpha(EditorTheme.AccentCyan, 0.4f),
+                        new System.Numerics.Vector4(0,0,0,0), EditorTheme.AccentCyan, 9840))
+                    {
+                        int storIdx = BlueSky.Core.ECS.Builtin.NetworkManagerStorage.Allocate("");
+                        _world.AddComponent(entity, new BlueSky.Core.ECS.Builtin.NetworkManagerComponent
+                        {
+                            StorageIndex = storIdx,
+                            MaxPlayers = 8,
+                            ReplicationInterval = 0.1f,
+                            ReplicationTimer = 0f,
+                            PlayerCount = 0,
+                            IsHost = false,
+                            HasStartedSpawning = false
+                        });
+                        Log("🌐 Network Manager added! Configure prefab path in inspector.");
+                    }
+                    y += 28;
+                }
+
+                // Check if entity has spawn point
+                bool hasSpawnPoint = _world.TryGetComponent<BlueSky.Core.ECS.Builtin.SpawnPointComponent>(entity, out _);
+                if (!hasSpawnPoint)
+                {
+                    if (ui.ButtonEx(rect.X + inset, y - scrollOffset, rect.W - inset * 2, 24, "📍 Add Spawn Point",
+                        EditorTheme.WithAlpha(EditorTheme.Yellow, 0.2f),
+                        EditorTheme.WithAlpha(EditorTheme.Yellow, 0.3f),
+                        EditorTheme.WithAlpha(EditorTheme.Yellow, 0.4f),
+                        new System.Numerics.Vector4(0,0,0,0), EditorTheme.Yellow, 9841))
+                    {
+                        _world.AddComponent(entity, new BlueSky.Core.ECS.Builtin.SpawnPointComponent
+                        {
+                            Index = 0,
+                            IsOccupied = false,
+                            OccupantEntityId = -1
+                        });
+                        Log("📍 Spawn Point added! Set its index in inspector.");
+                    }
+                    y += 28;
+                }
+
+                // ── NetworkManager Inspector Section ──
+                if (_world.TryGetComponent<BlueSky.Core.ECS.Builtin.NetworkManagerComponent>(entity, out var nmComp))
+                {
+                    ui.Panel(rect.X + inset, y - scrollOffset, rect.W - inset * 2, EditorTheme.SectionH, EditorTheme.Bg2);
+                    ui.Panel(rect.X + inset, y - scrollOffset, 3, EditorTheme.SectionH, EditorTheme.AccentCyan);
+                    ui.SetCursor(labelCol + 2, (y + 8) - scrollOffset);
+                    ui.Text("Network Manager", EditorTheme.TextPrimary);
+
+                    // Remove button
+                    if (ui.ButtonEx(rect.X + rect.W - inset - 30, (y + 6) - scrollOffset, 24, 20, "×",
+                        EditorTheme.WithAlpha(EditorTheme.Red, 0.2f), EditorTheme.Red, EditorTheme.Red,
+                        new System.Numerics.Vector4(0,0,0,0), EditorTheme.Red, 9842))
+                    {
+                        BlueSky.Core.ECS.Builtin.NetworkManagerStorage.SetPrefabPath(nmComp.StorageIndex, "");
+                        _world.RemoveComponent<BlueSky.Core.ECS.Builtin.NetworkManagerComponent>(entity);
+                    }
+                    y += EditorTheme.SectionH + EditorTheme.Pad;
+
+                    // Prefab Path (drop target for .bseprefab files)
+                    ui.SetCursor(labelCol, (y + 2) - scrollOffset); ui.Text("Player Prefab", EditorTheme.TextMuted);
+                    string prefabPath = BlueSky.Core.ECS.Builtin.NetworkManagerStorage.GetPrefabPath(nmComp.StorageIndex);
+                    string prefabName = string.IsNullOrEmpty(prefabPath) ? "None" : Path.GetFileNameWithoutExtension(prefabPath);
+                    float pfFieldX = valueCol - 6;
+                    float pfFieldY = (y - 2) - scrollOffset;
+                    float pfFieldW = rect.W - (valueCol - rect.X) - inset + 6;
+                    float pfFieldH = 22;
+
+                    // Highlight when dragging a .bseprefab file over this field
+                    bool isOverDropZone = _isDraggingAsset && _draggedAssetPath != null &&
+                        Path.GetExtension(_draggedAssetPath).Equals(".bseprefab", StringComparison.OrdinalIgnoreCase) &&
+                        ui.IsHovering(pfFieldX, pfFieldY, pfFieldW, pfFieldH);
+
+                    var pfBg = isOverDropZone ? EditorTheme.WithAlpha(EditorTheme.AccentCyan, 0.25f) : EditorTheme.Bg0;
+                    var pfBorder = isOverDropZone ? EditorTheme.AccentCyan : EditorTheme.Border1;
+                    ui.RoundedPanel(pfFieldX, pfFieldY, pfFieldW, pfFieldH, pfBg, EditorTheme.InputRadius);
+                    EditorChrome.Stroke(ui, pfFieldX, pfFieldY, pfFieldW, pfFieldH, pfBorder);
+                    ui.SetCursor(valueCol, (y + 2) - scrollOffset);
+                    if (isOverDropZone)
+                    {
+                        ui.Text("Drop .bseprefab here", EditorTheme.AccentCyan);
+                    }
+                    else
+                    {
+                        ui.Text(prefabName.Length > 20 ? prefabName[..17] + "..." : prefabName,
+                            !string.IsNullOrEmpty(prefabPath) ? EditorTheme.AccentCyan : EditorTheme.TextDisabled);
+                    }
+                    // Store drop zone bounds (screen coordinates) for drop detection
+                    _nmPrefabDropZone = new System.Numerics.Vector4(pfFieldX, pfFieldY, pfFieldW, pfFieldH);
+                    y += 24;
+
+                    // Max Players slider
+                    ui.SetCursor(labelCol, (y + 2) - scrollOffset); ui.Text("Max Players", EditorTheme.TextMuted);
+                    ui.SetCursor(valueCol, y - scrollOffset);
+                    float maxPlayers = nmComp.MaxPlayers;
+                    if (ui.Slider(ref maxPlayers, 2f, 32f, 100, 14))
+                    {
+                        nmComp.MaxPlayers = (int)maxPlayers;
+                        _world.AddComponent(entity, nmComp);
+                    }
+                    y += 24;
+
+                    // Replication Interval slider
+                    ui.SetCursor(labelCol, (y + 2) - scrollOffset); ui.Text("Replication", EditorTheme.TextMuted);
+                    ui.SetCursor(valueCol, y - scrollOffset);
+                    float replInterval = nmComp.ReplicationInterval;
+                    if (ui.Slider(ref replInterval, 0.01f, 1.0f, 100, 14))
+                    {
+                        nmComp.ReplicationInterval = replInterval;
+                        _world.AddComponent(entity, nmComp);
+                    }
+                    y += 28;
+                }
+
+                // ── SpawnPoint Inspector Section ──
+                if (_world.TryGetComponent<BlueSky.Core.ECS.Builtin.SpawnPointComponent>(entity, out var spComp))
+                {
+                    ui.Panel(rect.X + inset, y - scrollOffset, rect.W - inset * 2, EditorTheme.SectionH, EditorTheme.Bg2);
+                    ui.Panel(rect.X + inset, y - scrollOffset, 3, EditorTheme.SectionH, EditorTheme.Yellow);
+                    ui.SetCursor(labelCol + 2, (y + 8) - scrollOffset);
+                    ui.Text("Spawn Point", EditorTheme.TextPrimary);
+
+                    // Remove button
+                    if (ui.ButtonEx(rect.X + rect.W - inset - 30, (y + 6) - scrollOffset, 24, 20, "×",
+                        EditorTheme.WithAlpha(EditorTheme.Red, 0.2f), EditorTheme.Red, EditorTheme.Red,
+                        new System.Numerics.Vector4(0,0,0,0), EditorTheme.Red, 9843))
+                    {
+                        _world.RemoveComponent<BlueSky.Core.ECS.Builtin.SpawnPointComponent>(entity);
+                    }
+                    y += EditorTheme.SectionH + EditorTheme.Pad;
+
+                    // Spawn Index
+                    ui.SetCursor(labelCol, (y + 2) - scrollOffset); ui.Text("Index", EditorTheme.TextMuted);
+                    ui.SetCursor(valueCol, y - scrollOffset);
+                    float spIndex = spComp.Index;
+                    if (ui.Slider(ref spIndex, 0f, 15f, 100, 14))
+                    {
+                        spComp.Index = (int)spIndex;
+                        _world.AddComponent(entity, spComp);
+                    }
+                    y += 24;
+
+                    // Occupied status (read-only)
+                    ui.SetCursor(labelCol, (y + 2) - scrollOffset); ui.Text("Occupied", EditorTheme.TextMuted);
+                    ui.SetCursor(valueCol, (y + 2) - scrollOffset);
+                    ui.Text(spComp.IsOccupied ? "Yes" : "No", spComp.IsOccupied ? EditorTheme.Orange : EditorTheme.TextSecondary);
                     y += 28;
                 }
             }
@@ -977,12 +1272,12 @@ partial class Program
         // Component count pinned to bottom
         ui.Panel(rect.X + inset, rect.Y + rect.H - 28, rect.W - inset * 2, 1, EditorTheme.Border1);
         ui.SetCursor(labelCol, rect.Y + rect.H - 20);
-        int compCount = (hasMesh ? 1 : 0) + (hasScript ? 1 : 0) + (hasRb ? 1 : 0) + (hasCol ? 1 : 0) + 1; // +1 for transform
+        int compCount = (hasMesh ? 1 : 0) + (hasScript ? 1 : 0) + (hasPhysics ? 1 : 0) + 1; // +1 for transform
         ui.Text($"{compCount} components", EditorTheme.TextDisabled);
     }
 
 
-    private static void DrawContentBrowserPanel(NotBSUI ui, DockRect rect)
+    private static void DrawContentBrowserPanel(EditorUI ui, DockRect rect)
     {
 
         // Map to centralized theme colors
@@ -1043,18 +1338,6 @@ partial class Program
             textPrimary, importBtnId))
         {
             ImportFilesDialog();
-        }
-
-        // Create Material Button — right-aligned in toolbar
-        uint createMaterialBtnId = 8002;
-        if (ui.ButtonEx(rect.X + rect.W - 190, rect.Y + (toolbarH - 24) / 2, 86, 24, "+ Material",
-            accentPurple,
-            new System.Numerics.Vector4(0.6f, 0.4f, 1.0f, 1f), // hover
-            new System.Numerics.Vector4(0.5f, 0.3f, 0.9f, 1f), // pressed
-            new System.Numerics.Vector4(0, 0, 0, 0.4f), // shadow
-            textPrimary, createMaterialBtnId))
-        {
-            CreateNewMaterial();
         }
 
         // ── SIDEBAR ─────────────────────────────────────────────────────────
@@ -1121,15 +1404,29 @@ partial class Program
         float itemW = 104, itemH = 116;
         float gap = 10;
 
-        if (string.IsNullOrEmpty(_currentBrowserDir) || !Directory.Exists(_currentBrowserDir))
+        if (string.IsNullOrEmpty(_currentBrowserDir))
         {
             _currentBrowserDir = ProjectManager.AssetsDir ?? "";
         }
 
-        if (!string.IsNullOrEmpty(_currentBrowserDir) && Directory.Exists(_currentBrowserDir))
+        var browserListing = string.IsNullOrEmpty(_currentBrowserDir)
+            ? null
+            : Assets.GetContentBrowserListing(_currentBrowserDir);
+
+        if (browserListing == null)
         {
-            string[] dirs = Directory.GetDirectories(_currentBrowserDir);
-            string[] files = Directory.GetFiles(_currentBrowserDir);
+            ui.SetCursor(contentX + 18, gridY + 12);
+            ui.Text(string.IsNullOrEmpty(_currentBrowserDir) ? "Open a project to browse assets" : "Loading folder…", textMuted);
+        }
+        else if (browserListing.Error != null)
+        {
+            ui.SetCursor(contentX + 18, gridY + 12);
+            ui.Text($"Could not read folder: {browserListing.Error}", EditorTheme.Red);
+        }
+        else
+        {
+            string[] dirs = browserListing.Directories;
+            string[] files = browserListing.Files;
 
             float cx = contentX + 16;
             float cy = gridY;
@@ -1165,14 +1462,14 @@ partial class Program
                         if (_doubleClickTarget == backId && (now - _lastClickTime) < 0.3)
                         {
                             var parentDir = Directory.GetParent(_currentBrowserDir)?.FullName;
-                            if (parentDir != null && parentDir.StartsWith(ProjectManager.AssetsDir))
+                            if (parentDir != null && parentDir.StartsWith(ProjectManager.AssetsDir ?? ""))
                             {
                                 _currentBrowserDir = parentDir;
                                 _selectedAssetIndex = -1;
                             }
                             else
                             {
-                                _currentBrowserDir = ProjectManager.AssetsDir;
+                                _currentBrowserDir = ProjectManager.AssetsDir ?? "";
                                 _selectedAssetIndex = -1;
                             }
                         }
@@ -1183,10 +1480,6 @@ partial class Program
                         }
                     }
                     
-                    // Back Icon
-                    float ix = cx + (itemW - 48) / 2;
-                    float iy = drawCy + 16;
-                    ui.Panel(ix + 12, iy + 6, 24, 24, textSecondary); // Placeholder back icon indicator
                     ui.SetCursor(cx + 8, drawCy + itemH - 24);
                     ui.Text("<- Back", textPrimary);
                 }
@@ -1294,9 +1587,11 @@ partial class Program
                 string ext = Path.GetExtension(file).ToLower();
                 bool isBlueAsset = ext == ".blueskyasset";
                 bool isMesh = ext == ".obj" || ext == ".fbx" || ext == ".gltf";
-                bool isTexture = ext == ".png" || ext == ".jpg" || ext == ".jpeg";
+                bool isTexture = ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".bmp" || ext == ".tga";
                 bool isCode = ext == ".cs" || ext == ".blueprint";
                 bool isTeaScript = ext == ".tea";
+                bool isBsphy = ext == ".bsphy";
+                bool isStratamat = ext == ".stratamat";
                 
                 // Asset type info for tooltip
                 string assetType = "File";
@@ -1315,28 +1610,34 @@ partial class Program
                     new System.Numerics.Vector4(0.28f, 0.48f, 0.78f, 0.5f)))
                 {
                     _selectedAssetIndex = (int)cardId;
+                    _dragPos = ui.MousePosition; // record click origin for drag threshold
                     Log($"Selected file: {Path.GetFileName(file)}");
                     
-                    // Double-click detection for .tea files and Material assets
+                    // Double-click detection for .tea files
                     double now = ui.Time;
                     if (_doubleClickTarget == cardId && (now - _lastClickTime) < 0.3)
                     {
+                        Console.WriteLine($"[StrataDbg] double-click: file={Path.GetFileName(file)} ext={ext} isStratamat={isStratamat}");
                         if (isTeaScript)
                         {
                             OpenScriptEditor(file);
+                        }
+                        else if (isStratamat)
+                        {
+                            OpenStrataMaterial(file);
                         }
                         else if (isBlueAsset)
                         {
                             var header = BlueSky.Core.Assets.BlueAsset.LoadHeader(file);
                             if (header != null)
                             {
-                                if (header.Type == BlueSky.Core.Assets.AssetType.Material)
-                                {
-                                    OpenMaterialEditor(file);
-                                }
-                                else if (header.Type == BlueSky.Core.Assets.AssetType.StaticMesh || header.Type == BlueSky.Core.Assets.AssetType.Mesh)
+                                if (header.Type == BlueSky.Core.Assets.AssetType.StaticMesh || header.Type == BlueSky.Core.Assets.AssetType.Mesh)
                                 {
                                     OpenStaticMeshEditor(file);
+                                }
+                                else if (header.Type == BlueSky.Core.Assets.AssetType.SkeletalMesh)
+                                {
+                                    OpenSkeletalMeshEditor(file);
                                 }
                             }
                         }
@@ -1349,14 +1650,20 @@ partial class Program
                 }
 
                 // --- Drag and Drop initiation ---
-                if (_selectedAssetIndex == (int)cardId && 
-                    ui.IsHovering(cx, drawCy, itemW, itemH) && 
-                    ui.IsMouseDown)
+                if (ui.IsHovering(cx, drawCy, itemW, itemH) && ui.IsMouseDown)
                 {
-                    // If moving distance > 5
+                    // First mouse-down frame on this card: select it and record click origin
+                    if (_selectedAssetIndex != (int)cardId && !_isDraggingAsset)
+                    {
+                        _selectedAssetIndex = (int)cardId;
+                        _dragPos = ui.MousePosition;
+                    }
+
+                    // If moved more than 5px from click origin, start dragging
                     if (System.Numerics.Vector2.Distance(ui.MousePosition, _dragPos) > 5 && !_isDraggingAsset)
                     {
-                        if (isBlueAsset || isTeaScript)
+                        bool isPrefab = ext == ".bseprefab";
+                        if (isBlueAsset || isTeaScript || isPrefab || isBsphy || isStratamat)
                         {
                             _isDraggingAsset = true;
                             _draggedAssetPath = file;
@@ -1371,6 +1678,7 @@ partial class Program
                 else if (isMesh) typeBorder = accentBlue;
                 else if (isTexture) typeBorder = accentPurple;
                 else if (isTeaScript) typeBorder = accentGreen;
+                else if (isBsphy) typeBorder = EditorTheme.Orange;
                 else if (isBlueAsset) typeBorder = accentBlueLight;
                 ui.Panel(cx, drawCy, itemW, 2, typeBorder);
 
@@ -1387,7 +1695,7 @@ partial class Program
                 
                 if (isBlueAsset)
                 {
-                    var header = BlueSky.Core.Assets.BlueAsset.LoadHeader(file);
+                    var header = Assets.GetAssetHeader(file);
                     if (header != null)
                     {
                         displayLabel = header.AssetName;
@@ -1405,12 +1713,6 @@ partial class Program
                             assetType = "Skeletal Mesh";
                             assetSubtype = "3D Model (Animated)";
                             typeColor = new System.Numerics.Vector4(0.5f, 0.8f, 1.0f, 1f); // Light blue
-                        }
-                        else if (header.Type == BlueSky.Core.Assets.AssetType.Material)
-                        {
-                            assetType = "Material";
-                            assetSubtype = "Rendering Material";
-                            typeColor = new System.Numerics.Vector4(0.8f, 0.5f, 1.0f, 1f); // Purple
                         }
                         else if (header.Type == BlueSky.Core.Assets.AssetType.Texture)
                         {
@@ -1444,6 +1746,18 @@ partial class Program
                     assetType = "Code";
                     assetSubtype = "Source File";
                     typeColor = new System.Numerics.Vector4(0.5f, 0.9f, 0.7f, 1f); // Light green
+                }
+                else if (isBsphy)
+                {
+                    assetType = "Physics Asset";
+                    assetSubtype = "Skeletal Collision Data";
+                    typeColor = EditorTheme.Orange;
+                }
+                else if (isStratamat)
+                {
+                    assetType = "Strata Material";
+                    assetSubtype = ".stratamat surface";
+                    typeColor = new System.Numerics.Vector4(1.0f, 0.55f, 0.15f, 1f); // Strata orange
                 }
 
                 if (isMesh)
@@ -1492,6 +1806,14 @@ partial class Program
                     ui.Panel(ix + 6, iy + 6, 24, 3, accentGreen);
                     ui.Panel(ix + 6, iy + 14, 20, 2, new System.Numerics.Vector4(0.55f, 0.92f, 0.70f, 0.7f));
                     ui.Panel(ix + 6, iy + 22, 24, 2, new System.Numerics.Vector4(0.55f, 0.92f, 0.70f, 0.4f));
+                }
+                else if (isBsphy)
+                {
+                    // Physics asset icon - sphere with wireframe
+                    ui.Shadow(ix + 2, iy + 3, 40, 36, 2, 3, 0.2f);
+                    ui.Circle(ix + 20, iy + 18, 16, EditorTheme.Orange, true);
+                    ui.Circle(ix + 20, iy + 18, 16, EditorTheme.WithAlpha(EditorTheme.Orange, 0.6f), false);
+                    ui.Circle(ix + 20, iy + 18, 10, EditorTheme.WithAlpha(EditorTheme.Orange, 0.3f), false);
                 }
                 else
                 {
@@ -1601,6 +1923,18 @@ partial class Program
 
         ui.SetCursor(rect.X + 16, sy + 6);
         ui.Text("BlueSky Engine  —  A game engine for the ease of Development", textMuted);
+        
+        // Standalone status indicator (multi-instance aware)
+        if (_standalonePlay?.IsRunning ?? false)
+        {
+            var pids = _standalonePlay.ProcessIds;
+            int pidCount = pids.Count();
+            string statusText = pidCount > 1
+                ? $"● Standalone ({pidCount} instances)"
+                : $"● Standalone (PID: {_standalonePlay?.ProcessId})";
+            ui.SetCursor(rect.X + rect.W - 280, sy + 6);
+            ui.Text(statusText, accentGreen);
+        }
 
         ui.SetCursor(rect.X + rect.W - 90, sy + 6);
         ui.Text("● Ready", accentGreen);
@@ -1616,7 +1950,7 @@ partial class Program
             _showContextMenu = true;
             _contextMenuX = ui.MousePosition.X;
             _contextMenuY = ui.MousePosition.Y;
-            _contextMenuPath = _currentBrowserDir;
+            _contextMenuPath = _currentBrowserDir ?? "";
         }
         
         // Draw context menu
@@ -1626,7 +1960,7 @@ partial class Program
         }
     }
 
-    private static void DrawTerrainBrushButton(NotBSUI ui, float x, float y, string label, BrushMode mode, uint id)
+    private static void DrawTerrainBrushButton(EditorUI ui, float x, float y, string label, BrushMode mode, uint id)
     {
         bool active = _terrainBrushMode == mode;
         if (ui.ButtonEx(x, y, 60, 20, label,
@@ -1638,7 +1972,7 @@ partial class Program
         }
     }
 
-    private static void DrawConsolePanel(NotBSUI ui, DockRect rect)
+    private static void DrawConsolePanel(EditorUI ui, DockRect rect)
     {
         ui.Panel(rect.X, rect.Y, rect.W, rect.H, EditorTheme.Bg1);
 

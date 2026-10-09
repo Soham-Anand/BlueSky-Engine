@@ -28,7 +28,10 @@ namespace BlueSky.Rendering
         
         // Configuration
         private float _cameraSpeed = 10.0f; // Increased for better feel
-        private float _mouseSensitivity = 0.1f; // Increased sensitivity
+        // The input layer already provides relative mouse deltas. Keep this
+        // at the scale used by the stable editor camera path; applying a
+        // second tiny scale makes the camera feel effectively frozen.
+        private float _mouseSensitivity = 0.1f;
         
         private const float DEG2RAD = MathF.PI / 180f;
         
@@ -214,7 +217,14 @@ namespace BlueSky.Rendering
             }
 
             _renderer.BeginFrame(0.1f, 0.1f, 0.1f);
-            _renderer.RenderScene(_world, _camera, _cameraTransform);
+            try
+            {
+                _renderer.RenderScene(_world, _camera, _cameraTransform);
+            }
+            finally
+            {
+                _renderer.EndFrame();
+            }
         }
 
         public Entity GetCameraEntity() => _cameraEntity;
@@ -341,193 +351,4 @@ namespace BlueSky.Rendering
         }
     }
 
-    public static class Primitives
-    {
-        public static (float[] vertices, uint[] indices) CreateCube(float size = 1.0f)
-        {
-            var s = size * 0.5f;
-            var vertices = new float[]
-            {
-                // Front face
-                -s, -s,  s,  0,  0,  1,  0, 0,
-                 s, -s,  s,  0,  0,  1,  1, 0,
-                 s,  s,  s,  0,  0,  1,  1, 1,
-                -s,  s,  s,  0,  0,  1,  0, 1,
-                
-                // Back face
-                -s, -s, -s,  0,  0, -1,  1, 0,
-                -s,  s, -s,  0,  0, -1,  1, 1,
-                 s,  s, -s,  0,  0, -1,  0, 1,
-                 s, -s, -s,  0,  0, -1,  0, 0,
-                
-                // Top face
-                -s,  s, -s,  0,  1,  0,  0, 1,
-                -s,  s,  s,  0,  1,  0,  0, 0,
-                 s,  s,  s,  0,  1,  0,  1, 0,
-                 s,  s, -s,  0,  1,  0,  1, 1,
-                
-                // Bottom face
-                -s, -s, -s,  0, -1,  0,  0, 0,
-                 s, -s, -s,  0, -1,  0,  1, 0,
-                 s, -s,  s,  0, -1,  0,  1, 1,
-                -s, -s,  s,  0, -1,  0,  0, 1,
-                
-                // Right face
-                 s, -s, -s,  1,  0,  0,  1, 0,
-                 s,  s, -s,  1,  0,  0,  1, 1,
-                 s,  s,  s,  1,  0,  0,  0, 1,
-                 s, -s,  s,  1,  0,  0,  0, 0,
-                
-                // Left face
-                -s, -s, -s, -1,  0,  0,  0, 0,
-                -s, -s,  s, -1,  0,  0,  1, 0,
-                -s,  s,  s, -1,  0,  0,  1, 1,
-                -s,  s, -s, -1,  0,  0,  0, 1
-            };
-
-            var indices = new uint[]
-            {
-                0,  1,  2,  0,  2,  3,   // Front
-                4,  5,  6,  4,  6,  7,   // Back
-                8,  9,  10, 8,  10, 11,  // Top
-                12, 13, 14, 12, 14, 15,  // Bottom
-                16, 17, 18, 16, 18, 19,  // Right
-                20, 21, 22, 20, 22, 23   // Left
-            };
-
-            return (vertices, indices);
-        }
-        
-        /// <summary>
-        /// Creates a smooth cube with shared vertices and averaged normals for better shading
-        /// </summary>
-        public static (float[] vertices, uint[] indices) CreateSmoothCube(float size = 1.0f)
-        {
-            var s = size * 0.5f;
-            
-            // Use shared vertices (8 corners instead of 24 separate vertices)
-            var positions = new Vector3[]
-            {
-                new Vector3(-s, -s, -s), // 0: left-bottom-back
-                new Vector3( s, -s, -s), // 1: right-bottom-back
-                new Vector3( s,  s, -s), // 2: right-top-back
-                new Vector3(-s,  s, -s), // 3: left-top-back
-                new Vector3(-s, -s,  s), // 4: left-bottom-front
-                new Vector3( s, -s,  s), // 5: right-bottom-front
-                new Vector3( s,  s,  s), // 6: right-top-front
-                new Vector3(-s,  s,  s)  // 7: left-top-front
-            };
-            
-            // Calculate smooth normals by averaging face normals at each vertex
-            var normals = new Vector3[8];
-            
-            // Each vertex normal is the average of its adjacent face normals
-            normals[0] = new Vector3(-1, -1, -1).Normalize(); // left + bottom + back
-            normals[1] = new Vector3( 1, -1, -1).Normalize(); // right + bottom + back
-            normals[2] = new Vector3( 1,  1, -1).Normalize(); // right + top + back
-            normals[3] = new Vector3(-1,  1, -1).Normalize(); // left + top + back
-            normals[4] = new Vector3(-1, -1,  1).Normalize(); // left + bottom + front
-            normals[5] = new Vector3( 1, -1,  1).Normalize(); // right + bottom + front
-            normals[6] = new Vector3( 1,  1,  1).Normalize(); // right + top + front
-            normals[7] = new Vector3(-1,  1,  1).Normalize(); // left + top + front
-            
-            // Texture coordinates for each vertex
-            var texCoords = new Vector2[]
-            {
-                new Vector2(0, 0), new Vector2(1, 0), new Vector2(1, 1), new Vector2(0, 1),
-                new Vector2(0, 0), new Vector2(1, 0), new Vector2(1, 1), new Vector2(0, 1)
-            };
-            
-            // Pack into vertex array (position + normal + texcoord = 8 floats per vertex)
-            var vertices = new float[8 * 8];
-            for (int i = 0; i < 8; i++)
-            {
-                int offset = i * 8;
-                vertices[offset + 0] = positions[i].X;
-                vertices[offset + 1] = positions[i].Y;
-                vertices[offset + 2] = positions[i].Z;
-                vertices[offset + 3] = normals[i].X;
-                vertices[offset + 4] = normals[i].Y;
-                vertices[offset + 5] = normals[i].Z;
-                vertices[offset + 6] = texCoords[i].X;
-                vertices[offset + 7] = texCoords[i].Y;
-            }
-            
-            // Indices for the 12 triangles (6 faces * 2 triangles each)
-            var indices = new uint[]
-            {
-                // Front face (z = +s)
-                4, 5, 6,  4, 6, 7,
-                
-                // Back face (z = -s)
-                1, 0, 3,  1, 3, 2,
-                
-                // Top face (y = +s)
-                3, 7, 6,  3, 6, 2,
-                
-                // Bottom face (y = -s)
-                0, 1, 5,  0, 5, 4,
-                
-                // Right face (x = +s)
-                1, 2, 6,  1, 6, 5,
-                
-                // Left face (x = -s)
-                0, 4, 7,  0, 7, 3
-            };
-            
-            return (vertices, indices);
-        }
-
-        public static (float[] vertices, uint[] indices) CreateSphere(float radius = 1.0f, int segments = 32, int rings = 16)
-        {
-            var vertices = new System.Collections.Generic.List<float>();
-            var indices = new System.Collections.Generic.List<uint>();
-
-            for (int ring = 0; ring <= rings; ring++)
-            {
-                float theta = ring * MathF.PI / rings;
-                float sinTheta = MathF.Sin(theta);
-                float cosTheta = MathF.Cos(theta);
-
-                for (int segment = 0; segment <= segments; segment++)
-                {
-                    float phi = segment * 2 * MathF.PI / segments;
-                    float sinPhi = MathF.Sin(phi);
-                    float cosPhi = MathF.Cos(phi);
-
-                    float x = cosPhi * sinTheta;
-                    float y = cosTheta;
-                    float z = sinPhi * sinTheta;
-
-                    vertices.Add(radius * x);
-                    vertices.Add(radius * y);
-                    vertices.Add(radius * z);
-                    vertices.Add(x);
-                    vertices.Add(y);
-                    vertices.Add(z);
-                    vertices.Add((float)segment / segments);
-                    vertices.Add((float)ring / rings);
-                }
-            }
-
-            for (int ring = 0; ring < rings; ring++)
-            {
-                for (int segment = 0; segment < segments; segment++)
-                {
-                    uint current = (uint)(ring * (segments + 1) + segment);
-                    uint next = current + (uint)(segments + 1);
-
-                    indices.Add(current);
-                    indices.Add(next);
-                    indices.Add(current + 1);
-
-                    indices.Add(current + 1);
-                    indices.Add(next);
-                    indices.Add(next + 1);
-                }
-            }
-
-            return (vertices.ToArray(), indices.ToArray());
-        }
-    }
 }

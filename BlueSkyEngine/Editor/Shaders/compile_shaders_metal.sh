@@ -72,22 +72,9 @@ else
 fi
 
 # ============================================================================
-# Compile pbr_optimized.metal (optional)
-# ============================================================================
-echo "[4/6] Compiling pbr_optimized.metal..."
-if [ -f "pbr_optimized.metal" ]; then
-    xcrun -sdk macosx metal -c pbr_optimized.metal -o pbr_optimized.air
-    xcrun -sdk macosx metallib pbr_optimized.air -o pbr_optimized.metallib
-    rm -f pbr_optimized.air
-    echo "  ✓ pbr_optimized.metallib created"
-else
-    echo "  ⊘ pbr_optimized.metal not found (optional)"
-fi
-
-# ============================================================================
 # Compile PolarisUpscale.metal (AVX Ray Tracing edge-aware upscaler)
 # ============================================================================
-echo "[5/6] Compiling PolarisUpscale.metal..."
+echo "[4/4] Compiling PolarisUpscale.metal..."
 POLARIS_SRC="../../Rendering/Shaders/PolarisUpscale.metal"
 if [ -f "$POLARIS_SRC" ]; then
     xcrun -sdk macosx metal -c "$POLARIS_SRC" -o PolarisUpscale.air
@@ -97,19 +84,6 @@ if [ -f "$POLARIS_SRC" ]; then
 else
     echo "  ✗ PolarisUpscale.metal not found at $POLARIS_SRC"
     exit 1
-fi
-
-# ============================================================================
-# Compile and copy EasePlus shaders
-# ============================================================================
-echo "[6/6] Compiling EasePlus shaders..."
-EASEPLUS_DIR="../../Rendering/EasePlus/Shaders"
-if [ -d "$EASEPLUS_DIR" ]; then
-    (cd "$EASEPLUS_DIR" && chmod +x build_metal_shaders.sh && ./build_metal_shaders.sh)
-    cp "$EASEPLUS_DIR"/*.metallib .
-    echo "  ✓ EasePlus shaders compiled and copied successfully"
-else
-    echo "  ⚠ EasePlus shader directory not found at $EASEPLUS_DIR"
 fi
 
 echo ""

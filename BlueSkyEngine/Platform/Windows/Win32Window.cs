@@ -12,11 +12,43 @@ public class Win32Window : IWindow
     private readonly System.Diagnostics.Stopwatch _timer;
     private double _lastTime;
     private bool _isVisible;
-    private bool _isFocused;
-    
-    public string Title { get; set; }
-    public Vector2 Size { get; set; }
-    public Vector2 Position { get; set; }
+    private bool _isFocused = false;
+    private string _title;
+    private Vector2 _size;
+    private Vector2 _position;
+
+    public string Title
+    {
+        get => _title;
+        set
+        {
+            _title = value ?? string.Empty;
+            if (_hwnd != IntPtr.Zero)
+                SetWindowTextW(_hwnd, _title);
+        }
+    }
+
+    public Vector2 Size
+    {
+        get => _size;
+        set
+        {
+            _size = new Vector2(MathF.Max(1, value.X), MathF.Max(1, value.Y));
+            if (_hwnd != IntPtr.Zero)
+                SetWindowPos(_hwnd, IntPtr.Zero, 0, 0, (int)_size.X, (int)_size.Y, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
+
+    public Vector2 Position
+    {
+        get => _position;
+        set
+        {
+            _position = value;
+            if (_hwnd != IntPtr.Zero)
+                SetWindowPos(_hwnd, IntPtr.Zero, (int)value.X, (int)value.Y, 0, 0, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSIZE);
+        }
+    }
     public Vector2 FramebufferSize => Size;
     public bool IsVisible => _isVisible;
     public bool IsFocused => _isFocused;
@@ -34,14 +66,21 @@ public class Win32Window : IWindow
     internal event Action<uint, IntPtr, IntPtr>? OnMessage;
     
     /// <summary>
+    /// Fired after all pending Win32 messages have been dispatched.
+    /// Used by Win32Input to defer SetCursorPos outside the WM_MOUSEMOVE handler.
+    /// </summary>
+    internal event Action? PostProcessEvents;
+    
+    /// <summary>
     /// Fired when files are dragged and dropped onto the window.
     /// </summary>
     public event Action<string[]>? FilesDropped;
     
     public Win32Window(WindowOptions options)
     {
-        Title = options.Title;
-        Size = new Vector2(options.Width, options.Height);
+        _title = options.Title ?? string.Empty;
+        _size = new Vector2(Math.Max(1, options.Width), Math.Max(1, options.Height));
+        _position = Vector2.Zero;
         _className = $"BlueSkyWindow_{Guid.NewGuid():N}";
         _timer = System.Diagnostics.Stopwatch.StartNew();
         
@@ -67,10 +106,22 @@ public class Win32Window : IWindow
             throw new Exception($"Failed to register window class: {Marshal.GetLastWin32Error()}");
         
         // Use WS_EX_ACCEPTFILES to enable drag-and-drop
+        uint style = options.Fullscreen ? WS_POPUP : WS_OVERLAPPEDWINDOW;
+        if (!options.Fullscreen && !options.Resizable)
+            style &= ~(WS_THICKFRAME | WS_MAXIMIZEBOX);
+        if (options.StartVisible)
+            style |= WS_VISIBLE;
+
+        int width = options.Fullscreen ? GetSystemMetrics(0) : (int)_size.X;
+        int height = options.Fullscreen ? GetSystemMetrics(1) : (int)_size.Y;
+        int x = options.Fullscreen ? 0 : (options.X == -1 ? Math.Max(0, (GetSystemMetrics(0) - width) / 2) : options.X);
+        int y = options.Fullscreen ? 0 : (options.Y == -1 ? Math.Max(0, (GetSystemMetrics(1) - height) / 2) : options.Y);
+        _position = new Vector2(x, y);
+
         _hwnd = CreateWindowExW(
-            WS_EX_ACCEPTFILES, _className, options.Title,
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            100, 100, (int)options.Width, (int)options.Height,
+            WS_EX_ACCEPTFILES, _className, _title,
+            style,
+            x, y, width, height,
             IntPtr.Zero, IntPtr.Zero, hInstance, IntPtr.Zero);
         
         if (_hwnd == IntPtr.Zero)
@@ -79,16 +130,15 @@ public class Win32Window : IWindow
         // Enable drag-and-drop file acceptance
         DragAcceptFiles(_hwnd, true);
         
-        ShowWindow(_hwnd, SW_SHOW);
-        UpdateWindow(_hwnd);
-        
-        _isVisible = true;
-        Console.WriteLine("[Win32Window] Window created and shown (drag-drop enabled)");
+        if (options.StartVisible)
+            Show();
+        Console.WriteLine($"[Win32Window] Window created (fullscreen={options.Fullscreen}, visible={options.StartVisible}, drag-drop enabled)");
     }
     
     public void Show()
     {
         ShowWindow(_hwnd, SW_SHOW);
+        UpdateWindow(_hwnd);
         _isVisible = true;
     }
     
@@ -112,6 +162,10 @@ public class Win32Window : IWindow
             DispatchMessageW(ref msg);
         }
         
+        // Fire deferred events after all messages are dispatched.
+        // Win32Input uses this to warp the cursor without re-entering WM_MOUSEMOVE.
+        PostProcessEvents?.Invoke();
+        
         if (!IsClosing)
         {
             var currentTime = Time;
@@ -132,7 +186,24 @@ public class Win32Window : IWindow
 
     public void SetCursorCaptured(bool captured)
     {
-        // TODO: Implement with ClipCursor/SetCapture for Windows
+        if (captured)
+        {
+            // Confine cursor to window client rect in screen coordinates
+            GetClientRect(_hwnd, out var rc);
+            var pt = new POINT { x = rc.left, y = rc.top };
+            ClientToScreen(_hwnd, ref pt);
+            int sx = pt.x, sy = pt.y;
+            pt = new POINT { x = rc.right, y = rc.bottom };
+            ClientToScreen(_hwnd, ref pt);
+            var clip = new RECT { left = sx, top = sy, right = pt.x, bottom = pt.y };
+            ClipCursor(ref clip);
+            SetCapture(_hwnd);
+        }
+        else
+        {
+            ClipCursor(IntPtr.Zero);
+            ReleaseCapture();
+        }
     }
     
     /// <summary>
@@ -245,9 +316,29 @@ public class Win32Window : IWindow
                 int newH = (short)((lParam.ToInt64() >> 16) & 0xFFFF);
                 if (newW > 0 && newH > 0)
                 {
-                    Size = new Vector2(newW, newH);
-                    Resize?.Invoke(Size);
-                    FramebufferResize?.Invoke(Size);
+                    _size = new Vector2(newW, newH);
+                    Resize?.Invoke(_size);
+                    FramebufferResize?.Invoke(_size);
+                }
+                return IntPtr.Zero;
+
+            case WM_MOVE:
+                _position = new Vector2((short)(lParam.ToInt64() & 0xFFFF), (short)((lParam.ToInt64() >> 16) & 0xFFFF));
+                return IntPtr.Zero;
+
+            case WM_SETFOCUS:
+                if (!_isFocused)
+                {
+                    _isFocused = true;
+                    FocusGained?.Invoke();
+                }
+                return IntPtr.Zero;
+
+            case WM_KILLFOCUS:
+                if (_isFocused)
+                {
+                    _isFocused = false;
+                    FocusLost?.Invoke();
                 }
                 return IntPtr.Zero;
                 
@@ -307,4 +398,3 @@ public class Win32Window : IWindow
         }
     }
 }
-

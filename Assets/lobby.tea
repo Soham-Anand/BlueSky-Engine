@@ -1,0 +1,223 @@
+// BlueSky Engine - Multiplayer Lobby & Matchmaking
+// Handles EOS authentication, hosting a lobby, joining, and player list rendering
+
+let searchTimer = 0.0
+let statusMsg = ""
+
+fn start() {
+    log("Matchmaking Lobby Script Started")
+}
+
+fn update() {
+    let W = 1280.0
+    let H = 720.0
+    let dt = getDeltaTime()
+
+    // Periodically search for available sessions to keep lists fresh
+    searchTimer = searchTimer + dt
+    if (searchTimer >= 1.5) {
+        search()
+        searchTimer = 0.0
+    }
+    
+    // Draw background panel
+    uiPanel(0.0, 0.0, W, H, "TopLeft", 0.06, 0.08, 0.11, 0.95)
+
+    // Header Title
+    uiText("BLUESKY MULTIPLAYER", 40.0, 40.0, "TopLeft", 0.3, 0.65, 1.0, 1.0)
+    
+    // Render Display Name in the Top-Right Corner if Logged In
+    if (isLoggedIn()) {
+        let myName = getDisplayName()
+        if (myName == "") {
+            myName = "Player"
+        }
+        uiText("👤  " + myName, W - 40.0, 40.0, "TopRight", 0.7, 0.85, 1.0, 1.0)
+    }
+
+    if (isLoggedIn() == false) {
+        drawLoginScreen(W, H)
+    } else {
+        if (isInLobby()) {
+            drawLobby(W, H)
+        } else {
+            drawMainMenu(W, H)
+        }
+    }
+}
+
+fn drawLoginScreen(W, H) {
+    let CX = W * 0.5
+    let CY = H * 0.5
+    
+    // Centered Login Panel
+    uiPanel(CX - 250.0, CY - 180.0, 500.0, 320.0, "TopLeft", 0.12, 0.14, 0.18, 0.9)
+    
+    uiText("BLUESKY MULTIPLAYER LOBBY", CX - 220.0, CY - 150.0, "TopLeft", 0.3, 0.65, 1.0, 1.0)
+    uiText("Login to access global online lobbies,", CX - 220.0, CY - 100.0, "TopLeft", 0.7, 0.7, 0.7, 1.0)
+    uiText("host matches, and join players via Epic Games.", CX - 220.0, CY - 75.0, "TopLeft", 0.7, 0.7, 0.7, 1.0)
+
+    let myName = getDisplayName()
+    if (myName == "") {
+        myName = "Racer"
+    }
+
+    if (uiButton("LOG IN WITH EPIC GAMES", CX - 220.0, CY, 440.0, 50.0, "TopLeft")) {
+        login(myName)
+    }
+    
+    uiText("Status: Offline (Sign-in Required)", CX - 220.0, CY + 80.0, "TopLeft", 0.8, 0.3, 0.2, 1.0)
+}
+
+fn drawMainMenu(W, H) {
+    let PX = 40.0
+    let PY = 100.0
+    
+    // Left Box: Connection & Profile info
+    uiPanel(PX + 20.0, PY + 60.0, 350.0, 200.0, "TopLeft", 0.12, 0.14, 0.18, 0.9)
+    uiText("PROFILE", PX + 36.0, PY + 72.0, "TopLeft", 0.3, 0.6, 1.0, 1.0)
+    
+    let myName = getDisplayName()
+    if (myName == "") {
+        myName = "Player"
+    }
+    uiText("Display Name:", PX + 36.0, PY + 105.0, "TopLeft", 0.5, 0.5, 0.5, 1.0)
+    uiText(myName, PX + 36.0, PY + 125.0, "TopLeft", 1.0, 1.0, 1.0, 1.0)
+    uiText("Status: Online (EOS)", PX + 36.0, PY + 155.0, "TopLeft", 0.2, 0.8, 0.2, 1.0)
+
+    // Left Box: Host Actions
+    uiPanel(PX + 20.0, PY + 280.0, 350.0, 220.0, "TopLeft", 0.12, 0.14, 0.18, 0.9)
+    uiText("HOST MATCH", PX + 36.0, PY + 292.0, "TopLeft", 0.3, 0.6, 1.0, 1.0)
+    uiText("Create a new public session.", PX + 36.0, PY + 325.0, "TopLeft", 0.6, 0.6, 0.6, 1.0)
+    
+    let scenePath = "Scenes/main.blueskyscene"
+    
+    if (uiButton("CREATE LOBBY", PX + 36.0, PY + 360.0, 318.0, 45.0, "TopLeft")) {
+        let lobbyName = myName + "_Lobby"
+        hostLobby(lobbyName, scenePath, 8)
+    }
+    
+    if (uiButton("QUICK JOIN", PX + 36.0, PY + 420.0, 318.0, 45.0, "TopLeft")) {
+        let count = getSessionCount()
+        if (count > 0) {
+            let t = getTime()
+            let randIdx = floor((t * 100.0) % count)
+            let targetLobby = getSessionName(randIdx)
+            joinLobby(targetLobby, scenePath, myName)
+        } else {
+            statusMsg = "No available lobbies found!"
+        }
+    }
+
+    // Right Box: Lobbies List / Matchmaking
+    let RX = PX + 400.0
+    let RY = PY + 60.0
+    let RW = W - 480.0
+    let RH = H - 200.0
+    
+    uiPanel(RX, RY, RW, RH, "TopLeft", 0.12, 0.14, 0.18, 0.9)
+    uiText("AVAILABLE LOBBIES", RX + 16.0, RY + 16.0, "TopLeft", 0.3, 0.6, 1.0, 1.0)
+
+    let lobbyCount = getSessionCount()
+    if (lobbyCount == 0) {
+        uiText("No active lobbies on Epic Online Services...", RX + 16.0, RY + 70.0, "TopLeft", 0.5, 0.5, 0.5, 1.0)
+        uiText("Tip: Click 'CREATE LOBBY' on the left to host.", RX + 16.0, RY + 95.0, "TopLeft", 0.4, 0.4, 0.4, 1.0)
+    } else {
+        let showCount = min(lobbyCount, 6)
+        let i = 0
+        while (i < showCount) {
+            let sName = getSessionName(i)
+            let sHost = getSessionHost(i)
+            let sPlayers = getSessionPlayerCount(i)
+            let sMax = getSessionMaxPlayers(i)
+            
+            let itemY = RY + 60.0 + i * 70.0
+            
+            // Draw item panel background
+            uiPanel(RX + 16.0, itemY, RW - 32.0, 60.0, "TopLeft", 0.18, 0.20, 0.25, 0.8)
+            
+            uiText(sName, RX + 32.0, itemY + 10.0, "TopLeft", 1.0, 1.0, 1.0, 1.0)
+            uiText("Host: " + sHost + "  |  Players: " + sPlayers + " / " + sMax, RX + 32.0, itemY + 34.0, "TopLeft", 0.6, 0.6, 0.6, 1.0)
+            
+            if (uiButton("JOIN", RX + RW - 140.0, itemY + 12.0, 100.0, 36.0, "TopLeft")) {
+                joinLobby(sName, scenePath, myName)
+            }
+            
+            i = i + 1
+        }
+    }
+}
+
+fn drawLobby(W, H) {
+    let PX = 40.0
+    let PY = 100.0
+    let LX = PX + 20.0
+    let LY = PY + 60.0
+
+    // Left side: user stats info panel
+    uiPanel(LX, LY, 350.0, 120.0, "TopLeft", 0.12, 0.14, 0.18, 0.9)
+
+    let myName = getDisplayName()
+    if (myName == "") {
+        myName = "Player"
+    }
+    uiText("YOU", LX + 16.0, LY + 12.0, "TopLeft", 0.3, 0.6, 1.0, 1.0)
+    uiText(myName, LX + 16.0, LY + 38.0, "TopLeft", 1.0, 1.0, 1.0, 1.0)
+
+    if (isLobbyHost()) {
+        uiText("Role: HOST", LX + 16.0, LY + 64.0, "TopLeft", 0.2, 0.8, 0.2, 1.0)
+    } else {
+        uiText("Role: CLIENT", LX + 16.0, LY + 64.0, "TopLeft", 0.8, 0.7, 0.2, 1.0)
+    }
+
+    let playerCount = getLobbyPlayerCount()
+    uiText("Players: " + playerCount + " / 8", LX + 16.0, LY + 90.0, "TopLeft", 0.6, 0.6, 0.6, 1.0)
+
+    // ── Left side: Countdown bar ────────────────────────────────
+    let CY = LY + 140.0
+    uiPanel(LX, CY, 350.0, 50.0, "TopLeft", 0.12, 0.14, 0.18, 0.9)
+
+    let cd = getLobbyCountdown()
+    if (cd > 0) {
+        uiText("Travel in: " + ceil(cd) + "s", LX + 16.0, CY + 12.0, "TopLeft", 1.0, 0.9, 0.3, 1.0)
+        let progress = getLobbyCountdownProgress()
+        uiProgressBar(LX + 16.0, CY + 34.0, 318.0, 10.0, progress, "TopLeft")
+    } else {
+        uiText("Waiting for host to start...", LX + 16.0, CY + 18.0, "TopLeft", 0.5, 0.5, 0.5, 1.0)
+    }
+
+    // ── Right side: Player list ─────────────────────────────────
+    let RX = PX + 400.0
+    let RY = PY + 60.0
+    let RW = W - 420.0
+    let RH = H - 80.0
+
+    uiPanel(RX, RY, RW, RH, "TopLeft", 0.12, 0.14, 0.18, 0.9)
+    uiText("PLAYERS", RX + 16.0, RY + 12.0, "TopLeft", 0.3, 0.6, 1.0, 1.0)
+
+    let i = 0
+    while (i < playerCount) {
+        let name = getLobbyPlayerName(i)
+        if (name == "") {
+            name = "Joining..."
+        }
+        let pY = RY + 38.0 + i * 32.0
+        uiText(name, RX + 16.0, pY, "TopLeft", 1.0, 1.0, 1.0, 1.0)
+        i = i + 1
+    }
+
+    // Back / Action button at the bottom of left panel area
+    let BY = CY + 70.0
+    if (isLobbyHost()) {
+        let cdActive = getLobbyCountdown()
+        if (cdActive <= 0) {
+            if (uiButton("START COUNTDOWN", LX, BY, 350.0, 45.0, "TopLeft")) {
+                startCountdown(10.0)
+            }
+        }
+    }
+
+    if (uiButton("LEAVE LOBBY", LX, BY + 60.0, 350.0, 45.0, "TopLeft")) {
+        leaveLobby()
+    }
+}

@@ -1,7 +1,7 @@
 using System.Runtime.InteropServices;
 using System.Collections.Concurrent;
 
-namespace NotBSRenderer.Metal;
+namespace BlueSky.Rendering.RHI.Metal;
 
 internal static class MetalInterop
 {
@@ -143,6 +143,18 @@ internal static class MetalInterop
     public const ulong MTLWindingClockwise = 0;
     public const ulong MTLWindingCounterClockwise = 1;
     
+    // Metal compute pipeline creation (Metal 1.0+)
+    // MTLDevice: newComputePipelineStateWithFunction:error:
+    // We need a dedicated DllImport because objc_msgSend with an error ref parameter
+    // requires a specific signature that returns IntPtr and takes ref IntPtr for error.
+    [DllImport("/usr/lib/libobjc.A.dylib", EntryPoint = "objc_msgSend")]
+    public static extern IntPtr objc_msgSend_newComputePipeline(IntPtr receiver, IntPtr selector, IntPtr function, ref IntPtr error);
+
+    // Metal indirect drawing selectors (Metal 1.0+)
+    // drawPrimitives:indirectBuffer:indirectBufferOffset:
+    // drawIndexedPrimitives:indirectBuffer:indirectBufferOffset:
+    // dispatchThreadgroups:threadsPerThreadgroup:
+
     // Helper methods
     public static IntPtr Retain(IntPtr obj)
     {

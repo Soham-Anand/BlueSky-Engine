@@ -3,23 +3,26 @@ using System.Numerics;
 using System.Runtime.InteropServices;
 using BlueSky.Core.ECS;
 using BlueSky.Core.ECS.Builtin;
-using NotBSRenderer;
+using BlueSky.Rendering.RHI;
 
 namespace BlueSky.Rendering;
 
 /// <summary>
-/// Clean terrain renderer — single mesh per terrain entity, proper instance buffer at slot 30.
+    /// Clean terrain renderer — single mesh per terrain entity, proper instance buffer at slot 12.
 /// </summary>
 public sealed class TerrainRenderer : IDisposable
 {
     private readonly IRHIDevice _device;
 
-    // Per-terrain GPU resources
+    // Per-terrain GPU resources (WARNING: This renderer only supports ONE terrain entity!)
     private IRHIBuffer? _vertexBuffer;
     private IRHIBuffer? _indexBuffer;
     private int         _indexCount;
+    private int         _cachedVertexCount;  // Track if mesh changed
+    private uint        _cachedEntityId;     // Track which terrain we cached
+    private int         _cachedVersion;      // Track cached version
 
-    // Instance buffer at slot 30 (matches vs_mesh: constant EntityUniforms* entities [[buffer(30)]])
+    // Instance buffer at slot 12 (matches vs_mesh: cbuffer EntityUniforms : register(b12))
     private IRHIBuffer? _instanceBuffer;
 
     private bool _disposed;
@@ -42,21 +45,22 @@ public sealed class TerrainRenderer : IDisposable
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    private struct MaterialData
+    private struct AstraSurface
     {
-        public Vector4 AlbedoAndMetallic; // xyz=albedo, w=metallic
-        public float   Roughness;
-        public float   Ao;
-        public float   Emission;
-        public float   Subsurface;
-        public int     UseAlbedoTex;
-        public int     UseNormalTex;
-        public int     UseRMATex;
-        public int     BlendMode;
-        public int     UseOpacityTex;
-        private int    _pad0;
-        private int    _pad1;
-        private int    _pad2;
+        public Vector4 BaseColor;           // 16  rgb=base, a=draw alpha
+        public float   Roughness;           // 4
+        public float   Metallic;            // 4
+        public float   AO;                  // 4
+        public float   EmissiveStrength;    // 4
+        public float   SpecularStrength;    // 4
+        public float   Shininess;           // 4
+        public float   Alpha;               // 4
+        public uint    Flags;               // 4
+        public Vector2 UVScale;             // 8
+        public Vector2 UVOffset;            // 8
+        public Vector4 EmissiveColor;       // 16
+        public Vector4 Custom0;             // 16
+        public Vector4 Custom1;             // 16
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -91,13 +95,28 @@ public sealed class TerrainRenderer : IDisposable
         IRHITexture       normalTexture,
         IRHITexture       rmaTexture,
         IRHITexture       opacityTexture,
+        IRHITexture?      detailAlbedoTexture,
+        IRHITexture?      detailNormalTexture,
+        IRHITexture?      gradeLutTexture,
+        IRHITexture?      bentTexture,
+        int               debugView,
         Matrix4x4         viewProj,
         Vector3           cameraPos)
     {
-        if (_disposed || _instanceBuffer == null)
+        if (_disposed)
+        {
             return;
+        }
+        if (_instanceBuffer == null)
+        {
+            return;
+        }
 
         // ── Pipeline + shared textures ────────────────────────────────────────
+        // NOTE: fs_mesh unconditionally samples t6/t7 (detail, gated by feat=0 so
+        // cheap), t8 (grade LUT — ALWAYS sampled) and t9 (bent, gated). Leaving
+        // them unbound returns black on Metal/DX11/Vulkan, which is why terrain
+        // rendered black while regular meshes (which bind defaults) did not.
         cmd.SetPipeline(meshPipeline);
         cmd.SetUniformBuffer(viewUniformBuffer, 10);
         cmd.SetUniformBuffer(lightBuffer, 13);
@@ -108,26 +127,35 @@ public sealed class TerrainRenderer : IDisposable
         cmd.SetTexture(normalTexture,3);
         cmd.SetTexture(rmaTexture,   4);
         cmd.SetTexture(opacityTexture,5);
+        cmd.SetTexture(detailAlbedoTexture ?? whiteTexture, 6);
+        cmd.SetTexture(detailNormalTexture ?? normalTexture, 7);
+        cmd.SetTexture(gradeLutTexture ?? whiteTexture, 8);
+        cmd.SetTexture(bentTexture ?? whiteTexture, 9);
 
-        // ── Terrain material — neutral editor checker like Unreal's default floor
-        var material = new MaterialData
+        // ── Terrain surface — plain white (no material system) ────────────────
+        var surface = new AstraSurface
         {
-            AlbedoAndMetallic = new Vector4(0.7f, 0.7f, 0.7f, 0.0f),
-            Roughness         = 0.9f,
-            Ao                = 1.0f,
-            Emission          = 0.0f,
-            Subsurface        = 0.0f,
-            UseAlbedoTex      = 0,
-            UseNormalTex      = 0,
-            UseRMATex         = 0,
-            BlendMode         = 0,
-            UseOpacityTex     = 0
+            BaseColor        = new Vector4(1.0f, 1.0f, 1.0f, 1.0f),
+            Roughness        = 0.9f,
+            Metallic         = 0.0f,
+            AO               = 1.0f,
+            EmissiveStrength = 0.0f,
+            SpecularStrength = 0.5f,
+            Shininess        = 16.0f,
+            Alpha            = 1.0f,
+            Flags            = (1u << 12) | ((uint)(debugView & 7) << 14), // Terrain (+debug view)
+            UVScale          = new Vector2(1, 1),
+            UVOffset         = new Vector2(0, 0),
+            EmissiveColor    = new Vector4(0, 0, 0, 1),
+            Custom0          = new Vector4(1, 0, 0, 0),
+            Custom1          = new Vector4(0, 0, 0, 0),
         };
-        var matSpan = MemoryMarshal.CreateSpan(ref material, 1);
-        cmd.SetFragmentUniforms(11, MemoryMarshal.AsBytes(matSpan));
+        var surfaceSpan = MemoryMarshal.CreateSpan(ref surface, 1);
+        cmd.SetFragmentUniforms(11, MemoryMarshal.AsBytes(surfaceSpan));
+        cmd.SetFragmentUniforms(2, MemoryMarshal.AsBytes(surfaceSpan));
 
-        // ── Bind instance buffer at slot 30 (shader reads entities[instance_id]) ─
-        cmd.SetUniformBuffer(_instanceBuffer, 30);
+        // ── Bind instance buffer at slot 12 (shader reads EntityModel/EntityColor) ─
+        cmd.SetUniformBuffer(_instanceBuffer, 12);
 
         // ── Iterate terrain entities ──────────────────────────────────────────
         var query = world.CreateQuery()
@@ -135,8 +163,13 @@ public sealed class TerrainRenderer : IDisposable
             .All<TransformComponent>()
             .Build();
 
+        int chunkCount = 0;
+        int entityCount = 0;
+        int drawCount = 0;
+
         foreach (var ecsChunk in world.GetQueryChunks(query))
         {
+            chunkCount++;
             var entities    = ecsChunk.GetEntities();
             int terrainIdx  = ecsChunk.GetComponentIndex(typeof(TerrainComponent));
             int transformIdx= ecsChunk.GetComponentIndex(typeof(TransformComponent));
@@ -145,16 +178,22 @@ public sealed class TerrainRenderer : IDisposable
             {
                 var entity    = entities[i];
                 var transform = ecsChunk.GetComponent<TransformComponent>(i, transformIdx);
+                uint entityId = (uint)entity.Id;
+                entityCount++;
 
-                var meshData = terrainSystem.GetMesh((uint)entity.Id);
+                var meshData = terrainSystem.GetMesh(entityId);
                 if (meshData == null)
+                {
                     continue;
+                }
 
-                // Upload mesh if needed
-                UploadMesh(meshData.Value);
+                // Upload mesh if needed (only if entity or mesh changed)
+                UploadMesh(meshData.Value, entityId);
 
                 if (_vertexBuffer == null || _indexBuffer == null || _indexCount == 0)
+                {
                     continue;
+                }
 
                 // Upload this entity's world matrix into the instance buffer
                 var worldMatrix = ToMatrix4x4(transform.WorldMatrix);
@@ -170,16 +209,27 @@ public sealed class TerrainRenderer : IDisposable
                 cmd.SetVertexBuffer(_vertexBuffer, 0);
                 cmd.SetIndexBuffer(_indexBuffer, IndexType.UInt32);
                 cmd.DrawIndexed((uint)_indexCount, 1, 0, 0, 0); // firstInstance=0 → entities[0]
+                drawCount++;
             }
         }
+
     }
 
     // ─────────────────────────────────────────────────────────────────────────
 
-    private void UploadMesh(TerrainMeshData meshData)
+    private void UploadMesh(TerrainMeshData meshData, uint entityId)
     {
         if (meshData.Vertices == null || meshData.Indices == null || meshData.Vertices.Length == 0)
             return;
+
+        // Only reupload if mesh version, entity ID, or vertex count changed
+        if (_vertexBuffer != null && 
+            _cachedEntityId == entityId && 
+            _cachedVertexCount == meshData.Vertices.Length &&
+            _cachedVersion == meshData.Version)
+        {
+            return;
+        }
 
         _vertexBuffer?.Dispose();
         _indexBuffer?.Dispose();
@@ -214,6 +264,11 @@ public sealed class TerrainRenderer : IDisposable
         _device.UpdateBuffer(_indexBuffer, MemoryMarshal.AsBytes(meshData.Indices.AsSpan()));
 
         _indexCount = meshData.Indices.Length;
+        _cachedVertexCount = meshData.Vertices.Length;
+        _cachedEntityId = entityId;
+        _cachedVersion = meshData.Version;
+        
+        Console.WriteLine($"[TerrainRenderer] Uploaded terrain mesh for Entity_{entityId}: {vertices.Length} vertices, {_indexCount} indices (version {meshData.Version})");
     }
 
     private static Matrix4x4 ToMatrix4x4(BlueSky.Core.Math.Matrix4x4 m) =>

@@ -1,13 +1,13 @@
 using System;
 using System.IO;
 using System.Numerics;
-using NotBSRenderer;
+using BlueSky.Rendering.RHI;
 using StbTrueTypeSharp;
 
 namespace BlueSky.Editor.UI;
 
 /// <summary>
-/// Bakes a TTF font into an R8 GPU texture atlas so NotBSUIRenderer can
+/// Bakes a TTF font into an R8 GPU texture atlas so EditorUIRenderer can
 /// emit properly-shaped glyph quads instead of coloured placeholder blocks.
 ///
 /// Covers ASCII printable range (0x20–0x7E, i.e. space through tilde).

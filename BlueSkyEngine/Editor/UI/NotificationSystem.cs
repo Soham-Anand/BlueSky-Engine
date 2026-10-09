@@ -1,7 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Numerics;
-using NotBSRenderer;
+using BlueSky.Rendering.RHI;
 
 namespace BlueSky.Editor.UI;
 
@@ -24,7 +24,7 @@ public class NotificationSystem
     private class Notification
     {
         public uint Id;
-        public string Message;
+        public string Message = string.Empty;
         public string? Icon;
         public NotificationType Type;
         public float Duration;
@@ -97,7 +97,7 @@ public class NotificationSystem
         }
     }
     
-    public void Render(NotBSUI ui, float screenWidth, float screenHeight)
+    public void Render(EditorUI ui, float screenWidth, float screenHeight)
     {
         float notifWidth = 320f;
         float notifHeight = 56f;

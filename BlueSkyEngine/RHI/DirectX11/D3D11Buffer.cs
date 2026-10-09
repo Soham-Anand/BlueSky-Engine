@@ -1,14 +1,10 @@
 using System.Runtime.InteropServices;
 
-namespace NotBSRenderer.DirectX11;
+namespace BlueSky.Rendering.RHI.DirectX11;
 
-/// <summary>
-/// DirectX 11 buffer implementation wrapping ID3D11Buffer COM object.
-/// Supports vertex, index, uniform (constant), and storage buffer types.
-/// </summary>
 internal sealed class D3D11Buffer : IRHIBuffer
 {
-    private IntPtr _buffer;   // ID3D11Buffer*
+    private IntPtr _buffer;
     private bool _disposed;
 
     public ulong Size { get; }
@@ -39,7 +35,6 @@ internal sealed class D3D11Buffer : IRHIBuffer
             ? 0u
             : D3D11Interop.D3D11_CPU_ACCESS_WRITE;
 
-        // Constant buffers must be 16-byte aligned
         uint byteWidth = (uint)Size;
         if (Usage.HasFlag(BufferUsage.Uniform))
             byteWidth = (byteWidth + 15u) & ~15u;
@@ -55,26 +50,24 @@ internal sealed class D3D11Buffer : IRHIBuffer
         };
 
         if (device == IntPtr.Zero)
-        {
-            Console.WriteLine($"[D3D11Buffer] Warning: null device, buffer '{DebugName}' created as placeholder");
-            return;
-        }
+            throw new InvalidOperationException($"Cannot create D3D11 buffer '{DebugName}' without a valid device.");
 
         int hr = D3D11DeviceAPI.CreateBuffer(device, ref bufferDesc, IntPtr.Zero, out _buffer);
         if (hr < 0)
             throw new InvalidOperationException($"[D3D11] CreateBuffer failed for '{DebugName}': HRESULT 0x{hr:X8}");
     }
 
-    /// <summary>
-    /// Update buffer contents via Map/Unmap (for dynamic buffers) or UpdateSubresource (for default).
-    /// </summary>
     internal void UpdateData(IntPtr deviceContext, ReadOnlySpan<byte> data, ulong offset = 0)
     {
         if (_buffer == IntPtr.Zero || deviceContext == IntPtr.Zero) return;
 
+        long available = (long)Size - (long)offset;
+        if (data.Length > available)
+            data = data.Slice(0, (int)Math.Min(data.Length, available));
+        if (data.Length == 0) return;
+
         if (MemoryType == MemoryType.GpuOnly)
         {
-            // Use UpdateSubresource for GPU-only buffers
             unsafe
             {
                 fixed (byte* pData = data)
@@ -85,7 +78,6 @@ internal sealed class D3D11Buffer : IRHIBuffer
         }
         else
         {
-            // Map/Unmap for dynamic buffers
             int hr = D3D11DeviceAPI.Map(deviceContext, _buffer, 0, 4 /* D3D11_MAP_WRITE_DISCARD */, 0, out var mapped);
             if (hr >= 0 && mapped.pData != IntPtr.Zero)
             {
@@ -94,7 +86,7 @@ internal sealed class D3D11Buffer : IRHIBuffer
                     fixed (byte* pSrc = data)
                     {
                         Buffer.MemoryCopy(pSrc, (void*)((nint)mapped.pData + (nint)offset),
-                            (long)Size - (long)offset, data.Length);
+                            available, data.Length);
                     }
                 }
                 D3D11DeviceAPI.Unmap(deviceContext, _buffer, 0);
@@ -114,13 +106,8 @@ internal sealed class D3D11Buffer : IRHIBuffer
     }
 }
 
-/// <summary>
-/// COM vtable helpers for ID3D11Device and ID3D11DeviceContext buffer operations.
-/// These call through the COM vtable at the correct offsets.
-/// </summary>
 internal static class D3D11DeviceAPI
 {
-    // ID3D11Device::CreateBuffer is vtable slot 3 (IUnknown has 3 slots: QI, AddRef, Release)
     public static int CreateBuffer(IntPtr device, ref D3D11Interop.D3D11_BUFFER_DESC desc,
         IntPtr initialData, out IntPtr buffer)
     {
@@ -129,9 +116,7 @@ internal static class D3D11DeviceAPI
 
         unsafe
         {
-            // Read vtable pointer
             IntPtr vtable = *(IntPtr*)device;
-            // CreateBuffer is at index 3 in ID3D11Device vtable
             IntPtr fnPtr = *((IntPtr*)vtable + 3);
             var fn = (delegate* unmanaged[Stdcall]<IntPtr, ref D3D11Interop.D3D11_BUFFER_DESC, IntPtr, out IntPtr, int>)fnPtr;
             
@@ -143,7 +128,6 @@ internal static class D3D11DeviceAPI
         }
     }
 
-    // ID3D11DeviceContext::UpdateSubresource - vtable slot 48
     public static void UpdateSubresource(IntPtr context, IntPtr resource, uint subresource,
         IntPtr dstBox, IntPtr srcData, uint srcRowPitch, uint srcDepthPitch)
     {
@@ -157,7 +141,6 @@ internal static class D3D11DeviceAPI
         }
     }
 
-    // ID3D11DeviceContext::Map - vtable slot 14
     [StructLayout(LayoutKind.Sequential)]
     public struct D3D11_MAPPED_SUBRESOURCE
     {
@@ -180,7 +163,6 @@ internal static class D3D11DeviceAPI
         }
     }
 
-    // ID3D11DeviceContext::Unmap - vtable slot 15
     public static void Unmap(IntPtr context, IntPtr resource, uint subresource)
     {
         if (context == IntPtr.Zero) return;

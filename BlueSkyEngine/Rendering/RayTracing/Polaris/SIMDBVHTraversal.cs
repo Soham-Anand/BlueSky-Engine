@@ -40,7 +40,7 @@ public struct PolarisTriangle
     public float V1X, V1Y, V1Z;
     public float V2X, V2Y, V2Z;
     public float N0X, N0Y, N0Z; // vertex normal (for shading)
-    public int MaterialIndex;
+    public int SurfaceIndex;
     public int Padding;
 }
 
@@ -50,8 +50,8 @@ public struct PolarisTriangle
 /// </summary>
 public class SIMDBVHTraversal
 {
-    private PolarisNode[] _nodes;
-    private PolarisTriangle[] _triangles;
+    private PolarisNode[] _nodes = null!;
+    private PolarisTriangle[] _triangles = null!;
     private int _nodeCount;
     
     // Build stats
@@ -89,7 +89,7 @@ public class SIMDBVHTraversal
                 V1X = t.V1.X, V1Y = t.V1.Y, V1Z = t.V1.Z,
                 V2X = t.V2.X, V2Y = t.V2.Y, V2Z = t.V2.Z,
                 N0X = t.N0.X, N0Y = t.N0.Y, N0Z = t.N0.Z,
-                MaterialIndex = 0
+                SurfaceIndex = 0
             };
             indices[i] = i;
         }

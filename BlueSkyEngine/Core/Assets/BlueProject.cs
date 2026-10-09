@@ -135,7 +135,6 @@ public class BlueProject
         Directory.CreateDirectory(Path.Combine(projectDir, "Content"));
         Directory.CreateDirectory(Path.Combine(projectDir, "Content", "Meshes"));
         Directory.CreateDirectory(Path.Combine(projectDir, "Content", "Textures"));
-        Directory.CreateDirectory(Path.Combine(projectDir, "Content", "Materials"));
         Directory.CreateDirectory(Path.Combine(projectDir, "Content", "Scenes"));
         Directory.CreateDirectory(Path.Combine(projectDir, "Content", "Scripts"));
         Directory.CreateDirectory(Path.Combine(projectDir, "Intermediate"));

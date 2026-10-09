@@ -3,7 +3,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using BlueSky.Platform;
 
-namespace NotBSRenderer.Vulkan;
+namespace BlueSky.Rendering.RHI.Vulkan;
 
 /// <summary>
 /// Full Vulkan RHI device implementation.
@@ -34,7 +34,6 @@ public sealed class VulkanDevice : IRHIDevice
 
     public RHIBackend Backend => RHIBackend.Vulkan;
     public RHICapabilities Capabilities { get; private set; }
-    public DescriptorBindingMode BindingMode => DescriptorBindingMode.SlotBased;
     public string DeviceName { get; private set; } = "Unknown";
 
     public VulkanDevice(IWindow window)
@@ -186,12 +185,11 @@ public sealed class VulkanDevice : IRHIDevice
         VulkanInterop.vkGetPhysicalDeviceMemoryProperties(PhysicalDevice, out _memoryProperties);
 
         // Determine capabilities
-        Capabilities = RHICapabilities.None;
-        if (_deviceFeatures.geometryShader != 0) Capabilities |= RHICapabilities.GeometryShaders;
-        if (_deviceFeatures.tessellationShader != 0) Capabilities |= RHICapabilities.TessellationShaders;
-        if (_deviceFeatures.multiDrawIndirect != 0) Capabilities |= RHICapabilities.IndirectDrawing;
-        // Vulkan always has compute shaders
-        Capabilities |= RHICapabilities.ComputeShaders;
+        // These describe engine operations available in this backend. Native
+        // geometry/tessellation support is not exposed by our pipeline API.
+        Capabilities = RHICapabilities.ComputeShaders | RHICapabilities.IndirectDrawing;
+        if (_deviceFeatures.multiDrawIndirect != 0)
+            Capabilities |= RHICapabilities.MultiDrawIndirect;
 
         Console.WriteLine($"[Vulkan] Selected GPU: {DeviceName} (type={_deviceProperties.deviceType}, score={bestScore})");
     }
@@ -641,22 +639,6 @@ public sealed class VulkanDevice : IRHIDevice
 
         texture.CurrentLayout = newLayout;
     }
-
-    // ═══════════════════════════════════════════════════════════════════
-    //  IRHIDevice — Bindless (stubs — Vulkan bindless requires VK_EXT_descriptor_indexing)
-    // ═══════════════════════════════════════════════════════════════════
-
-    public BindlessResourceHandle RegisterBindlessTexture(IRHITexture texture)
-    {
-        return new BindlessResourceHandle { Index = 0, Generation = 0 };
-    }
-
-    public BindlessResourceHandle RegisterBindlessBuffer(IRHIBuffer buffer)
-    {
-        return new BindlessResourceHandle { Index = 0, Generation = 0 };
-    }
-
-    public void UnregisterBindlessResource(BindlessResourceHandle handle) { }
 
     private void CreateDefaultSampler()
     {

@@ -93,52 +93,21 @@ namespace BlueSky.Core.ECS.Builtin
         }
     }
 
-    /// <summary>
-    /// Mesh component for rendering 3D geometry.
-    /// </summary>
+    /// <summary>Legacy scene mesh handle retained for serialized scene migration.</summary>
     public struct MeshComponent
     {
         public int VertexBufferId;
         public int IndexBufferId;
         public int VertexCount;
         public int IndexCount;
-        public int MaterialId;
-        
-        public MeshComponent(int vertexBufferId, int indexBufferId, int vertexCount, int indexCount, int materialId = -1)
+
+        public MeshComponent(int vertexBufferId, int indexBufferId, int vertexCount, int indexCount)
         {
             VertexBufferId = vertexBufferId;
             IndexBufferId = indexBufferId;
             VertexCount = vertexCount;
             IndexCount = indexCount;
-            MaterialId = materialId;
         }
-    }
-
-    /// <summary>
-    /// Material component for surface properties.
-    /// </summary>
-    public struct MaterialComponent
-    {
-        public Vector3 AlbedoColor;
-        public float Metallic;
-        public float Roughness;
-        public float Emission;
-        public int AlbedoTextureId;
-        public int NormalTextureId;
-        public int MetallicRoughnessTextureId;
-        
-        public MaterialComponent(Vector3 albedo, float metallic = 0f, float roughness = 0.5f)
-        {
-            AlbedoColor = albedo;
-            Metallic = metallic;
-            Roughness = roughness;
-            Emission = 0f;
-            AlbedoTextureId = -1;
-            NormalTextureId = -1;
-            MetallicRoughnessTextureId = -1;
-        }
-        
-        public static MaterialComponent Default => new(Vector3.One);
     }
 
     /// <summary>

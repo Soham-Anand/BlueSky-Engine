@@ -1,4 +1,4 @@
-namespace NotBSRenderer;
+namespace BlueSky.Rendering.RHI;
 
 public interface IRHIPipeline : IDisposable
 {

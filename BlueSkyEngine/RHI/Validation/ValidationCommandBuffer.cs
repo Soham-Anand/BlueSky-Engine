@@ -1,6 +1,6 @@
 using System.Numerics;
 
-namespace NotBSRenderer;
+namespace BlueSky.Rendering.RHI;
 
 internal sealed class ValidationCommandBuffer : IRHICommandBuffer, IRHIWrapped<IRHICommandBuffer>
 {
@@ -209,7 +209,6 @@ internal sealed class ValidationCommandBuffer : IRHICommandBuffer, IRHIWrapped<I
     // Phase 2/3 additions - pass-through to underlying command buffer
     public void SetStorageBuffer(IRHIBuffer buffer, uint binding, uint set = 0) => Inner.SetStorageBuffer(buffer, binding, set);
     public void SetStorageTexture(IRHITexture texture, uint binding, uint set = 0) => Inner.SetStorageTexture(texture, binding, set);
-    public void SetBindlessResourceTable(uint set, ReadOnlySpan<BindlessResourceHandle> handles) => Inner.SetBindlessResourceTable(set, handles);
     public void SetComputeUniforms(uint binding, ReadOnlySpan<byte> data) => Inner.SetComputeUniforms(binding, data);
     public void DrawIndirect(IRHIBuffer buffer, ulong offset, uint drawCount, uint stride) => Inner.DrawIndirect(buffer, offset, drawCount, stride);
     public void DrawIndexedIndirect(IRHIBuffer buffer, ulong offset, uint drawCount, uint stride) => Inner.DrawIndexedIndirect(buffer, offset, drawCount, stride);

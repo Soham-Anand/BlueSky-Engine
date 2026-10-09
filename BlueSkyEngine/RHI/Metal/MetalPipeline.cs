@@ -1,6 +1,6 @@
-using static NotBSRenderer.Metal.MetalInterop;
+using static BlueSky.Rendering.RHI.Metal.MetalInterop;
 
-namespace NotBSRenderer.Metal;
+namespace BlueSky.Rendering.RHI.Metal;
 
 internal class MetalPipeline : IRHIPipeline
 {
@@ -26,23 +26,23 @@ internal class MetalPipeline : IRHIPipeline
         CreateDepthStencilState(device, desc.DepthStencilState);
     }
     
-    private static ulong ToMTLCullMode(NotBSRenderer.CullMode mode)
+    private static ulong ToMTLCullMode(BlueSky.Rendering.RHI.CullMode mode)
     {
         return mode switch
         {
-            NotBSRenderer.CullMode.None => 0,  // MTLCullModeNone
-            NotBSRenderer.CullMode.Front => 1, // MTLCullModeFront
-            NotBSRenderer.CullMode.Back => 2,  // MTLCullModeBack
+            BlueSky.Rendering.RHI.CullMode.None => 0,  // MTLCullModeNone
+            BlueSky.Rendering.RHI.CullMode.Front => 1, // MTLCullModeFront
+            BlueSky.Rendering.RHI.CullMode.Back => 2,  // MTLCullModeBack
             _ => 0
         };
     }
     
-    private static ulong ToMTLFillMode(NotBSRenderer.FillMode mode)
+    private static ulong ToMTLFillMode(BlueSky.Rendering.RHI.FillMode mode)
     {
         return mode switch
         {
-            NotBSRenderer.FillMode.Solid => 0,      // MTLTriangleFillModeFill
-            NotBSRenderer.FillMode.Wireframe => 1,  // MTLTriangleFillModeLines
+            BlueSky.Rendering.RHI.FillMode.Solid => 0,      // MTLTriangleFillModeFill
+            BlueSky.Rendering.RHI.FillMode.Wireframe => 1,  // MTLTriangleFillModeLines
             _ => 0
         };
     }
@@ -231,21 +231,15 @@ internal class MetalPipeline : IRHIPipeline
             else
                 libraryName = "default.metallib";
 
-            // Prefer editor shader libraries for editor viewport entry points.
-            // A stale legacy copy can also exist in Shaders/, so keep it as a fallback.
+            // Editor shader libraries are the single source of compiled viewport shaders.
             var exeDir = System.AppContext.BaseDirectory;
             var libraryPath = System.IO.Path.Combine(exeDir, "Editor", "Shaders", libraryName);
-            
-            if (!System.IO.File.Exists(libraryPath))
-                libraryPath = System.IO.Path.Combine(exeDir, "Shaders", libraryName);
                 
-            // Bundle fallback: check ../Resources/Editor/Shaders and ../Resources/Shaders
+            // Bundle fallback: check the packaged editor shader directory.
             if (!System.IO.File.Exists(libraryPath))
             {
                 var bundleResources = System.IO.Path.Combine(exeDir, "..", "Resources");
                 libraryPath = System.IO.Path.Combine(bundleResources, "Editor", "Shaders", libraryName);
-                if (!System.IO.File.Exists(libraryPath))
-                    libraryPath = System.IO.Path.Combine(bundleResources, "Shaders", libraryName);
             }
 
             if (!System.IO.File.Exists(libraryPath))

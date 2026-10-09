@@ -11,7 +11,7 @@ public enum EditorState { ProjectBrowser, Workspace }
 ///   - ProjectBrowserUI.cs  — Project launcher/browser screen
 ///   - WorkspaceUI.cs       — Menu bar, toolbar, play controls, docking
 ///   - EditorPanels.cs      — Viewport, Outliner, Details, Content Browser, Console panels
-///   - SceneCommands.cs     — Import, save/load, context menus, script editor, material/mesh editors
+///   - SceneCommands.cs     — Import, save/load, context menus, script editor, mesh editors
 ///   - PlayModeController.cs — Physics sync, terrain creation
 ///   - GizmoController.cs   — Translate/Rotate/Scale gizmo interaction
 /// </summary>

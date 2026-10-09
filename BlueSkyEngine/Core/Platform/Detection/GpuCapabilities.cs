@@ -2,7 +2,6 @@ namespace BlueSky.Core.Platform.Detection
 {
     public enum GpuTier { Low, Mid, High }
     public enum OSPlatform { Windows, MacOS, Linux }
-    public enum RendererBackend { OpenGL, Vulkan, DX11, DX12, Metal }
     
     public struct GpuCapabilities
     {
@@ -27,5 +26,6 @@ namespace BlueSky.Core.Platform.Detection
         /// e.g. "shell:system_profiler", "shell:wmic", "heuristic:os+arch"
         /// </summary>
         public string DetectionMethod;
+
     }
 }

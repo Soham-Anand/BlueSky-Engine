@@ -25,6 +25,7 @@ public enum TokenType
     Minus,
     Star,
     Slash,
+    Percent,
     Assign,
     Equal,
     NotEqual,

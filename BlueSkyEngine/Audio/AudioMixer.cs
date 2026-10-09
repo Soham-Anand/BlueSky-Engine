@@ -19,6 +19,10 @@ public class AudioMixer
 {
     private readonly Dictionary<AudioChannel, float> _channelVolumes = new();
     private readonly Dictionary<AudioChannel, float> _duckingMultipliers = new();
+    private readonly Dictionary<AudioChannel, float> _duckingStarts = new();
+    private readonly Dictionary<AudioChannel, float> _duckingTargets = new();
+    private readonly Dictionary<AudioChannel, float> _duckingDurations = new();
+    private readonly Dictionary<AudioChannel, float> _duckingElapsed = new();
     private readonly Dictionary<AudioChannel, bool> _channelMutes = new();
     
     // Priority system
@@ -70,14 +74,28 @@ public class AudioMixer
 
     public void ApplyDucking(AudioChannel targetChannel, float ratio, float fadeTime)
     {
-        // Simple immediate ducking for now.
-        // A full implementation would use fadeTime to interpolate the multiplier in Update()
-        _duckingMultipliers[targetChannel] = ratio;
+        float target = float.IsFinite(ratio) ? Math.Clamp(ratio, 0.0f, 1.0f) : 1.0f;
+        float duration = float.IsFinite(fadeTime) ? Math.Max(0.0f, fadeTime) : 0.0f;
+        if (!_duckingMultipliers.TryGetValue(targetChannel, out float current))
+            current = 1.0f;
+
+        if (duration == 0.0f)
+        {
+            _duckingMultipliers[targetChannel] = target;
+            ClearDuckingTransition(targetChannel);
+            return;
+        }
+
+        _duckingStarts[targetChannel] = current;
+        _duckingTargets[targetChannel] = target;
+        _duckingDurations[targetChannel] = duration;
+        _duckingElapsed[targetChannel] = 0.0f;
     }
 
     public void RemoveDucking(AudioChannel targetChannel)
     {
         _duckingMultipliers[targetChannel] = 1.0f;
+        ClearDuckingTransition(targetChannel);
     }
 
     public void RegisterSource(AudioSource source)
@@ -96,7 +114,34 @@ public class AudioMixer
 
     public void Update(float deltaTime)
     {
-        // Here we would interpolate ducking values if we implemented smooth ducking
+        if (!float.IsFinite(deltaTime) || deltaTime <= 0.0f || _duckingTargets.Count == 0)
+            return;
+
+        foreach (var channel in new List<AudioChannel>(_duckingTargets.Keys))
+        {
+            float elapsed = Math.Min(_duckingElapsed[channel] + deltaTime, _duckingDurations[channel]);
+            float duration = _duckingDurations[channel];
+            float amount = duration <= 0.0f ? 1.0f : elapsed / duration;
+            float start = _duckingStarts[channel];
+            float target = _duckingTargets[channel];
+
+            _duckingElapsed[channel] = elapsed;
+            _duckingMultipliers[channel] = start + (target - start) * amount;
+
+            if (elapsed >= duration)
+            {
+                _duckingMultipliers[channel] = target;
+                ClearDuckingTransition(channel);
+            }
+        }
+    }
+
+    private void ClearDuckingTransition(AudioChannel channel)
+    {
+        _duckingStarts.Remove(channel);
+        _duckingTargets.Remove(channel);
+        _duckingDurations.Remove(channel);
+        _duckingElapsed.Remove(channel);
     }
 
     private void CullLowPrioritySources()
@@ -111,7 +156,7 @@ public class AudioMixer
         while (_activeSources.Count > MaxSimultaneousVoices)
         {
             var lowest = _activeSources[0];
-            lowest.IsPlaying = false; // This will cause Orchestra to stop and remove it
+            lowest.IsPlaying = false; // This will cause Echo to stop and remove it
             _activeSources.RemoveAt(0);
         }
     }

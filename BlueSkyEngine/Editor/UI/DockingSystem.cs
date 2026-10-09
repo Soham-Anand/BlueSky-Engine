@@ -3,7 +3,7 @@ using System.Collections.Generic;
 using System.Numerics;
 using BlueSky.Editor.UI;
 
-namespace NotBSRenderer;
+namespace BlueSky.Editor.UI;
 
 /// <summary>
 /// Professional docking system with polished tab rendering, resizable splits,
@@ -19,12 +19,9 @@ public class DockingSystem
     // ── State ────────────────────────────────────────────────────────
     private DockNode _root;
     private readonly Dictionary<string, DockPanel> _panels = new();
-    private DockPanel? _draggedPanel;
     private int _dragSplitterNode = -1;
     private float _dragSplitterStart;
     private float _dragMouseStart;
-    private DockZone _hoveredZone;
-    private DockNode? _hoveredZoneNode;
     private int _nextNodeId;
     private Vector2 _lastMousePos;
     private bool _lastMouseDown;
@@ -41,7 +38,7 @@ public class DockingSystem
 
     // ── Public API ───────────────────────────────────────────────────
 
-    public DockPanel AddPanel(string id, string title, Action<NotBSUI, DockRect> drawContent)
+    public DockPanel AddPanel(string id, string title, Action<EditorUI, DockRect> drawContent)
     {
         var panel = new DockPanel { Id = id, Title = title, DrawContent = drawContent };
         _panels[id] = panel;
@@ -70,7 +67,7 @@ public class DockingSystem
         LayoutNode(_root);
     }
 
-    public void Update(NotBSUI ui, Vector2 mousePos, bool mouseDown)
+    public void Update(EditorUI ui, Vector2 mousePos, bool mouseDown)
     {
         bool mousePressed = mouseDown && !_lastMouseDown;
         bool mouseReleased = !mouseDown && _lastMouseDown;
@@ -137,9 +134,7 @@ public class DockingSystem
         node.Type = DockNodeType.Split;
         node.SplitDirection = horizontal ? SplitDir.Horizontal : SplitDir.Vertical;
         // UE5-like proportions: sidebars ~18%, bottom ~30%
-        node.SplitRatio = (position == DockPosition.Left) ? 0.18f
-                        : (position == DockPosition.Top)  ? 0.30f
-                        : 0.18f; // placeholder for left/top
+        node.SplitRatio = position == DockPosition.Top ? 0.30f : 0.18f;
         node.Tabs.Clear();
 
         var panelNode = new DockNode { Id = _nextNodeId++, Type = DockNodeType.Tabs };
@@ -206,10 +201,12 @@ public class DockingSystem
                     ? mouse.X - _dragMouseStart
                     : mouse.Y - _dragMouseStart;
                 float totalSize = node.SplitDirection == SplitDir.Horizontal ? node.Bounds.W : node.Bounds.H;
+                // A window can be resized below the normal panel minimum. Avoid
+                // division by zero and keep Math.Clamp's bounds ordered then.
+                if (!float.IsFinite(totalSize) || totalSize <= 0f) return;
                 float newRatio = _dragSplitterStart + delta / totalSize;
-                node.SplitRatio = Math.Clamp(newRatio,
-                    EditorTheme.MinPanelW / totalSize,
-                    1f - EditorTheme.MinPanelW / totalSize);
+                float minRatio = Math.Min(EditorTheme.MinPanelW / totalSize, 0.5f);
+                node.SplitRatio = Math.Clamp(newRatio, minRatio, 1f - minRatio);
             }
             return;
         }
@@ -240,7 +237,7 @@ public class DockingSystem
 
     // ── Rendering ────────────────────────────────────────────────────
 
-    private void RenderNode(NotBSUI ui, DockNode node, Vector2 mouse, bool down, bool pressed, bool released)
+    private void RenderNode(EditorUI ui, DockNode node, Vector2 mouse, bool down, bool pressed, bool released)
     {
         if (node.Type == DockNodeType.Split)
         {
@@ -269,7 +266,7 @@ public class DockingSystem
         }
     }
 
-    private void RenderTabbedPanel(NotBSUI ui, DockNode node, Vector2 mouse, bool down, bool pressed, bool released)
+    private void RenderTabbedPanel(EditorUI ui, DockNode node, Vector2 mouse, bool down, bool pressed, bool released)
     {
         var b = node.Bounds;
         if (b.W < 1 || b.H < 1) return;
@@ -477,8 +474,6 @@ public struct DockRect
 public enum DockPosition { Center, Left, Right, Top, Bottom }
 public enum DockNodeType { Empty, Tabs, Split }
 public enum SplitDir { Horizontal, Vertical }
-public enum DockZone { None, Center, Left, Right, Top, Bottom }
-
 public class DockNode
 {
     public int Id;
@@ -496,6 +491,6 @@ public class DockPanel
 {
     public string Id = "";
     public string Title = "";
-    public Action<NotBSUI, DockRect>? DrawContent;
+    public Action<EditorUI, DockRect>? DrawContent;
     public bool Transparent;
 }

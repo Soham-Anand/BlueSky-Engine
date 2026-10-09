@@ -1,7 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Numerics;
-using NotBSRenderer;
+using BlueSky.Rendering.RHI;
+using BlueSky.Editor.UI;
 
 namespace BlueSky.Runtime.UI;
 
@@ -22,7 +23,8 @@ internal enum RuntimeUIElementKind
 {
     Label,
     Panel,
-    ProgressBar
+    ProgressBar,
+    Button
 }
 
 public static class RuntimeUI
@@ -35,7 +37,7 @@ public static class RuntimeUI
         public float Y { get; init; }
         public float Width { get; init; }
         public float Height { get; init; }
-        public float Value { get; init; }
+        public double Value { get; init; }
         public Vector4 Color { get; init; }
         public Vector4 ColorB { get; init; }
         public RuntimeUIAnchor Anchor { get; init; }
@@ -43,6 +45,14 @@ public static class RuntimeUI
 
     private static readonly object Sync = new();
     private static readonly List<Element> FrameElements = new();
+    private static readonly HashSet<uint> ClickedButtons = new();
+    private static readonly HashSet<uint> NextFrameClicks = new();
+
+    public static bool IsButtonClicked(uint id)
+    {
+        lock (Sync)
+            return ClickedButtons.Contains(id);
+    }
 
     public static event Action<RuntimeUIContext>? Draw;
 
@@ -53,7 +63,13 @@ public static class RuntimeUI
     public static void BeginFrame()
     {
         lock (Sync)
+        {
             FrameElements.Clear();
+            ClickedButtons.Clear();
+            foreach (var id in NextFrameClicks)
+                ClickedButtons.Add(id);
+            NextFrameClicks.Clear();
+        }
     }
 
     public static void Label(string text, float x, float y,
@@ -115,7 +131,27 @@ public static class RuntimeUI
         }
     }
 
-    public static void Render(NotBSUI ui, float width, float height, float deltaTime)
+    public static void Button(string text, float x, float y, float width, float height,
+                              RuntimeUIAnchor anchor = RuntimeUIAnchor.TopLeft,
+                              uint id = 0)
+    {
+        lock (Sync)
+        {
+            FrameElements.Add(new Element
+            {
+                Kind = RuntimeUIElementKind.Button,
+                Text = text ?? string.Empty,
+                X = x,
+                Y = y,
+                Width = width,
+                Height = height,
+                Anchor = anchor,
+                Value = id
+            });
+        }
+    }
+
+    public static void Render(EditorUI ui, float width, float height, float deltaTime)
     {
         Element[] elements;
         lock (Sync)
@@ -123,8 +159,22 @@ public static class RuntimeUI
 
         var context = new RuntimeUIContext(ui, width, height, deltaTime);
         foreach (var element in elements)
-            context.DrawElement(element.Kind, element.Text, element.X, element.Y, element.Width, element.Height,
-                                element.Value, element.Color, element.ColorB, element.Anchor);
+        {
+            if (element.Kind == RuntimeUIElementKind.Button)
+            {
+                bool clicked = context.Button(element.X, element.Y, element.Width, element.Height, element.Text, element.Anchor, (uint)Math.Max(1, element.Value));
+                if (clicked)
+                {
+                    lock (Sync)
+                        NextFrameClicks.Add((uint)Math.Max(1, element.Value));
+                }
+            }
+            else
+            {
+                context.DrawElement(element.Kind, element.Text, element.X, element.Y, element.Width, element.Height,
+                                    element.Value, element.Color, element.ColorB, element.Anchor);
+            }
+        }
 
         Draw?.Invoke(context);
 
@@ -135,9 +185,9 @@ public static class RuntimeUI
 
 public readonly struct RuntimeUIContext
 {
-    private readonly NotBSUI _ui;
+    private readonly EditorUI _ui;
 
-    public RuntimeUIContext(NotBSUI ui, float width, float height, float deltaTime)
+    public RuntimeUIContext(EditorUI ui, float width, float height, float deltaTime)
     {
         _ui = ui;
         Width = width;
@@ -194,7 +244,7 @@ public readonly struct RuntimeUIContext
     }
 
     internal void DrawElement(RuntimeUIElementKind kind, string text, float x, float y, float width, float height,
-                              float value, Vector4 color, Vector4 colorB, RuntimeUIAnchor anchor)
+                              double value, Vector4 color, Vector4 colorB, RuntimeUIAnchor anchor)
     {
         switch (kind)
         {
@@ -205,7 +255,10 @@ public readonly struct RuntimeUIContext
                 Panel(x, y, width, height, anchor, color);
                 break;
             case RuntimeUIElementKind.ProgressBar:
-                ProgressBar(x, y, width, height, value, anchor, color, colorB);
+                ProgressBar(x, y, width, height, (float)value, anchor, color, colorB);
+                break;
+            case RuntimeUIElementKind.Button:
+                Button(x, y, width, height, text, anchor, (uint)Math.Max(1, value));
                 break;
         }
     }

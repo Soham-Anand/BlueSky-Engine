@@ -1,12 +1,19 @@
 using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
 using System.Linq;
 using System.Numerics;
 using System.Runtime.InteropServices;
-using NotBSRenderer;
+using System.Threading.Tasks;
+using System.Collections.Concurrent;
+using BlueSky.Rendering.RHI;
+using BlueSky.Rendering.RHI.DirectX11;
 using BlueSky.Core.ECS;
 using BlueSky.Core.ECS.Builtin;
 using BlueSky.Core.Math;
 using BlueSky.Core.Gameplay;
+using BlueSky.Motif;
 
 namespace BlueSky.Editor;
 
@@ -16,9 +23,9 @@ namespace BlueSky.Editor;
 /// </summary>
 public sealed class ViewportRenderer : IDisposable
 {
-    /// <summary>F10 in the editor queues a one-shot console dump of per-submesh material resolution.</summary>
-    bool _materialDebugDumpPending;
-    private const bool VerboseViewportLogging = false;
+
+    private static bool VerboseViewportLogging =>
+        Environment.GetEnvironmentVariable("BLUESKY_VERBOSE_VIEWPORT") == "1";
 
     // ── Uniform structure (must match Metal ViewUniforms exactly for sky/grid) ────────
     [StructLayout(LayoutKind.Sequential)]
@@ -31,15 +38,17 @@ public sealed class ViewportRenderer : IDisposable
         public System.Numerics.Matrix4x4 LightSpaceMatrix;
         public System.Numerics.Vector4 CameraPos; // 16 bytes (offset 320)
         public float Time;                        // 4 bytes (offset 336)
-        
-        // Metal aligns float3 to 16 bytes, so we need 12 bytes padding here
+
+        // padding to offset 352 (matches Metal/HLSL 16-byte alignment)
         private float _pad1;
         private float _pad2;
         private float _pad3;
-        
-        public System.Numerics.Vector3 SunDirection; // 12 bytes (offset 352)
-        private float _pad4;                         // 4 bytes to complete 16-byte alignment
-        
+
+        // float4 (NOT float3): HLSL packs float3 tightly while Metal/C# pad to
+        // 16 bytes, so float3 sunDirection lands at different offsets per API.
+        // xyz = direction toward sun, w unused.
+        public System.Numerics.Vector4 SunDirection; // 16 bytes (offset 352)
+
         public System.Numerics.Vector4 WindParams;   // 16 bytes (offset 368)
     }
     
@@ -57,7 +66,7 @@ public sealed class ViewportRenderer : IDisposable
         public float     FarPlane;
     }
 
-    // ── Entity uniform structure (model matrix + material) ─────────────────────────
+    // ── Entity uniform structure (model matrix + tint) ─────────────────────────
     [StructLayout(LayoutKind.Sequential)]
     private struct EntityUniforms
     {
@@ -72,26 +81,26 @@ public sealed class ViewportRenderer : IDisposable
         public System.Numerics.Matrix4x4 LightSpaceMatrix;
     }
     
-    // ── Material data for Horizon shader (must match Metal MaterialData) ───────────────
-    // CRITICAL: Metal pads float3 to 16 bytes inside structs (same as float4).
-    // C# Vector3 is 12 bytes. To avoid the 4-byte gap, we pack Metallic into
-    // the w component of Albedo as a Vector4. The shader reads albedo.xyz and albedo.w.
+    // ── Surface data for Astra shader (112 bytes, must match HLSL register(b2)) ───
+    // Single global surface: historic orange clay. No material system.
     [StructLayout(LayoutKind.Sequential)]
-    private struct MaterialData
+    private struct AstraSurface
     {
-        public System.Numerics.Vector4 AlbedoAndMetallic; // xyz=albedo, w=metallic
-        public float Roughness;
-        public float Ao;
-        public float Emission;
-        public float Subsurface;
-        public int UseAlbedoTex;
-        public int UseNormalTex;
-        public int UseRMATex;
-        public int BlendMode; // 0=Opaque, 1=AlphaTest, 2=AlphaBlend
-        public int UseOpacityTex; // Separate opacity/alpha map (map_d)
-        private int _pad0;
-        private int _pad1;
-        private int _pad2;
+        public System.Numerics.Vector4 BaseColor;           // 16  rgb=base, a=draw alpha
+        public float Roughness;                             // 4
+        public float Metallic;                              // 4
+        public float AO;                                    // 4
+        public float EmissiveStrength;                      // 4
+        public float SpecularStrength;                      // 4
+        public float Shininess;                             // 4
+        public float Alpha;                                 // 4
+        public uint  Flags;                                 // 4  AstraSurfaceFlags
+        public System.Numerics.Vector2 UVScale;             // 8
+        public System.Numerics.Vector2 UVOffset;            // 8
+        public System.Numerics.Vector4 EmissiveColor;       // 16
+        public System.Numerics.Vector4 Custom0;             // 16
+        public System.Numerics.Vector4 Custom1;             // 16
+        // Total: 16 + 32 + 4 + 16 + 48 = 112 bytes ✓
     }
     
     // ── Gizmo uniforms (must match Metal GizmoUniforms) ──────────────────────────────
@@ -105,6 +114,21 @@ public sealed class ViewportRenderer : IDisposable
         public float AxisId;    // 0=X, 1=Y, 2=Z, 3=center
         public float IsHovered; // 1.0 when hovered
         private float _pad;
+    }
+
+    // ── Physics debug shape overlay types ──────────────────────────────────────────
+    public enum DebugShapeType { Box, Sphere, Capsule, ConvexHull }
+
+    public struct DebugShape
+    {
+        public System.Numerics.Matrix4x4 Transform;
+        public DebugShapeType ShapeType;
+        public System.Numerics.Vector3 Size;
+        public float Radius;
+        public float Height;
+        public System.Numerics.Vector4 Color;
+        public System.Numerics.Vector3[]? HullVertices;
+        public int[]? HullIndices;
     }
     
     // ── Gizmo Mode enum ─────────────────────────────────────────────────────────────
@@ -162,7 +186,7 @@ public sealed class ViewportRenderer : IDisposable
         public int EnableVolumetrics;
         public int EnableContactShadows;
         public float Exposure;
-        public System.Numerics.Vector3 AmbientColor;
+        public System.Numerics.Vector4 AmbientPacked; // xyz=color, w=intensity
     }
 
     // ── Conversion helpers ───────────────────────────────────────────────
@@ -176,12 +200,11 @@ public sealed class ViewportRenderer : IDisposable
         );
     }
 
-    // ── Submesh info with material slot index ─────────────────────────────
+    // ── Submesh info (geometry ranges; no material system) ────────────────
     public struct SubmeshInfo
     {
         public int IndexOffset;     // Starting index in the index buffer
         public int IndexCount;      // Number of indices for this submesh
-        public int MaterialSlot;    // Material slot index (0-7)
     }
 
     // ── Mesh GPU cache struct ─────────────────────────────────────────────
@@ -190,11 +213,10 @@ public sealed class ViewportRenderer : IDisposable
         public IRHIBuffer? VertexBuffer;
         public IRHIBuffer? IndexBuffer;
         public int IndexCount;
-        public List<SubmeshInfo> Submeshes = new(); // One per material slot
+        public List<SubmeshInfo> Submeshes = new(); // Geometry ranges
+        public List<int> SubmeshSlots = new(); // Parallel surface-slot ints (geometry org)
+        public Dictionary<int, string> StrataLinks = new(); // slot → .stratamat path
         public ulong LastUsedFrame; // For LRU cache eviction
-        
-        // Cached material slot paths from asset metadata (covers all slots, not just 0-7)
-        public Dictionary<int, string> MaterialSlotPaths = new();
 
         /// <summary>
         /// CPU-side copy of the index buffer (uint32).
@@ -233,20 +255,19 @@ public sealed class ViewportRenderer : IDisposable
     private          IRHIPipeline? _gridPipeline;
     private          IRHIPipeline? _meshPipeline;
     private          IRHIPipeline? _transparentMeshPipeline;
-    private          IRHIPipeline? _doubleSidedMeshPipeline;
     private          IRHIPipeline? _wireframePipeline;
     private          IRHIPipeline? _shadowPipeline;
     private          IRHITexture?  _shadowMap;
     private          IRHIBuffer?   _uniformBuffer;
     private          IRHIBuffer?   _entityUniformBuffer;
     private          IRHIBuffer?   _instanceBuffer;
-    private          const int     MaxInstancesPerBatch = 512;
+    private          const int     MaxInstancesPerBatch = 64;
     // Per-frame instance buffer: large enough for ALL entities in the scene.
     // Uploaded ONCE per frame before any draw calls so every draw can read its
     // own unique slice via the firstInstance offset — eliminates the shared-
     // buffer aliasing bug where entities would snap to each other's position.
     private          IRHIBuffer?   _frameInstanceBuffer;
-    private          const int     MaxFrameInstances    = 4096; // covers very large scenes
+    private const int MaxFrameInstances    = 256;  // DX11 HLSL entity array max (256 * 80 = 20480 bytes in cbuffer)
     private          int           _debugFrameCounter   = 0;
     
     // Horizon Lighting buffers
@@ -254,10 +275,33 @@ public sealed class ViewportRenderer : IDisposable
     private IRHIBuffer? _lightBuffer;
     private IRHIBuffer? _lightCountBuffer;
     private IRHIBuffer? _lightSettingsBuffer;
-    private IRHIBuffer? _materialBuffer;
+    private IRHIBuffer? _surfaceBuffer;
+
+    // ── Strata sky-captured IBL: 9 SH coeffs, recaptured when the sun moves ──
+    private IRHIBuffer? _shBuffer;
+    private System.Numerics.Vector3 _shSunDir = new(float.NaN);
+    private float _shPreset = float.NaN;
+    private IRHITexture? _gradeLut;
+    private IRHIBuffer? _skyParamsBuffer; // b17: SkyPreset float + padding
+    // ── Phase-B probes: pack path caches + active probe key ────────────────
+    private readonly Dictionary<string, string> _meshPackCache = new();
+    private readonly Dictionary<string, System.Collections.Generic.List<BlueSky.Rendering.Strata.StrataPack.PackProbe>> _packProbeCache = new();
+    private readonly Dictionary<string, System.Numerics.Vector3[]> _probeCoeffCache = new();
+    private string _shProbeKey = "";
+    private float _shParamsPreset = float.NaN;
     
     private readonly Dictionary<string, MeshGPUData> _meshCache = new();
-    private readonly Dictionary<string, BlueSky.Core.Assets.MaterialAsset?> _materialCache = new();
+    // Asset file reads can be large. Keep them off the render thread; GPU buffer
+    // creation remains on the render thread when the completed asset is consumed.
+    private readonly ConcurrentDictionary<string, Task<BlueSky.Core.Assets.BlueAsset?>> _pendingMeshAssets = new();
+
+    // ── Strata override (vehicle proof): when set, every mesh renders with ──
+    // this material instead of the orange clay. Textures upload lazily once.
+    public BlueSky.Rendering.Strata.StrataMaterial? StrataOverride { get; set; }
+    private BlueSky.Rendering.Strata.StrataSurfaceUpload.SurfaceParams _strataParams;
+    private bool _strataReady;
+    private string _strataReadyFor = "";
+    private readonly Dictionary<string, IRHITexture> _strataTexCache = new(StringComparer.OrdinalIgnoreCase);
 
     // ── Wheel animation for static meshes (no skeleton) ─────────────────
     // Maps (meshAssetId, entityId) → submeshIndex→wheelIndex (-1 = not a wheel).
@@ -265,8 +309,20 @@ public sealed class ViewportRenderer : IDisposable
     // against the car controller's wheel positions.
     private readonly Dictionary<(string, uint), int[]> _submeshWheelMap = new();
     
-    // ── Texture cache for material textures ─────────────────────────────
-    // Key includes sRGB flag: same file path must not be shared between albedo (sRGB) and data (linear) textures.
+    // ── Bone animation for skeletal meshes ──────────────────────────────
+    // Maps (meshAssetId, entityId) → submeshIndex→boneIndex (-1 = no bone).
+    // Built lazily on first encounter by checking vertex bone weights and falling back to name/hierarchy analysis.
+    private readonly Dictionary<(string, uint), int[]> _skeletalSubmeshBoneMap = new();
+
+    // ── Pack skeletons (stratapack import) ──────────────────────────────────
+    // assetId → (bone names, per-submesh dominant bone index). Negative cached
+    // as empty arrays: one metadata check per static mesh, then dict hits.
+    private readonly Dictionary<string, (string[] BoneNames, int[] SubmeshBone)> _packSkeletonCache = new();
+    private readonly HashSet<string> _wheelTraceMappings = new();
+
+    
+    // ── Texture cache (path + colorspace intent; Strata will own the intent) ──
+    // Key includes sRGB flag: same file path must not be shared between color (sRGB) and data (linear) textures.
     private readonly Dictionary<(string Path, bool Srgb), IRHITexture?> _textureCache = new();
     private IRHITexture? _defaultWhiteTexture;
     private IRHITexture? _defaultNormalTexture;
@@ -280,6 +336,114 @@ public sealed class ViewportRenderer : IDisposable
     private ulong _frameCount = 0; // For LRU eviction
 
     // ── Skeletal mesh bone detection helper ─────────────────────────────
+    // (FBX path below; pack-skeleton loader follows it.)
+
+    /// <summary>
+    /// Dominant pack-skeleton bone name for one submesh (stratapack imports).
+    /// Votes skinning weights over the submesh index range; top-weight bone
+    /// wins per vertex, majority wins the submesh. Cached per asset.
+    /// </summary>
+    private bool TryGetPackSubmeshBoneName(string assetId, MeshGPUData gpuData,
+        SubmeshInfo submesh, int submeshIdx, out string boneName)
+    {
+        boneName = "";
+        if (string.IsNullOrEmpty(assetId))
+            return false;
+        if (!_packSkeletonCache.TryGetValue(assetId, out var entry))
+        {
+            entry = LoadPackSkeletonMap(assetId, gpuData)
+                ?? (Array.Empty<string>(), Array.Empty<int>());
+            _packSkeletonCache[assetId] = entry;
+        }
+        if (entry.BoneNames.Length == 0 || submeshIdx < 0 || submeshIdx >= entry.SubmeshBone.Length)
+            return false;
+        int bi = entry.SubmeshBone[submeshIdx];
+        if (bi < 0 || bi >= entry.BoneNames.Length)
+            return false;
+        boneName = entry.BoneNames[bi];
+        return !string.IsNullOrEmpty(boneName);
+    }
+
+    private (string[] BoneNames, int[] SubmeshBone)? LoadPackSkeletonMap(string assetId, MeshGPUData gpuData)
+    {
+        // No sidecars: skin + skeleton live in the .stratapack. The asset
+        // carries pack-relative references; we slice straight from the pack.
+        try
+        {
+            var header = BlueSky.Core.Assets.BlueAsset.LoadHeader(assetId);
+            if (header == null || !header.Metadata.TryGetValue("sourcePack", out var packPath) ||
+                !header.Metadata.TryGetValue("skinOffset", out var skinOffS) ||
+                !header.Metadata.TryGetValue("skinSize", out var skinSizeS) ||
+                !header.Metadata.TryGetValue("skinCount", out var skinCountS) ||
+                !header.Metadata.TryGetValue("skeletonIndex", out var skelIdxS) ||
+                string.IsNullOrWhiteSpace(packPath) || !System.IO.File.Exists(packPath) ||
+                !ulong.TryParse(skinOffS, out ulong skinOff) ||
+                !ulong.TryParse(skinSizeS, out ulong skinSize) ||
+                !int.TryParse(skinCountS, out int skinCount) ||
+                !int.TryParse(skelIdxS, out int skelIdx) ||
+                gpuData.RawIndices == null || gpuData.Submeshes == null)
+                return null;
+            var (packHeader, payloadBase) =
+                BlueSky.Rendering.Strata.StrataPack.DecodeHeader(packPath);
+            if (skelIdx < 0 || skelIdx >= packHeader.Skeletons.Count)
+                return null;
+            var skel = packHeader.Skeletons[skelIdx];
+            if (skel == null || skel.Bones.Count == 0)
+                return null;
+            int stride = BlueSky.Rendering.Strata.StrataPack.SkinStride;
+            if (skinCount <= 0 || skinSize != (ulong)skinCount * (ulong)stride)
+                return null;
+            byte[] skin = new byte[skinSize];
+            using (var fs = new FileStream(packPath, FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                fs.Seek(payloadBase + (long)skinOff, SeekOrigin.Begin);
+                int got = 0;
+                while (got < skin.Length)
+                {
+                    int n = fs.Read(skin, got, skin.Length - got);
+                    if (n <= 0) break;
+                    got += n;
+                }
+                if (got < skin.Length)
+                    return null;
+            }
+            var names = new string[skel.Bones.Count];
+            for (int b = 0; b < names.Length; b++) names[b] = skel.Bones[b].Name ?? "";
+            var subBone = new int[gpuData.Submeshes.Count];
+            for (int s = 0; s < subBone.Length; s++)
+            {
+                var sub = gpuData.Submeshes[s];
+                var votes = new float[names.Length];
+                int start = Math.Max(0, sub.IndexOffset);
+                int end = Math.Min(gpuData.RawIndices.Length, start + Math.Max(0, sub.IndexCount));
+                for (int i = start; i < end; i++)
+                {
+                    uint vid = gpuData.RawIndices[i];
+                    long off = (long)vid * stride;
+                    if (off < 0 || off + stride > skin.Length)
+                        continue;
+                    // Top-weight influence wins this vertex.
+                    int best = -1; float bestW = 0f;
+                    for (int k = 0; k < 4; k++)
+                    {
+                        uint bi = BitConverter.ToUInt32(skin, (int)off + k * 4);
+                        float w = BitConverter.ToSingle(skin, (int)off + 16 + k * 4);
+                        if (bi < (uint)names.Length && w > bestW) { bestW = w; best = (int)bi; }
+                    }
+                    if (best >= 0) votes[best] += bestW;
+                }
+                int win = -1; float winV = 0f;
+                for (int b = 0; b < votes.Length; b++)
+                    if (votes[b] > winV) { winV = votes[b]; win = b; }
+                subBone[s] = win;
+            }
+            return (names, subBone);
+        }
+        catch
+        {
+            return null;
+        }
+    }
     /// <summary>
     /// Accumulate a bone weight vote for dominant-bone detection per submesh.
     /// </summary>
@@ -306,14 +470,25 @@ public sealed class ViewportRenderer : IDisposable
     private          int           _gizmoRingIndexCount;
     public          int           HoveredAxis = -1; // 0=X, 1=Y, 2=Z, 3=Center
     private          bool          _gizmoGeometryCreated;
+    internal          List<DebugShape> _physicsDebugShapes = new();
+    private          IRHIBuffer?   _hullLineVB;
+    private          int           _hullLineVertexCapacity;
+    private          IRHIBuffer?   _gizmoCapsuleVB;
+    private          IRHIBuffer?   _gizmoCapsuleIB;
+    private          int           _gizmoCapsuleIndexCount;
+    private          IRHIBuffer?   _gizmoSphereVB;
+    private          IRHIBuffer?   _gizmoSphereIB;
+    private          int           _gizmoSphereIndexCount;
 
     private float _elapsedTime;
     private bool  _disposed;
     private readonly TextureFormat _colorFormat;
+    private readonly bool _showEditorGizmos;
 
-    public ViewportRenderer(IRHIDevice device, World world, BlueSky.Rendering.TerrainSystem? terrainSystem = null, TextureFormat colorFormat = TextureFormat.RGBA8Unorm)
+    public ViewportRenderer(IRHIDevice device, World world, BlueSky.Rendering.TerrainSystem? terrainSystem = null, TextureFormat colorFormat = TextureFormat.RGBA8Unorm, bool showEditorGizmos = true)
     {
         _device = device;
+        _showEditorGizmos = showEditorGizmos;
         _world = world;
         _terrainSystem = terrainSystem;
         _colorFormat = colorFormat;
@@ -328,7 +503,7 @@ public sealed class ViewportRenderer : IDisposable
     }
     
     /// <summary>
-    /// Get cached mesh GPU data for EasePlus renderer integration.
+    /// Get cached mesh GPU data (shared mesh cache).
     /// </summary>
     public MeshGPUData? GetCachedMesh(string assetId)
     {
@@ -344,36 +519,42 @@ public sealed class ViewportRenderer : IDisposable
     }
     
     /// <summary>
-    /// Load cached material for EasePlus renderer integration.
-    /// </summary>
-    public BlueSky.Core.Assets.MaterialAsset? LoadCachedMaterial(string? matPath)
-    {
-        return LoadCachedMaterialInternal(matPath);
-    }
-    
-    /// <summary>
     /// Detect and remove entities with corrupted mesh data (from old import format).
     /// </summary>
     private void CleanupCorruptedMeshes()
     {
-        var query = _world.CreateQuery().All<TransformComponent>().All<BlueSky.Core.ECS.Builtin.StaticMeshComponent>().Build();
+        var query = _world.CreateQuery()
+            .All<TransformComponent>()
+            .Any(typeof(BlueSky.Core.ECS.Builtin.StaticMeshComponent), typeof(BlueSky.Core.ECS.Builtin.SkeletalMeshComponent))
+            .Build();
         var chunks = _world.GetQueryChunks(query);
         var entitiesToRemove = new List<Entity>();
         
         foreach (var chunk in chunks)
         {
-            int meshIndex = chunk.GetComponentIndex(typeof(BlueSky.Core.ECS.Builtin.StaticMeshComponent));
+            int staticMeshIndex = chunk.GetComponentIndex(typeof(BlueSky.Core.ECS.Builtin.StaticMeshComponent));
+            int skeletalMeshIndex = chunk.GetComponentIndex(typeof(BlueSky.Core.ECS.Builtin.SkeletalMeshComponent));
             var entities = chunk.GetEntities();
             
             for (int i = 0; i < chunk.Count; i++)
             {
-                var staticMesh = chunk.GetComponent<BlueSky.Core.ECS.Builtin.StaticMeshComponent>(i, meshIndex);
+                string meshId = "";
+                if (staticMeshIndex >= 0 && chunk.Archetype.HasComponent(typeof(BlueSky.Core.ECS.Builtin.StaticMeshComponent)))
+                {
+                    var staticMesh = chunk.GetComponent<BlueSky.Core.ECS.Builtin.StaticMeshComponent>(i, staticMeshIndex);
+                    meshId = staticMesh.MeshAssetId;
+                }
+                else if (skeletalMeshIndex >= 0 && chunk.Archetype.HasComponent(typeof(BlueSky.Core.ECS.Builtin.SkeletalMeshComponent)))
+                {
+                    var skeletalMesh = chunk.GetComponent<BlueSky.Core.ECS.Builtin.SkeletalMeshComponent>(i, skeletalMeshIndex);
+                    meshId = skeletalMesh.MeshAssetPath;
+                }
                 
-                if (string.IsNullOrEmpty(staticMesh.MeshAssetId)) continue;
+                if (string.IsNullOrEmpty(meshId)) continue;
                 
                 try
                 {
-                    var asset = BlueSky.Core.Assets.BlueAsset.Load(staticMesh.MeshAssetId);
+                    var asset = BlueSky.Core.Assets.BlueAsset.Load(meshId);
                     if (asset != null && asset.PayloadData != null && asset.PayloadData.Length > 0)
                     {
                         using var ms = new System.IO.MemoryStream(asset.PayloadData);
@@ -399,14 +580,6 @@ public sealed class ViewportRenderer : IDisposable
         {
             _world.DestroyEntity(entity);
         }
-    }
-
-    /// <summary>
-    /// Invalidate all cached materials (e.g. on project reload).
-    /// </summary>
-    public void InvalidateAllMaterials()
-    {
-        _materialCache.Clear();
     }
 
     /// <summary>
@@ -463,24 +636,22 @@ public sealed class ViewportRenderer : IDisposable
     /// <param name="storedInSrgb">
     /// True for base-color / albedo (glTF sRGB). False for normal, MR, AO, opacity — linear data.
     /// </param>
-    public IRHITexture? LoadCachedTexture(string path, bool storedInSrgb = false)
+    public IRHITexture? LoadCachedTexture(string path, bool storedInSrgb = false, string? baseDirectory = null)
     {
         if (string.IsNullOrEmpty(path)) 
         {
             return null;
         }
 
-        var cacheKey = (path, storedInSrgb);
+        string resolvedPath = ResolveAssetFile(path, baseDirectory) ?? path;
+        var cacheKey = (resolvedPath, storedInSrgb);
         if (_textureCache.TryGetValue(cacheKey, out var cached)) 
         {
             return cached;
         }
 
-        if (!System.IO.File.Exists(path))
-        {
-            // Do NOT cache null here — the file may appear after a re-import.
+        if (!System.IO.File.Exists(resolvedPath))
             return null;
-        }
 
         try
         {
@@ -488,21 +659,66 @@ public sealed class ViewportRenderer : IDisposable
 
             if (path.EndsWith(".blueskyasset", StringComparison.OrdinalIgnoreCase))
             {
-                tex = LoadTextureFromBlueAsset(path, storedInSrgb);
+                tex = LoadTextureFromBlueAsset(resolvedPath, storedInSrgb);
             }
             else
             {
-                tex = LoadTextureFromRawFile(path, storedInSrgb);
+                tex = LoadTextureFromRawFile(resolvedPath, storedInSrgb);
             }
 
             _textureCache[cacheKey] = tex;
             return tex;
         }
-        catch (Exception ex)
+        catch (Exception)
         {
-            Console.WriteLine($"[Viewport] Exception loading texture '{path}': {ex.Message}");
             return null; // Not cached — will retry next frame
         }
+    }
+
+    /// <summary>
+    /// Resolves imported references after a project or asset folder has moved.
+    /// Importers may store absolute paths, project-relative paths, or just a
+    /// sidecar filename; all three forms are accepted here.
+    /// </summary>
+    private static string? ResolveAssetFile(string? path, string? baseDirectory = null)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            return null;
+
+        string normalized = path.Replace('\\', Path.DirectorySeparatorChar);
+        var candidates = new List<string> { normalized };
+
+        if (!Path.IsPathRooted(normalized))
+            candidates.Add(Path.Combine(Environment.CurrentDirectory, normalized));
+
+        if (!string.IsNullOrWhiteSpace(baseDirectory))
+        {
+            string baseDir = baseDirectory!;
+            candidates.Add(Path.Combine(baseDir, normalized));
+            string fileName = Path.GetFileName(normalized);
+            if (!string.IsNullOrEmpty(fileName))
+            {
+                candidates.Add(Path.Combine(baseDir, fileName));
+                candidates.Add(Path.Combine(baseDir, "Textures", fileName));
+                candidates.Add(Path.Combine(Directory.GetParent(baseDir)?.FullName ?? baseDir, fileName));
+            }
+        }
+
+        foreach (string candidate in candidates)
+        {
+            try
+            {
+                if (File.Exists(candidate))
+                    return Path.GetFullPath(candidate);
+            }
+            catch
+            {
+                // Ignore malformed stale references and continue with the
+                // remaining recovery candidates.
+            }
+        }
+
+        return null;
     }
 
     private IRHITexture? LoadTextureFromBlueAsset(string path, bool storedInSrgb)
@@ -537,6 +753,7 @@ public sealed class ViewportRenderer : IDisposable
             DebugName = asset.AssetName
         });
         _device.UploadTexture(tex, data);
+        BlueSky.Rendering.Strata.StrataBenchmark.RecordTextureBytes(data.Length);
         
         return tex;
     }
@@ -564,58 +781,142 @@ public sealed class ViewportRenderer : IDisposable
             DebugName = System.IO.Path.GetFileNameWithoutExtension(path)
         });
         _device.UploadTexture(tex, image.Data);
+        BlueSky.Rendering.Strata.StrataBenchmark.RecordTextureBytes(image.Data.Length);
         return tex;
     }
 
     /// <summary>
-    /// Demand-load a MaterialAsset from a .blueskyasset file.
-    /// Results are cached by path. Missing files are NOT permanently cached.
-    /// Does NOT mutate the loaded asset (no metallic hotfix — import correctly instead).
+    /// Builds GPU resources for the active StrataOverride (once per material).
+    /// Returns false when no override is set.
     /// </summary>
-    private BlueSky.Core.Assets.MaterialAsset? LoadCachedMaterialInternal(string? path)
+    private bool EnsureStrataOverride()
     {
-        if (string.IsNullOrEmpty(path)) 
+        var mat = StrataOverride;
+        if (mat == null)
         {
-            return null;
+            _strataReady = false;
+            _strataReadyFor = "";
+            return false;
         }
-        
-        if (_materialCache.TryGetValue(path, out var cached)) 
+        if (_strataReady && _strataReadyFor == mat.Name)
+            return true;
+
+        _strataParams = BlueSky.Rendering.Strata.StrataSurfaceUpload.BuildParams(mat);
+        foreach (var kv in _strataTexCache)
+            kv.Value?.Dispose();
+        _strataTexCache.Clear();
+
+        foreach (var tex in mat.Textures)
         {
-            return cached;
+            int size = (int)tex.PayloadSize;
+            int off = (int)tex.PayloadOffset;
+            if (size <= 0 || off < 0 || off + size > mat.Payload.Length)
+            {
+                Console.WriteLine($"[Strata] Texture '{tex.Slot}' range invalid — skipped.");
+                continue;
+            }
+            var bytes = new byte[size];
+            Buffer.BlockCopy(mat.Payload, off, bytes, 0, size);
+            var gpu = _device.CreateTexture(new TextureDesc
+            {
+                Width = (uint)Math.Max(1, tex.Width),
+                Height = (uint)Math.Max(1, tex.Height),
+                Depth = 1,
+                MipLevels = 1,
+                ArrayLayers = 1,
+                Format = tex.Colorspace == BlueSky.Rendering.Strata.StrataColorspace.Srgb
+                    ? TextureFormat.RGBA8Srgb : TextureFormat.RGBA8Unorm,
+                Usage = TextureUsage.Sampled | TextureUsage.TransferDst,
+                DebugName = $"Strata_{mat.Name}_{tex.Slot}"
+            });
+            _device.UploadTexture(gpu, bytes);
+            _strataTexCache[tex.Slot] = gpu;
         }
 
-        if (!System.IO.File.Exists(path))
-        {
-            // Not cached — will retry after re-import
-            return null;
-        }
+        _strataReady = true;
+        _strataReadyFor = mat.Name;
+        Console.WriteLine($"[Strata] Override '{mat.Name}' ready: mask=0x{((uint)mat.Features):X}, textures={_strataTexCache.Count}");
+        return true;
+    }
 
+    private bool StrataTexture(string slot, out IRHITexture? tex)
+        => _strataTexCache.TryGetValue(slot, out tex) && tex != null;
+
+    /// <summary>
+    /// Forces the global Strata override to rebuild next frame.
+    /// The override cache is name-keyed; same-name mutations need this.
+    /// </summary>
+    public void InvalidateStrata()
+    {
+        _strataReady = false;
+        _strataReadyFor = "";
+    }
+
+    /// <summary>
+    /// Resolves a submesh to its .stratamat path via slot links.
+    /// Missing link → loud log once per mesh+slot, orange clay fallback.
+    /// </summary>
+    private string? ResolveSubmeshStrata(string assetId, MeshGPUData gpuData, int submeshIdx)
+    {
+        int slot = (submeshIdx >= 0 && submeshIdx < gpuData.SubmeshSlots.Count)
+            ? gpuData.SubmeshSlots[submeshIdx] : 0;
+        if (gpuData.StrataLinks.TryGetValue(slot, out var path) && !string.IsNullOrWhiteSpace(path))
+            return path;
+        string key = $"{assetId}#{slot}";
+        if (_strataMissingLogged.Add(key))
+            Console.WriteLine($"[Strata] Mesh '{assetId}' slot {slot} has no .stratamat link — orange clay. Re-import to assign.");
+        return null;
+    }
+
+    // ── Per-file .stratamat cache (mesh slot assignment) ────────────────────
+    private readonly Dictionary<string, (BlueSky.Rendering.Strata.StrataSurfaceUpload.SurfaceParams Params,
+        Dictionary<string, IRHITexture> Texs)> _strataFileCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _strataFailLogged = new();
+    private readonly HashSet<string> _strataMissingLogged = new();
+    private readonly HashSet<string> _strataMaskLogged = new();
+
+    /// <summary>
+    /// Loads + uploads one .stratamat file (cached by path). Loud on failure.
+    /// </summary>
+    private bool EnsureStrataFile(string path)
+    {
+        if (_strataFileCache.ContainsKey(path))
+            return true;
         try
         {
-            var mat = BlueSky.Core.Assets.MaterialAsset.Load(path);
-            _materialCache[path] = mat; // cache even if null (decode failure)
-            return mat;
+            var mat = BlueSky.Rendering.Strata.StrataMaterial.Load(path);
+            var pars = BlueSky.Rendering.Strata.StrataSurfaceUpload.BuildParams(mat);
+            var texs = new Dictionary<string, IRHITexture>(StringComparer.OrdinalIgnoreCase);
+            foreach (var tex in mat.Textures)
+            {
+                int size = (int)tex.PayloadSize, off = (int)tex.PayloadOffset;
+                if (size <= 0 || off < 0 || off + size > mat.Payload.Length)
+                    continue;
+                var bytes = new byte[size];
+                Buffer.BlockCopy(mat.Payload, off, bytes, 0, size);
+                var gpu = _device.CreateTexture(new TextureDesc
+                {
+                    Width = (uint)Math.Max(1, tex.Width),
+                    Height = (uint)Math.Max(1, tex.Height),
+                    Depth = 1, MipLevels = 1, ArrayLayers = 1,
+                    Format = tex.Colorspace == BlueSky.Rendering.Strata.StrataColorspace.Srgb
+                        ? TextureFormat.RGBA8Srgb : TextureFormat.RGBA8Unorm,
+                    Usage = TextureUsage.Sampled | TextureUsage.TransferDst,
+                    DebugName = $"StrataFile_{mat.Name}_{tex.Slot}"
+                });
+                _device.UploadTexture(gpu, bytes);
+                texs[tex.Slot] = gpu;
+            }
+            _strataFileCache[path] = (pars, texs);
+            return true;
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[Viewport] Exception loading material '{path}': {ex.Message}");
-            return null;
+            if (_strataFailLogged.Add(path))
+                Console.WriteLine($"[Strata] .stratamat unreadable '{path}': {ex.Message} — orange clay fallback.");
+            return false;
         }
     }
-
-    /// <summary>
-    /// Evict a material from the cache so the next render picks up the saved version.
-    /// Call this from the MaterialEditor after saving.
-    /// </summary>
-    public void InvalidateMaterial(string path)
-    {
-        _materialCache.Remove(path);
-    }
-
-    /// <summary>
-    /// Evict a texture from the cache and dispose the GPU resource.
-    /// Call this after re-importing a texture asset.
-    /// </summary>
     public void InvalidateTexture(string path)
     {
         var toRemove = new System.Collections.Generic.List<(string Path, bool Srgb)>();
@@ -632,17 +933,11 @@ public sealed class ViewportRenderer : IDisposable
     }
 
     /// <summary>
-    /// Evict all cached materials and textures for a given mesh asset directory.
-    /// Call this after re-importing a mesh (which regenerates all its materials/textures).
+    /// Evict all cached textures and mesh data for a given mesh asset directory.
+    /// Call this after re-importing a mesh.
     /// </summary>
     public void InvalidateAssetDirectory(string assetDir)
     {
-        // Evict materials
-        var matKeys = new System.Collections.Generic.List<string>(
-            System.Linq.Enumerable.Where(_materialCache.Keys,
-                k => k.StartsWith(assetDir, StringComparison.OrdinalIgnoreCase)));
-        foreach (var k in matKeys) _materialCache.Remove(k);
-
         // Evict textures (cache keys are path + sRGB flag)
         var texKeys = new System.Collections.Generic.List<(string Path, bool Srgb)>(
             System.Linq.Enumerable.Where(_textureCache.Keys,
@@ -663,12 +958,10 @@ public sealed class ViewportRenderer : IDisposable
             _meshCache.Remove(k);
         }
 
-        Console.WriteLine($"[Viewport] Invalidated cache for: {assetDir}");
     }
 
     /// <summary>
-    /// Drop cached GPU mesh data for one asset so the next draw reloads submeshes + materialSlotPaths from disk.
-    /// Call after static mesh metadata changes or when debugging stale material bindings.
+    /// Drop cached GPU mesh data for one asset so the next draw reloads submeshes from disk.
     /// </summary>
     public void InvalidateMeshGpuCache(string meshAssetId)
     {
@@ -676,11 +969,7 @@ public sealed class ViewportRenderer : IDisposable
         if (!_meshCache.TryGetValue(meshAssetId, out var gpu)) return;
         gpu.Dispose();
         _meshCache.Remove(meshAssetId);
-        Console.WriteLine($"[Viewport] Invalidated GPU mesh cache: {meshAssetId}");
     }
-
-    /// <summary>Next draw queues up to 100 submesh lines printed to the console (see F10 in EditorApp).</summary>
-    public void RequestMaterialDebugDump() => _materialDebugDumpPending = true;
 
     // ── Public API ──────────────────────────────────────────────────────
 
@@ -705,35 +994,75 @@ public sealed class ViewportRenderer : IDisposable
         _device.UpdateBuffer(_uniformBuffer!, MemoryMarshal.AsBytes(shadowUniformSpan));
         cmd.SetUniformBuffer(_uniformBuffer!, 10); // LightSpaceMatrix at slot 10
 
-        var query = _world.CreateQuery().All<TransformComponent>().All<BlueSky.Core.ECS.Builtin.StaticMeshComponent>().Build();
+        var query = _world.CreateQuery()
+            .All<TransformComponent>()
+            .Any(typeof(BlueSky.Core.ECS.Builtin.StaticMeshComponent), typeof(BlueSky.Core.ECS.Builtin.SkeletalMeshComponent))
+            .Build();
         var chunks = _world.GetQueryChunks(query);
         
-        var shadowItems = new System.Collections.Generic.List<(MeshGPUData GpuData, SubmeshInfo Submesh, TransformComponent Transform)>();
+        var shadowItems = new System.Collections.Generic.List<(MeshGPUData GpuData, SubmeshInfo Submesh, BlueSky.Core.Math.Matrix4x4 ModelMatrix)>();
 
         foreach (var chunk in chunks)
         {
             int transformIndex = chunk.GetComponentIndex(typeof(TransformComponent));
-            int meshIndex = chunk.GetComponentIndex(typeof(BlueSky.Core.ECS.Builtin.StaticMeshComponent));
+            int staticMeshIndex = chunk.GetComponentIndex(typeof(BlueSky.Core.ECS.Builtin.StaticMeshComponent));
+            int skeletalMeshIndex = chunk.GetComponentIndex(typeof(BlueSky.Core.ECS.Builtin.SkeletalMeshComponent));
             for (int i = 0; i < chunk.Count; i++)
             {
                 var transform = chunk.GetComponent<TransformComponent>(i, transformIndex);
-                var staticMesh = chunk.GetComponent<BlueSky.Core.ECS.Builtin.StaticMeshComponent>(i, meshIndex);
+                
+                bool hasSkeletal = skeletalMeshIndex >= 0 && chunk.Archetype.HasComponent(typeof(BlueSky.Core.ECS.Builtin.SkeletalMeshComponent));
+                bool hasStatic = staticMeshIndex >= 0 && chunk.Archetype.HasComponent(typeof(BlueSky.Core.ECS.Builtin.StaticMeshComponent));
 
-                if (string.IsNullOrEmpty(staticMesh.MeshAssetId) || !_meshCache.TryGetValue(staticMesh.MeshAssetId, out var gpuData)) continue;
+                string assetId = "";
+                if (hasSkeletal)
+                {
+                    var skeletalMesh = chunk.GetComponent<BlueSky.Core.ECS.Builtin.SkeletalMeshComponent>(i, skeletalMeshIndex);
+                    assetId = skeletalMesh.MeshAssetPath;
+                }
+                else if (hasStatic)
+                {
+                    var staticMesh = chunk.GetComponent<BlueSky.Core.ECS.Builtin.StaticMeshComponent>(i, staticMeshIndex);
+                    assetId = staticMesh.MeshAssetId;
+                }
+
+                if (string.IsNullOrEmpty(assetId) || !_meshCache.TryGetValue(assetId, out var gpuData)) continue;
                 
                 // Ensure submeshes list is initialized
                 if (gpuData.Submeshes == null || gpuData.Submeshes.Count == 0)
                 {
                     gpuData.Submeshes = new List<SubmeshInfo>
                     {
-                        new SubmeshInfo { IndexOffset = 0, IndexCount = gpuData.IndexCount, MaterialSlot = 0 }
+                        new SubmeshInfo { IndexOffset = 0, IndexCount = gpuData.IndexCount }
                     };
                 }
 
-                foreach (var submesh in gpuData.Submeshes)
+                uint entityId = (uint)chunk.GetEntities()[i].Id;
+                var carController = BlueSky.Core.Gameplay.CarControllerSystem.GetController(entityId);
+
+                for (int submeshIdx = 0; submeshIdx < gpuData.Submeshes.Count; submeshIdx++)
                 {
+                    var submesh = gpuData.Submeshes[submeshIdx];
                     if (submesh.IndexCount == 0) continue;
-                    shadowItems.Add((gpuData, submesh, transform));
+
+                    // Transparent surfaces cast no shadow (glass must not blob).
+                    // Cache-backed: dict hits after the first frame.
+                    string? shadowStrata = ResolveSubmeshStrata(assetId, gpuData, submeshIdx);
+                    if (shadowStrata != null && EnsureStrataFile(shadowStrata) &&
+                        _strataFileCache.TryGetValue(shadowStrata, out var shadowFile) &&
+                        (shadowFile.Params.FeatureMask &
+                            (uint)BlueSky.Rendering.Strata.StrataFeature.Transparent) != 0)
+                        continue;
+
+                    var modelMatrix = transform.WorldMatrix;
+
+                    if (carController != null)
+                    {
+                        var cacheKey = (assetId, entityId);
+                        modelMatrix = ApplyWheelTransformIfApplicable(gpuData, submesh, submeshIdx, carController, cacheKey, modelMatrix);
+                    }
+
+                    shadowItems.Add((gpuData, submesh, modelMatrix));
                 }
             }
         }
@@ -751,80 +1080,127 @@ public sealed class ViewportRenderer : IDisposable
                 if (shadowInstances.Count < MaxFrameInstances)
                     shadowInstances.Add(new EntityUniforms
                     {
-                        Model = ToSystemMatrix4x4(shadowItems[si].Transform.WorldMatrix),
+                        Model = ToSystemMatrix4x4(shadowItems[si].ModelMatrix),
                         Color = System.Numerics.Vector4.One
                     });
             }
-            // Upload ALL shadow instance transforms at once
-            if (_frameInstanceBuffer != null && shadowInstances.Count > 0)
+            // ── FL10.1 / Intel HD 3000 COMPAT FIX ───────────────────────────────
+            // D3D11 FL10.x ignores the FirstInstance argument of DrawIndexedInstanced
+            // (only honored at FL11.0+). So instead of binding the full instance buffer
+            // and using firstInstance = shadowIndices[idx], we rebind a tiny per-draw
+            // instance buffer holding ONLY this item's transform, and draw with
+            // firstInstance = 0. The shadow VS reads EntityUniforms[SV_InstanceID].
+            foreach (var (item, idx) in shadowItems.Select((it, ix) => (it, ix)))
             {
-                int uploadCount = Math.Min(shadowInstances.Count, MaxFrameInstances);
-                ReadOnlySpan<EntityUniforms> shadowSpan = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(shadowInstances).Slice(0, uploadCount);
-                _device.UpdateBuffer(_frameInstanceBuffer, MemoryMarshal.AsBytes(shadowSpan));
-            }
-
-            var batches = shadowItems.Select((item, idx) => (item, idx))
-                .GroupBy(x => new { x.item.GpuData, x.item.Submesh.IndexOffset });
-
-            cmd.SetUniformBuffer(_frameInstanceBuffer!, 30);
-
-            foreach (var batch in batches)
-            {
-                var batchItems = batch.ToList();
-                var firstItem = batchItems[0].item;
-
-                cmd.SetVertexBuffer(firstItem.GpuData.VertexBuffer!, 0);
-                cmd.SetIndexBuffer(firstItem.GpuData.IndexBuffer!, IndexType.UInt32);
-
-                for (int i = 0; i < batchItems.Count; i += MaxInstancesPerBatch)
+                int slot = shadowIndices[idx];
+                if (_instanceBuffer != null && slot < shadowInstances.Count)
                 {
-                    int count = Math.Min(MaxInstancesPerBatch, batchItems.Count - i);
-                    uint firstInst = (uint)shadowIndices[batchItems[i].idx];
-                    
-                    cmd.DrawIndexed((uint)firstItem.Submesh.IndexCount, (uint)count, (uint)firstItem.Submesh.IndexOffset, 0, firstInst);
+                    var one = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(shadowInstances)
+                        .Slice(slot, 1);
+                    _device.UpdateBuffer(_instanceBuffer, MemoryMarshal.AsBytes(one));
+                    cmd.SetUniformBuffer(_instanceBuffer, 12);
                 }
+
+                cmd.SetVertexBuffer(item.GpuData.VertexBuffer!, 0);
+                cmd.SetIndexBuffer(item.GpuData.IndexBuffer!, IndexType.UInt32);
+                BlueSky.Rendering.Strata.StrataBenchmark.RecordShadowDraw();
+
+                cmd.DrawIndexed((uint)item.Submesh.IndexCount, 1, (uint)item.Submesh.IndexOffset, 0, 0);
             }
         }
 
         cmd.EndRenderPass();
     }
 
-    private static readonly System.Numerics.Vector3 DefaultAlbedo = new(0.5f, 0.5f, 0.5f); // Neutral grey fallback - visible even without material
+    private static readonly System.Numerics.Vector3 DefaultAlbedo = new(0.95f, 0.5f, 0.2f); // Historic orange clay (pre-material days)
     
+    /// <summary>Uploads 9 SH coeffs to the b16 probe buffer.</summary>
+    private void UploadShCoeffs(System.Numerics.Vector3[] coeffs)
+    {
+        if (_shBuffer == null || coeffs == null || coeffs.Length < 9)
+            return;
+        var shBytes = new byte[9 * 16];
+        for (int i = 0; i < 9; i++)
+        {
+            Buffer.BlockCopy(BitConverter.GetBytes(coeffs[i].X), 0, shBytes, i * 16, 4);
+            Buffer.BlockCopy(BitConverter.GetBytes(coeffs[i].Y), 0, shBytes, i * 16 + 4, 4);
+            Buffer.BlockCopy(BitConverter.GetBytes(coeffs[i].Z), 0, shBytes, i * 16 + 8, 4);
+            Buffer.BlockCopy(BitConverter.GetBytes(1f), 0, shBytes, i * 16 + 12, 4);
+        }
+        _device.UpdateBuffer(_shBuffer, shBytes);
+    }
+
+    /// <summary>
+    /// Phase-B probe lookup: aggregates probes across every pack referenced
+    /// by loaded meshes, selects nearest-in-radius to the camera, projects
+    /// its samples (cached per probe). Returns "" + null when no probe
+    /// covers the camera (sky fallback). Pack stays the database throughout.
+    /// </summary>
+    private string TryGetProbeKey(System.Numerics.Vector3 cameraPos,
+        out System.Numerics.Vector3[]? coeffs)
+    {
+        coeffs = null;
+        var keys = new System.Collections.Generic.List<string>();
+        var flat = new System.Collections.Generic.List<BlueSky.Rendering.Strata.StrataPack.PackProbe>();
+        foreach (var assetId in _meshCache.Keys)
+        {
+            if (!_meshPackCache.TryGetValue(assetId, out var packPath))
+            {
+                packPath = "";
+                try
+                {
+                    var h = BlueSky.Core.Assets.BlueAsset.LoadHeader(assetId);
+                    if (h != null && h.Metadata.TryGetValue("sourcePack", out var sp) &&
+                        !string.IsNullOrWhiteSpace(sp))
+                        packPath = sp;
+                }
+                catch { }
+                _meshPackCache[assetId] = packPath;
+            }
+            if (string.IsNullOrEmpty(packPath))
+                continue;
+            if (!_packProbeCache.TryGetValue(packPath, out var probes))
+            {
+                probes = new System.Collections.Generic.List<BlueSky.Rendering.Strata.StrataPack.PackProbe>();
+                try
+                {
+                    var decoded = BlueSky.Rendering.Strata.StrataPack.DecodeHeader(packPath);
+                    if (decoded.Header.Probes != null)
+                        probes.AddRange(decoded.Header.Probes);
+                }
+                catch { }
+                _packProbeCache[packPath] = probes;
+            }
+            for (int i = 0; i < probes.Count; i++)
+            {
+                keys.Add(packPath + "#" + probes[i].Name);
+                flat.Add(probes[i]);
+            }
+        }
+        if (flat.Count == 0)
+            return "";
+        int sel = BlueSky.Rendering.Strata.StrataSkyProbe.SelectProbe(flat, cameraPos);
+        if (sel < 0)
+            return "";
+        string key = keys[sel];
+        var pr = flat[sel];
+        if (!_probeCoeffCache.TryGetValue(key, out var c))
+        {
+            int n = pr.SampleDirs.Length / 3;
+            c = BlueSky.Rendering.Strata.StrataSkyProbe.ProjectSamples(pr.SampleDirs, pr.SampleColors, n);
+            _probeCoeffCache[key] = c;
+        }
+        coeffs = c;
+        return key;
+    }
+
 public void Render(IRHICommandBuffer cmd, System.Numerics.Matrix4x4 view, System.Numerics.Matrix4x4 proj,
     System.Numerics.Vector3 cameraPos, int viewportX, int viewportY, int viewportW, int viewportH, float deltaTime)
 {
     _frameCount++;
     _elapsedTime += deltaTime;
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    // SUPER VERBOSE DEBUG MODE
-    // ═══════════════════════════════════════════════════════════════════════════
     
-    if (VerboseViewportLogging && _frameCount <= 10)
-    {
-        Console.WriteLine($"[DEBUG] Frame {_frameCount}: cameraPos={cameraPos}");
-        Console.WriteLine($"[DEBUG] UniformBuffer={_uniformBuffer != null}, ShadowMap={_shadowMap != null}");
-        Console.WriteLine($"[DEBUG] Pipelines: sky={_skyPipeline != null}, grid={_gridPipeline != null}, mesh={_meshPipeline != null}");
-    }
-    
-    if (VerboseViewportLogging && (_frameCount == 60 || _frameCount == 120 || _frameCount == 180))
-    {
-        Console.WriteLine($"[ViewportRenderer] Frame {_frameCount}: viewport=({viewportX},{viewportY}) size={viewportW}x{viewportH}");
-        Console.WriteLine($"[ViewportRenderer] Pipelines: sky={_skyPipeline != null}, grid={_gridPipeline != null}, mesh={_meshPipeline != null}");
-        Console.WriteLine($"[ViewportRenderer] SunDirection={BlueSky.Core.WorldEnvironment.GlobalEnvironment.SunDirection}");
-        Console.WriteLine($"[ViewportRenderer] CameraPos={cameraPos}");
-        
-        // Check if there are any entities
-        var query = _world.CreateQuery().All<TransformComponent>().All<BlueSky.Core.ECS.Builtin.StaticMeshComponent>().Build();
-        var chunks = _world.GetQueryChunks(query);
-        int entityCount = 0;
-        foreach (var chunk in chunks)
-        {
-            entityCount += chunk.Count;
-        }
-        Console.WriteLine($"[ViewportRenderer] Entity count in world: {entityCount}");
-    }
     
 // ── build uniforms for sky/grid (old ViewUniforms) ────────────────────────────────
 var viewProj = view * proj;
@@ -846,17 +1222,73 @@ var uniforms = new ViewUniforms
     LightSpaceMatrix = lightViewProj,
     CameraPos = new System.Numerics.Vector4(cameraPos, 1.0f),
     Time = _elapsedTime,
-    SunDirection = sunDirectionValue,
+    SunDirection = new System.Numerics.Vector4(sunDirectionValue, 0.0f),
     WindParams = BlueSky.Core.WorldEnvironment.GlobalEnvironment.WindParams
 };
 
 var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
-_device.UpdateBuffer(_uniformBuffer!, MemoryMarshal.AsBytes(uniformSpan));
+    _device.UpdateBuffer(_uniformBuffer!, MemoryMarshal.AsBytes(uniformSpan));
+    if (_frameCount == 1 || _frameCount % 900 == 0)
+        Console.WriteLine($"[Viewport] sun=({sunDirectionValue.X:F3},{sunDirectionValue.Y:F3},{sunDirectionValue.Z:F3}) cam=({cameraPos.X:F1},{cameraPos.Y:F1},{cameraPos.Z:F1})");
 
-if (VerboseViewportLogging && _frameCount <= 3)
-{
-    Console.WriteLine($"[DEBUG] Uniform buffer updated. SunDirection in struct: {uniforms.SunDirection}");
-}
+        // ── Strata sky capture: recapture SH when sun or preset changes ──────
+        // Phase-B probes override the sky when the camera stands inside one:
+        // same b16 buffer, renderer agnostic to coefficient origin.
+        float skyPreset = Math.Clamp(
+            BlueSky.Core.WorldEnvironment.GlobalEnvironment.SkyPreset, 0f, 1f);
+        string probeKey = TryGetProbeKey(cameraPos, out var probeCoeffs);
+        if (probeCoeffs != null)
+        {
+            if (_shBuffer != null && probeKey != _shProbeKey)
+            {
+                UploadShCoeffs(probeCoeffs);
+                _shProbeKey = probeKey;
+            }
+            _shSunDir = sunDirectionValue;
+            _shPreset = skyPreset;
+        }
+        else
+        {
+            _shProbeKey = "";
+            if (_shBuffer != null && (float.IsNaN(_shSunDir.X) || float.IsNaN(_shPreset) ||
+                System.Numerics.Vector3.DistanceSquared(sunDirectionValue, _shSunDir) > 1e-8f ||
+                Math.Abs(skyPreset - _shPreset) > 1e-6f))
+            {
+                var coeffs = BlueSky.Rendering.Strata.StrataSkyCapture.CaptureCoefficients(
+                    sunDirectionValue, skyPreset);
+                UploadShCoeffs(coeffs);
+                _shSunDir = sunDirectionValue;
+                _shPreset = skyPreset;
+            }
+        }
+        // b17 sky params follow the preset independently of the SH source:
+        // fs_sky and the env sampler read it every frame.
+        if (_skyParamsBuffer != null && (float.IsNaN(_shParamsPreset) ||
+            Math.Abs(skyPreset - _shParamsPreset) > 1e-6f))
+        {
+            var skyBytes = new byte[16];
+            Buffer.BlockCopy(BitConverter.GetBytes(skyPreset), 0, skyBytes, 0, 4);
+            _device.UpdateBuffer(_skyParamsBuffer, skyBytes);
+            _shParamsPreset = skyPreset;
+        }
+
+        // ── Strata grade LUT (generated once, display-referred 16³ strip) ────
+        if (_gradeLut == null)
+        {
+            byte[] lut = BlueSky.Rendering.Strata.StrataLut.Generate();
+            _gradeLut = _device.CreateTexture(new TextureDesc
+            {
+                Width = (uint)BlueSky.Rendering.Strata.StrataLut.StripWidth,
+                Height = (uint)BlueSky.Rendering.Strata.StrataLut.StripHeight,
+                Depth = 1,
+                MipLevels = 1,
+                ArrayLayers = 1,
+                Format = TextureFormat.RGBA8Unorm,
+                Usage = TextureUsage.Sampled | TextureUsage.TransferDst,
+                DebugName = "Strata.GradeLUT"
+            });
+            _device.UploadTexture(_gradeLut, lut);
+        }
 
         // ── build uniforms for Horizon Lighting (new HorizonViewUniforms) ─────────────────
         System.Numerics.Matrix4x4.Invert(view, out var invView);
@@ -878,25 +1310,65 @@ if (VerboseViewportLogging && _frameCount <= 3)
 
         // ── Prepare Horizon Lighting buffers ─────────────────────────────
         Span<LightData> lightDataArray = stackalloc LightData[64];
-        lightDataArray[0] = new LightData
+        lightDataArray.Clear();
+        int lightCount = 0;
+        foreach (var entity in _world.GetAllEntities())
         {
-            Position = System.Numerics.Vector3.Zero,
-            Range = 1000f,
-            Direction = System.Numerics.Vector3.Normalize(new System.Numerics.Vector3(0.3f, 0.7f, 0.4f)), // Natural sun angle
-            Intensity = 3.5f, // Realistic sun intensity - not too bright
-            Color = new System.Numerics.Vector3(1.0f, 0.98f, 0.95f), // Natural daylight color
-            Type = 0, // Directional
-            InnerAngle = 0f,
-            OuterAngle = 0f,
-            Attenuation = 1f,
-            CastShadows = 1,
-            Volumetric = 0,
-        };
+            if (!_world.HasComponent<LightComponent>(entity)) continue;
+
+            var light = _world.GetComponent<LightComponent>(entity);
+            var transform = _world.HasComponent<TransformComponent>(entity)
+                ? _world.GetComponent<TransformComponent>(entity)
+                : TransformComponent.Default;
+            var direction = transform.Forward;
+            var directionLength = MathF.Sqrt(direction.X * direction.X + direction.Y * direction.Y + direction.Z * direction.Z);
+            if ((light.Type is LightComponent.LightType.Directional or LightComponent.LightType.Spot) && directionLength <= 1e-5f)
+                continue;
+            if (lightCount >= lightDataArray.Length) break;
+
+            float outerAngle = Math.Clamp(light.SpotAngle, 1.0f, 179.0f) * (MathF.PI / 360.0f);
+            lightDataArray[lightCount++] = new LightData
+            {
+                Position = new System.Numerics.Vector3(transform.Position.X, transform.Position.Y, transform.Position.Z),
+                Range = light.Type == LightComponent.LightType.Directional ? float.MaxValue : Math.Max(light.Range, 0.001f),
+                Direction = new System.Numerics.Vector3(direction.X, direction.Y, direction.Z) / Math.Max(directionLength, 1e-5f),
+                Intensity = Math.Max(light.Intensity, 0.0f),
+                Color = new System.Numerics.Vector3(light.Color.X, light.Color.Y, light.Color.Z),
+                Type = light.Type switch
+                {
+                    LightComponent.LightType.Directional => 0,
+                    LightComponent.LightType.Point => 1,
+                    LightComponent.LightType.Spot => 2,
+                    _ => 1,
+                },
+                InnerAngle = outerAngle * 0.8f,
+                OuterAngle = outerAngle,
+                Attenuation = 0.1f,
+                CastShadows = light.CastsShadows ? 1 : 0,
+                Volumetric = 0,
+            };
+        }
+
+        // Keep a useful daylight default for scenes that have no explicit lights.
+        if (lightCount == 0)
+        {
+            lightDataArray[0] = new LightData
+            {
+                Position = System.Numerics.Vector3.Zero,
+                Range = 1000f,
+                Direction = System.Numerics.Vector3.Normalize(new System.Numerics.Vector3(0.3f, 0.7f, 0.4f)),
+                Intensity = 3.5f,
+                Color = new System.Numerics.Vector3(1.0f, 0.98f, 0.95f),
+                Type = 0,
+                Attenuation = 0.1f,
+                CastShadows = 1,
+            };
+            lightCount = 1;
+        }
         
         _device.UpdateBuffer(_lightBuffer!, MemoryMarshal.AsBytes(lightDataArray));
         
         // Update light count
-        int lightCount = 1;
         var lightCountSpan = MemoryMarshal.CreateSpan(ref lightCount, 1);
         _device.UpdateBuffer(_lightCountBuffer!, MemoryMarshal.AsBytes(lightCountSpan));
         
@@ -909,25 +1381,45 @@ if (VerboseViewportLogging && _frameCount <= 3)
             EnableVolumetrics = 0,
             EnableContactShadows = 1,
             Exposure = 1.0f, // Natural exposure - not overblown
-            AmbientColor = new System.Numerics.Vector3(0.15f, 0.18f, 0.22f), // Realistic ambient - subtle sky bounce
+            AmbientPacked = new System.Numerics.Vector4(0.15f, 0.18f, 0.22f, 1.0f), // color + intensity
         };
+        _debugFrameCounter++;
         var lightSettingsSpan = MemoryMarshal.CreateSpan(ref lightSettings, 1);
         _device.UpdateBuffer(_lightSettingsBuffer!, MemoryMarshal.AsBytes(lightSettingsSpan));
         
-        // Default material data (will be overridden per-submesh in RenderEntities)
-        var material = new MaterialData
+        // Default surface data (strata override when active, else orange clay)
+        EnsureStrataOverride();
+        var surface = new AstraSurface
         {
-            AlbedoAndMetallic = new System.Numerics.Vector4(DefaultAlbedo, 0.1f), // Bright white with low metallic
-            Roughness = 0.6f, // Slightly rougher for better lighting
-            Ao = 1.0f,
-            Emission = 0.0f,
-            Subsurface = 0.0f,
-            UseAlbedoTex = 0,
-            UseNormalTex = 0,
-            UseRMATex = 0,
+            BaseColor = _strataReady
+                ? new System.Numerics.Vector4(
+                    _strataParams.BaseColor.X, _strataParams.BaseColor.Y, _strataParams.BaseColor.Z, 1.0f)
+                : new System.Numerics.Vector4(DefaultAlbedo, 1.0f),
+            Roughness = _strataReady ? _strataParams.Roughness : 0.6f,
+            Metallic = _strataReady ? _strataParams.Metallic : 0.0f,
+            AO = _strataReady ? _strataParams.AO : 1.0f,
+            EmissiveStrength = 0.0f,
+            SpecularStrength = 0.5f,
+            Shininess = 32.0f,
+            Alpha = _strataReady ? _strataParams.Alpha : 1.0f,
+            // Bits 14-15 carry the transient debug-view selector (0 when Lit).
+            Flags = (uint)(AstraSurfaceFlags.ReceiveShadow | AstraSurfaceFlags.CastShadow)
+                  | ((uint)(Program._debugView & 7) << 14),
+            UVScale = new System.Numerics.Vector2(1, 1),
+            UVOffset = new System.Numerics.Vector2(0, 0),
+            EmissiveColor = new System.Numerics.Vector4(0, 0, 0, 1),
+            Custom0 = _strataReady
+                ? new System.Numerics.Vector4(1, _strataParams.Wrap, _strataParams.DetailTile, _strataParams.ToksvigK)
+                : new System.Numerics.Vector4(1, 0, 0, 0),
+            Custom1 = _strataReady
+                ? new System.Numerics.Vector4(_strataParams.FeatureMask,
+                    _strataParams.ClearcoatTintLinear.X,
+                    _strataParams.ClearcoatTintLinear.Y,
+                    _strataParams.ClearcoatTintLinear.Z)
+                : new System.Numerics.Vector4(0, 1, 1, 1),
         };
-        var materialSpan = MemoryMarshal.CreateSpan(ref material, 1);
-        _device.UpdateBuffer(_materialBuffer!, MemoryMarshal.AsBytes(materialSpan));
+        var surfaceSpan = MemoryMarshal.CreateSpan(ref surface, 1);
+        _device.UpdateBuffer(_surfaceBuffer!, MemoryMarshal.AsBytes(surfaceSpan));
 
         // ── set viewport + scissor to the panel region ────────────────────
         cmd.SetViewport(new Viewport
@@ -958,7 +1450,12 @@ if (VerboseViewportLogging && _frameCount <= 3)
             _terrainRenderer.Render(cmd, _world, _terrainSystem, _meshPipeline,
                 _uniformBuffer!, _lightBuffer!, _lightCountBuffer!, _lightSettingsBuffer!,
                 _shadowMap, _defaultWhiteTexture, _defaultNormalTexture,
-                _defaultRmaTexture, _defaultWhiteOpacityTexture, viewProj, cameraPos);
+                _defaultRmaTexture, _defaultWhiteOpacityTexture,
+                _defaultWhiteTexture, _defaultNormalTexture, _gradeLut, _defaultWhiteTexture,
+                Program._debugView, viewProj, cameraPos);
+        }
+        else
+        {
         }
 
         // ── 3. Entities (BEFORE grid for correct transparency) ───────────
@@ -968,21 +1465,40 @@ if (VerboseViewportLogging && _frameCount <= 3)
         RenderEntities(cmd, view, proj, cameraPos);
 
         // ── 4. Grid (AFTER opaque world geometry for proper alpha blending) ───────────
-        cmd.SetPipeline(_gridPipeline!);
-        cmd.SetUniformBuffer(_uniformBuffer!, 10);
-        cmd.Draw(6); // fullscreen quad (2 tris)
+        if (_showEditorGizmos && _gridPipeline != null)
+        {
+            cmd.SetPipeline(_gridPipeline);
+            cmd.SetUniformBuffer(_uniformBuffer!, 10);
+            cmd.Draw(6); // fullscreen quad (2 tris)
+        }
         
         // ── 5. Editor Gizmos (LAST — always on top) ──────────────────────
         RenderTerrainBrushPreview(cmd, viewProj);
         RenderGizmos(cmd, viewProj, cameraPos);
+        RenderPhysicsDebugShapes(cmd, viewProj);
     }
 
     // ── Pipeline creation ───────────────────────────────────────────────
 
+    private IRHIPipeline? TryCreatePipeline(GraphicsPipelineDesc desc)
+    {
+        if (desc.VertexShader.Bytecode == null || desc.VertexShader.Bytecode.Length == 0)
+        {
+            Console.WriteLine($"[DX11] Pipeline '{desc.DebugName}' skipped — vertex shader bytecode empty");
+            return null;
+        }
+        if (desc.FragmentShader.Bytecode == null || desc.FragmentShader.Bytecode.Length == 0)
+        {
+            Console.WriteLine($"[DX11] Pipeline '{desc.DebugName}' skipped — pixel shader bytecode empty");
+            return null;
+        }
+        return _device.CreateGraphicsPipeline(desc);
+    }
+
     private void CreatePipelines()
     {
         // Sky pipeline — no depth, draws behind everything
-        _skyPipeline = _device.CreateGraphicsPipeline(new GraphicsPipelineDesc
+        _skyPipeline = TryCreatePipeline(new GraphicsPipelineDesc
         {
             VertexShader   = MakeShader(ShaderStage.Vertex, "vs_sky"),
             FragmentShader = MakeShader(ShaderStage.Fragment, "fs_sky"),
@@ -1005,7 +1521,7 @@ if (VerboseViewportLogging && _frameCount <= 3)
         });
 
         // Grid pipeline — depth test + alpha blend for fadeout
-        _gridPipeline = _device.CreateGraphicsPipeline(new GraphicsPipelineDesc
+        _gridPipeline = TryCreatePipeline(new GraphicsPipelineDesc
         {
             VertexShader   = MakeShader(ShaderStage.Vertex, "vs_grid"),
             FragmentShader = MakeShader(ShaderStage.Fragment, "fs_grid"),
@@ -1029,7 +1545,7 @@ if (VerboseViewportLogging && _frameCount <= 3)
         });
 
         // Mesh pipeline — Simple lighting (compatible with existing uniforms)
-        _meshPipeline = _device.CreateGraphicsPipeline(new GraphicsPipelineDesc
+        _meshPipeline = TryCreatePipeline(new GraphicsPipelineDesc
         {
             VertexShader   = MakeShader(ShaderStage.Vertex, "vs_mesh"),
             FragmentShader = MakeShader(ShaderStage.Fragment, "fs_mesh"),
@@ -1061,7 +1577,7 @@ if (VerboseViewportLogging && _frameCount <= 3)
         });
 
         // Transparent mesh pipeline — alpha blend, no depth write
-        _transparentMeshPipeline = _device.CreateGraphicsPipeline(new GraphicsPipelineDesc
+        _transparentMeshPipeline = TryCreatePipeline(new GraphicsPipelineDesc
         {
             VertexShader   = MakeShader(ShaderStage.Vertex, "vs_mesh"),
             FragmentShader = MakeShader(ShaderStage.Fragment, "fs_mesh"),
@@ -1092,13 +1608,8 @@ if (VerboseViewportLogging && _frameCount <= 3)
             DebugName       = "ViewportMesh_Transparent",
         });
 
-        // Double-sided mesh pipeline (optional for opaque parts that need it, though current _meshPipeline is none anyway)
-        // For now, let's keep _meshPipeline as None and just use it for everything. 
-        // But if we want to be correct, we should have Opaque-BackfaceCull too.
-        _doubleSidedMeshPipeline = _meshPipeline;
-
         // Wireframe pipeline — super thin outline for 3D depth perception
-        _wireframePipeline = _device.CreateGraphicsPipeline(new GraphicsPipelineDesc
+        _wireframePipeline = TryCreatePipeline(new GraphicsPipelineDesc
         {
             VertexShader   = MakeShader(ShaderStage.Vertex, "vs_mesh"),
             FragmentShader = MakeShader(ShaderStage.Fragment, "fs_wireframe"),
@@ -1135,7 +1646,7 @@ if (VerboseViewportLogging && _frameCount <= 3)
         });
 
         // Shadow pipeline — writes only depth from light's perspective
-        _shadowPipeline = _device.CreateGraphicsPipeline(new GraphicsPipelineDesc
+        _shadowPipeline = TryCreatePipeline(new GraphicsPipelineDesc
         {
             VertexShader   = MakeShader(ShaderStage.Vertex, "horizon_shadow_vertex"),
             FragmentShader = MakeShader(ShaderStage.Fragment, "horizon_shadow_fragment"),
@@ -1170,7 +1681,7 @@ if (VerboseViewportLogging && _frameCount <= 3)
         // contain vs_gizmo/fs_gizmo the rest of the renderer still works fine.
         try
         {
-            _gizmoPipeline = _device.CreateGraphicsPipeline(new GraphicsPipelineDesc
+            _gizmoPipeline = TryCreatePipeline(new GraphicsPipelineDesc
             {
                 VertexShader   = MakeShader(ShaderStage.Vertex, "vs_gizmo"),
                 FragmentShader = MakeShader(ShaderStage.Fragment, "fs_gizmo"),
@@ -1200,12 +1711,9 @@ if (VerboseViewportLogging && _frameCount <= 3)
                 DepthFormat     = TextureFormat.Depth32Float,
                 DebugName       = "ViewportGizmo",
             });
-            Console.WriteLine("[ViewportRenderer] Gizmo pipeline created successfully");
         }
-        catch (Exception ex)
+        catch (Exception)
         {
-            Console.WriteLine($"[ViewportRenderer] Gizmo pipeline creation failed (non-fatal): {ex.Message}");
-            Console.WriteLine("[ViewportRenderer] Gizmos will be disabled. Recompile shaders to enable.");
             _gizmoPipeline = null;
         }
     }
@@ -1222,9 +1730,8 @@ if (VerboseViewportLogging && _frameCount <= 3)
 
             string[] searchPaths = new[]
             {
-                System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Shaders", baseName + ".metallib"),
                 System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Editor", "Shaders", baseName + ".metallib"),
-                System.IO.Path.Combine(System.IO.Directory.GetCurrentDirectory(), "Shaders", baseName + ".metallib"),
+                System.IO.Path.Combine(System.IO.Directory.GetCurrentDirectory(), "Editor", "Shaders", baseName + ".metallib"),
                 System.IO.Path.Combine(System.IO.Directory.GetCurrentDirectory(), "BlueSkyEngine", "Editor", "Shaders", baseName + ".metallib"),
             };
 
@@ -1232,12 +1739,6 @@ if (VerboseViewportLogging && _frameCount <= 3)
             if (found != null)
             {
                 bytecode = System.IO.File.ReadAllBytes(found);
-                Console.WriteLine($"[ViewportRenderer] Loaded Metal library: {found} ({bytecode.Length} bytes)");
-            }
-            else
-            {
-                Console.WriteLine($"[ViewportRenderer] WARNING: {baseName}.metallib not found. Searched:");
-                foreach (var p in searchPaths) Console.WriteLine($"  {p}");
             }
         }
         else if (_device.Backend == RHIBackend.DirectX11)
@@ -1245,29 +1746,45 @@ if (VerboseViewportLogging && _frameCount <= 3)
             // For DX11, load pre-compiled .cso (Compiled Shader Object) files
             // These are generated by running compile_shaders.bat with fxc.exe
             string csoFileName = GetCSOFileName(stage, entryPoint);
-            
+
             if (!string.IsNullOrEmpty(csoFileName))
             {
                 string[] searchPaths = new[]
                 {
+                    // Exe-relative paths (self-contained / publish builds)
                     System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Shaders", csoFileName),
                     System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Editor", "Shaders", csoFileName),
+                    // CWD-relative paths (dev builds / dotnet run)
                     System.IO.Path.Combine(System.IO.Directory.GetCurrentDirectory(), "Editor", "Shaders", csoFileName),
                     System.IO.Path.Combine(System.IO.Directory.GetCurrentDirectory(), "BlueSkyEngine", "Editor", "Shaders", csoFileName),
+                    // Parent of exe dir (publish layout puts .cso one level up)
+                    System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "Editor", "Shaders", csoFileName),
                 };
-                
+
                 string? found = System.Array.Find(searchPaths, System.IO.File.Exists);
                 if (found != null)
                 {
                     bytecode = System.IO.File.ReadAllBytes(found);
-                    Console.WriteLine($"[ViewportRenderer] Loaded DX11 shader: {found} ({bytecode.Length} bytes)");
+                    string magic = bytecode.Length >= 4
+                        ? $"0x{bytecode[0]:X2}0x{bytecode[1]:X2}0x{bytecode[2]:X2}0x{bytecode[3]:X2}"
+                        : "N/A";
+                    Console.WriteLine($"[DX11] .cso loaded: '{csoFileName}' path={found} size={bytecode.Length}b first4=[{magic}]");
                 }
                 else
                 {
-                    Console.WriteLine($"[ViewportRenderer] WARNING: {csoFileName} not found. Run compile_shaders.bat to compile HLSL shaders.");
-                    Console.WriteLine($"  Searched:");
-                    foreach (var p in searchPaths) Console.WriteLine($"    {p}");
+                    Console.WriteLine($"[DX11] .cso NOT FOUND: '{csoFileName}' — falling back to D3DCompile");
                 }
+            }
+
+            // Fallback: if no .cso found, compile HLSL at runtime with D3DCompile
+            if (bytecode.Length == 0)
+            {
+                Console.WriteLine($"[DX11] D3DCompile fallback for '{entryPoint}' stage={stage}");
+                bytecode = CompileHLSLAtRuntime(stage, entryPoint);
+                if (bytecode.Length > 0)
+                    Console.WriteLine($"[DX11] D3DCompile fallback OK: '{entryPoint}' → {bytecode.Length} bytes");
+                else
+                    Console.WriteLine($"[DX11] D3DCompile fallback FAILED: '{entryPoint}'");
             }
         }
 
@@ -1315,6 +1832,101 @@ if (VerboseViewportLogging && _frameCount <= 3)
         };
     }
 
+    /// <summary>
+    /// Compile HLSL at runtime via D3DCompile when no .cso files are available.
+    /// </summary>
+    private byte[] CompileHLSLAtRuntime(ShaderStage stage, string entryPoint)
+    {
+        try
+        {
+            // Determine which HLSL file and shader target
+            string hlslFile, target;
+            if (entryPoint.Contains("ui"))
+            {
+                hlslFile = "simple_ui.hlsl";
+            }
+            else
+            {
+                hlslFile = "viewport_3d.hlsl";
+            }
+
+            if (stage == ShaderStage.Vertex)
+                target = "vs_4_1";
+            else
+                target = "ps_4_1";
+
+            Console.WriteLine($"[DX11] CompileHLSLAtRuntime: entry='{entryPoint}' stage={stage} target={target} hlslFile={hlslFile}");
+
+            // Search for the HLSL source file
+            string[] hlslSearchPaths = new[]
+            {
+                System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Editor", "Shaders", hlslFile),
+                System.IO.Path.Combine(System.IO.Directory.GetCurrentDirectory(), "Editor", "Shaders", hlslFile),
+                System.IO.Path.Combine(System.IO.Directory.GetCurrentDirectory(), "BlueSkyEngine", "Editor", "Shaders", hlslFile),
+                System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "Editor", "Shaders", hlslFile),
+            };
+
+            string? hlslPath = System.Array.Find(hlslSearchPaths, System.IO.File.Exists);
+            if (hlslPath == null)
+            {
+                Console.WriteLine($"[DX11] HLSL NOT FOUND for '{entryPoint}'. Searched:");
+                foreach (var p in hlslSearchPaths)
+                    Console.WriteLine($"  - {p} (exists={System.IO.File.Exists(p)})");
+                return Array.Empty<byte>();
+            }
+
+            Console.WriteLine($"[DX11] HLSL found: {hlslPath}");
+
+            string hlslSource = System.IO.File.ReadAllText(hlslPath);
+            IntPtr pSrc = Marshal.StringToHGlobalAnsi(hlslSource);
+            IntPtr pCode = IntPtr.Zero, pErrors = IntPtr.Zero;
+
+            int hr = D3D11Interop.D3DCompile(
+                pSrc,
+                (nuint)System.Text.Encoding.UTF8.GetByteCount(hlslSource),
+                hlslPath,
+                IntPtr.Zero, IntPtr.Zero,
+                entryPoint, target,
+                0, 0,
+                out pCode, out pErrors);
+
+            Marshal.FreeHGlobal(pSrc);
+
+            if (pErrors != IntPtr.Zero)
+            {
+                string? errMsg = Marshal.PtrToStringAnsi(D3D11Interop.GetBufferPointer(pErrors));
+                if (!string.IsNullOrEmpty(errMsg))
+                    Console.WriteLine($"[DX11] D3DCompile errors for '{entryPoint}':\n{errMsg}");
+                Marshal.Release(pErrors);
+            }
+
+            if (hr < 0 || pCode == IntPtr.Zero)
+            {
+                Console.WriteLine($"[DX11] D3DCompile FAILED for '{entryPoint}' (hr=0x{hr:X8})");
+                return Array.Empty<byte>();
+            }
+
+            nuint size = D3D11Interop.GetBufferSize(pCode);
+            IntPtr pData = D3D11Interop.GetBufferPointer(pCode);
+            byte[] result = new byte[size];
+            Marshal.Copy(pData, result, 0, (int)size);
+            Marshal.Release(pCode);
+
+            // Validate DXBC magic (first 4 bytes should be 'D','X','B','C')
+            if (result.Length >= 4 && result[0] == 'D' && result[1] == 'X' && result[2] == 'B' && result[3] == 'C')
+                Console.WriteLine($"[DX11] D3DCompile OK: '{entryPoint}' → {result.Length} bytes (valid DXBC)");
+            else
+                Console.WriteLine($"[DX11] D3DCompile WARNING: '{entryPoint}' → {result.Length} bytes (NOT DXBC! first4=[{result[0]:X2},{result[1]:X2},{result[2]:X2},{result[3]:X2}])");
+
+            return result;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[DX11] CompileHLSLAtRuntime EXCEPTION for '{entryPoint}': {ex.GetType().Name}: {ex.Message}");
+            return Array.Empty<byte>();
+        }
+    }
+
     private void CreateBuffers()
     {
         _shadowMap = _device.CreateTexture(new TextureDesc
@@ -1344,7 +1956,7 @@ if (VerboseViewportLogging && _frameCount <= 3)
         
         _instanceBuffer = _device.CreateBuffer(new BufferDesc
         {
-            Size       = (ulong)Marshal.SizeOf<EntityUniforms>() * MaxInstancesPerBatch,
+            Size       = (ulong)Marshal.SizeOf<EntityUniforms>() * MaxFrameInstances,
             Usage      = BufferUsage.Uniform,
             MemoryType = MemoryType.CpuToGpu,
             DebugName  = "Viewport.InstanceUB",
@@ -1393,35 +2005,55 @@ if (VerboseViewportLogging && _frameCount <= 3)
             DebugName  = "Viewport.LightCount",
         });
         
-        _materialBuffer = _device.CreateBuffer(new BufferDesc
+        _surfaceBuffer = _device.CreateBuffer(new BufferDesc
         {
-            Size       = (ulong)Marshal.SizeOf<MaterialData>(),
+            Size       = (ulong)Marshal.SizeOf<AstraSurface>(),
             Usage      = BufferUsage.Uniform,
             MemoryType = MemoryType.CpuToGpu,
-            DebugName  = "Viewport.MaterialUB",
+            DebugName  = "Viewport.SurfaceUB",
+        });
+
+        _shBuffer = _device.CreateBuffer(new BufferDesc
+        {
+            Size       = 9 * 16, // 9 SH coeffs × float4
+            Usage      = BufferUsage.Uniform,
+            MemoryType = MemoryType.CpuToGpu,
+            DebugName  = "Viewport.SHProbe",
+        });
+
+        _skyParamsBuffer = _device.CreateBuffer(new BufferDesc
+        {
+            Size       = 16, // SkyPreset float + 12B padding
+            Usage      = BufferUsage.Uniform,
+            MemoryType = MemoryType.CpuToGpu,
+            DebugName  = "Viewport.SkyParams",
         });
     }
 
 
     private void RenderEntities(IRHICommandBuffer cmd, System.Numerics.Matrix4x4 view, System.Numerics.Matrix4x4 proj, System.Numerics.Vector3 cameraPos)
     {
+        BlueSky.Rendering.Strata.StrataBenchmark.BeginSection("mesh");
+        try
+        {
         // Bind buffers for fs_mesh (viewport_3d.metal)
         // CRITICAL: fs_mesh uses the FULL ViewUniforms struct (with sunDirection, windParams)
         // NOT the smaller HorizonViewUniforms. Binding the wrong struct here was causing
         // garbage sunDirection → zero direct lighting → black models.
         // Buffer 10: ViewUniforms (full struct with sunDirection for light calculation)
         cmd.SetUniformBuffer(_uniformBuffer!, 10);
-        // Buffer 11: MaterialData (Bound per-mesh in BindMaterial)
-        // Buffer 13: LightData* (fs_mesh expects slot 13, NOT 12!)
+        // Buffer 13: LightData* (fs_mesh expects slot 13)
         cmd.SetUniformBuffer(_lightBuffer!, 13);
-        // Buffer 14: int lightCount (fs_mesh expects slot 14, NOT 13!)
+        // Buffer 14: int lightCount
         cmd.SetUniformBuffer(_lightCountBuffer!, 14);
-        // Buffer 15: LightingSettings (fs_mesh expects slot 15, NOT 14!)
+        // Buffer 15: LightingSettings
         cmd.SetUniformBuffer(_lightSettingsBuffer!, 15);
-
-        bool matDbgRun = _materialDebugDumpPending;
-        int matDbgBudget = matDbgRun ? 100 : 0;
-        int matDbgPrinted = 0;
+        // Buffer 16: Strata sky SH probe (9 float4)
+        if (_shBuffer != null)
+            cmd.SetUniformBuffer(_shBuffer, 16);
+        // Buffer 17: sky params (SkyPreset float)
+        if (_skyParamsBuffer != null)
+            cmd.SetUniformBuffer(_skyParamsBuffer, 17);
 
         // Extract frustum planes from ViewProj for CPU culling
         var viewProj = view * proj;
@@ -1430,7 +2062,7 @@ if (VerboseViewportLogging && _frameCount <= 3)
 
         var query = _world.CreateQuery()
             .All<TransformComponent>()
-            .All<BlueSky.Core.ECS.Builtin.StaticMeshComponent>()
+            .Any(typeof(BlueSky.Core.ECS.Builtin.StaticMeshComponent), typeof(BlueSky.Core.ECS.Builtin.SkeletalMeshComponent))
             .Build();
 
         // 1. Gather all submeshes to be rendered
@@ -1441,12 +2073,15 @@ if (VerboseViewportLogging && _frameCount <= 3)
         foreach (var chunk in chunks)
         {
             int transformIndex = chunk.GetComponentIndex(typeof(TransformComponent));
-            int meshIndex = chunk.GetComponentIndex(typeof(BlueSky.Core.ECS.Builtin.StaticMeshComponent));
+            int staticMeshIndex = chunk.GetComponentIndex(typeof(BlueSky.Core.ECS.Builtin.StaticMeshComponent));
+            int skeletalMeshIndex = chunk.GetComponentIndex(typeof(BlueSky.Core.ECS.Builtin.SkeletalMeshComponent));
+
+            bool chunkHasStatic = staticMeshIndex >= 0 && chunk.Archetype.HasComponent(typeof(BlueSky.Core.ECS.Builtin.StaticMeshComponent));
+            bool chunkHasSkeletal = skeletalMeshIndex >= 0 && chunk.Archetype.HasComponent(typeof(BlueSky.Core.ECS.Builtin.SkeletalMeshComponent));
 
             for (int i = 0; i < chunk.Count; i++)
             {
                 var transform = chunk.GetComponent<TransformComponent>(i, transformIndex);
-                var staticMesh = chunk.GetComponent<BlueSky.Core.ECS.Builtin.StaticMeshComponent>(i, meshIndex);
                 
                 // CPU frustum culling
                 var posMatrix = transform.WorldMatrix;
@@ -1461,164 +2096,91 @@ if (VerboseViewportLogging && _frameCount <= 3)
                     continue;
                 }
 
-                string assetId = staticMesh.MeshAssetId;
-                if (string.IsNullOrEmpty(assetId)) continue;
+                // Resolve asset ID from whichever mesh component is present
+                string assetId = "";
+
+                if (chunkHasSkeletal)
+                {
+                    var skeletalMesh = chunk.GetComponent<BlueSky.Core.ECS.Builtin.SkeletalMeshComponent>(i, skeletalMeshIndex);
+                    assetId = skeletalMesh.MeshAssetPath;
+                }
+                else if (chunkHasStatic)
+                {
+                    var staticMesh = chunk.GetComponent<BlueSky.Core.ECS.Builtin.StaticMeshComponent>(i, staticMeshIndex);
+                    assetId = staticMesh.MeshAssetId;
+                }
+
+                if (string.IsNullOrEmpty(assetId))
+                {
+                    continue;
+                }
 
                 if (!_meshCache.TryGetValue(assetId, out var gpuData))
                 {
-                    // Demand-load the mesh
-                    gpuData = LoadGpuMesh(assetId);
+                    // Do not block the viewport frame on disk I/O / JSON decoding.
+                    // The asset is uploaded to the GPU on this thread once available.
+                    var load = _pendingMeshAssets.GetOrAdd(assetId,
+                        id => Task.Run(() => BlueSky.Core.Assets.BlueAsset.Load(id)));
+                    if (!load.IsCompleted) continue;
+                    _pendingMeshAssets.TryRemove(assetId, out _);
+                    BlueSky.Core.Assets.BlueAsset? loadedAsset = null;
+                    try { loadedAsset = load.GetAwaiter().GetResult(); }
+                    catch { /* LoadGpuMesh handles invalid/missing assets as unavailable. */ }
+                    gpuData = LoadGpuMesh(assetId, loadedAsset);
+                    if (gpuData == null && chunkHasSkeletal)
+                    {
+                        if (_frameCount % 120 == 0)
+                            Console.WriteLine($"[ViewportRenderer] LoadGpuMesh FAILED for skeletal mesh: {assetId}");
+                    }
                 }
 
                 if (gpuData != null)
                 {
+                    if (_frameCount <= 3 && chunkHasSkeletal)
+                        Console.WriteLine($"[ViewportRenderer] SKELETAL ENTITY FOUND: asset={assetId} submeshes={gpuData.Submeshes.Count} verts={gpuData.RawVertexPositions?.Length ?? 0}");
+
                     gpuData.LastUsedFrame = _frameCount;
                     float distSq = System.Numerics.Vector3.DistanceSquared(cameraPos, entityPos);
 
-                    foreach (var submesh in gpuData.Submeshes)
+                    for (int submeshIdx = 0; submeshIdx < gpuData.Submeshes.Count; submeshIdx++)
                     {
+                        var submesh = gpuData.Submeshes[submeshIdx];
                         if (submesh.IndexCount == 0) continue;
 
-                        string matPath = staticMesh.GetEffectiveMaterial(submesh.MaterialSlot);
-                        if (string.IsNullOrEmpty(matPath))
-                        {
-                            if (!gpuData.MaterialSlotPaths.TryGetValue(submesh.MaterialSlot, out matPath!))
-                            {
-                                matPath = staticMesh.MaterialAssetId;
-                            }
-                        }
+                        // No material system: every surface shades with the global
+                        // historic orange clay. Lighting still varies per pixel.
 
-                        var material = LoadCachedMaterialInternal(matPath);
-
-                        if (matDbgBudget > 0)
-                        {
-                            bool inlineMat = !string.IsNullOrEmpty(staticMesh.GetEffectiveMaterial(submesh.MaterialSlot));
-                            gpuData.MaterialSlotPaths.TryGetValue(submesh.MaterialSlot, out var metaSlotPath);
-                            string? ap = material?.AlbedoTexturePath;
-                            string? rp = material?.RMATexturePath;
-                            bool aOk = !string.IsNullOrEmpty(ap) && System.IO.File.Exists(ap);
-                            bool rOk = !string.IsNullOrEmpty(rp) && System.IO.File.Exists(rp);
-                            var ent = chunk.GetEntities()[i];
-                            Console.WriteLine(
-                                $"[MatDbg] mesh={System.IO.Path.GetFileName(assetId)} ent={ent.Id} slot={submesh.MaterialSlot} " +
-                                $"path={(string.IsNullOrEmpty(matPath) ? "EMPTY" : System.IO.Path.GetFileName(matPath))} " +
-                                $"inline={inlineMat} metaPath={(string.IsNullOrEmpty(metaSlotPath) ? "-" : System.IO.Path.GetFileName(metaSlotPath))} " +
-                                $"mat={(material == null ? "NULL" : "OK")} albedoDisk={aOk} rmaDisk={rOk}");
-                            matDbgBudget--;
-                            matDbgPrinted++;
-                        }
                         // Record the instance index DURING gather so DrawBatched can
                         // use it as firstInstance — no matrix-equality search needed.
                         int instIdx = _frameInstances.Count;
-                        var color = material != null
-                            ? new System.Numerics.Vector4(material.Albedo.X, material.Albedo.Y, material.Albedo.Z, material.Opacity)
-                            : new System.Numerics.Vector4(DefaultAlbedo, 1.0f);
+                        string? strataPath = ResolveSubmeshStrata(assetId, gpuData, submeshIdx);
+                        var tint = new System.Numerics.Vector4(DefaultAlbedo, 1.0f);
+                        uint itemMask = 0u;
+                        if (strataPath != null && EnsureStrataFile(strataPath) &&
+                            _strataFileCache.TryGetValue(strataPath, out var tintFile))
+                        {
+                            tint = new System.Numerics.Vector4(
+                                tintFile.Params.BaseColor.X, tintFile.Params.BaseColor.Y,
+                                tintFile.Params.BaseColor.Z, 1.0f);
+                            itemMask = tintFile.Params.FeatureMask;
+                        }
+                        else if (_strataReady)
+                        {
+                            tint = new System.Numerics.Vector4(
+                                _strataParams.BaseColor.X, _strataParams.BaseColor.Y, _strataParams.BaseColor.Z, 1.0f);
+                            itemMask = _strataParams.FeatureMask;
+                        }
+                        var color = tint;
                         
                         var modelMatrix = transform.WorldMatrix;
                         
                         // Check if this entity has a CarController (for wheel steering/spinning animation)
                         var carController = BlueSky.Core.Gameplay.CarControllerSystem.GetController((uint)chunk.GetEntities()[i].Id);
-                        if (carController != null && carController.AnimController != null && carController.SkeletalMesh != null)
+                        if (carController != null)
                         {
-                            // ── Skeletal-mesh path: use bone voting ──
-                            int boneIdx = -1;
-                            var skelMesh = carController.SkeletalMesh;
-                            if (skelMesh.Vertices != null && gpuData.RawIndices != null)
-                            {
-                                int indexOffset = submesh.IndexOffset;
-                                int indexEnd = Math.Min(indexOffset + submesh.IndexCount, gpuData.RawIndices.Length);
-                                int maxVertsToCheck = Math.Min(16, (indexEnd - indexOffset) / 3);
-
-                                var boneVotes = new Dictionary<int, float>();
-
-                                for (int vi = 0; vi < maxVertsToCheck && (indexOffset + vi * 3) < indexEnd; vi++)
-                                {
-                                    int idxPos = indexOffset + vi * 3;
-                                    if (idxPos >= gpuData.RawIndices.Length) break;
-                                    uint vertexIdx = gpuData.RawIndices[idxPos];
-                                    if (vertexIdx >= skelMesh.Vertices.Length) continue;
-
-                                    var vertex = skelMesh.Vertices[vertexIdx];
-                                    AccumulateBoneVote(boneVotes, vertex.BoneIndex0, vertex.BoneWeight0);
-                                    AccumulateBoneVote(boneVotes, vertex.BoneIndex1, vertex.BoneWeight1);
-                                    AccumulateBoneVote(boneVotes, vertex.BoneIndex2, vertex.BoneWeight2);
-                                    AccumulateBoneVote(boneVotes, vertex.BoneIndex3, vertex.BoneWeight3);
-                                }
-
-                                float maxVote = 0f;
-                                foreach (var kvp in boneVotes)
-                                {
-                                    if (kvp.Value > maxVote)
-                                    {
-                                        maxVote = kvp.Value;
-                                        boneIdx = kvp.Key;
-                                    }
-                                }
-
-                                if (maxVote < 0.1f)
-                                    boneIdx = -1;
-                            }
-
-                            if (boneIdx >= 0 && boneIdx < carController.AnimController.BoneTransforms.Length)
-                            {
-                                var boneMatrix = carController.AnimController.BoneTransforms[boneIdx];
-                                var engineBone = new BlueSky.Core.Math.Matrix4x4(
-                                    boneMatrix.M11, boneMatrix.M12, boneMatrix.M13, boneMatrix.M14,
-                                    boneMatrix.M21, boneMatrix.M22, boneMatrix.M23, boneMatrix.M24,
-                                    boneMatrix.M31, boneMatrix.M32, boneMatrix.M33, boneMatrix.M34,
-                                    boneMatrix.M41, boneMatrix.M42, boneMatrix.M43, boneMatrix.M44
-                                );
-                                
-                                // Log which submeshes are animated (write to file for debugging)
-                                if (_debugFrameCounter++ % 60 == 0)
-                                {
-                                    var logPath = "/tmp/bluesky_bones.txt";
-                                    var msg = $"[Rendering] Submesh #{gpuData.Submeshes.IndexOf(submesh)} → bone {boneIdx}\n";
-                                    System.IO.File.AppendAllText(logPath, msg);
-                                }
-                                
-                                modelMatrix = engineBone * modelMatrix;
-                            }
-                        }
-                        else if (carController != null && carController.WheelCount >= 4
-                                 && gpuData.RawIndices != null && gpuData.RawVertexPositions != null)
-                        {
-                            // ── Static-mesh fallback: centroid-based wheel detection ──
-                            // Map each submesh to a wheel slot by comparing its vertex
-                            // centroid against the car controller's wheel positions.
                             uint entId = (uint)chunk.GetEntities()[i].Id;
                             var cacheKey = (assetId, entId);
-
-                            if (!_submeshWheelMap.TryGetValue(cacheKey, out int[] wheelMap))
-                            {
-                                wheelMap = BuildSubmeshWheelMap(gpuData, carController);
-                                _submeshWheelMap[cacheKey] = wheelMap;
-                            }
-
-                            // Find current submesh's index in the submesh list
-                            int submeshIdx = gpuData.Submeshes.IndexOf(submesh);
-                            if (submeshIdx >= 0 && submeshIdx < wheelMap.Length && wheelMap[submeshIdx] >= 0)
-                            {
-                                int wheelSlot = wheelMap[submeshIdx];
-                                var wheelRot = carController.GetWheelTransformMatrix(wheelSlot);
-                                Console.WriteLine($"[ViewportRenderer] 🎨 Entity_{chunk.GetEntities()[i].Id}: Applied static wheel transform slot={wheelSlot} to submesh");
-                                
-                                // Compute the submesh centroid so we can rotate around it
-                                var centroid = ComputeSubmeshCentroid(gpuData, submesh);
-
-                                // Build: Translate(-centroid) * Rotation * Translate(+centroid)
-                                var toOrigin = System.Numerics.Matrix4x4.CreateTranslation(-centroid);
-                                var fromOrigin = System.Numerics.Matrix4x4.CreateTranslation(centroid);
-                                var wheelTransform = toOrigin * wheelRot * fromOrigin;
-
-                                var ew = new BlueSky.Core.Math.Matrix4x4(
-                                    wheelTransform.M11, wheelTransform.M12, wheelTransform.M13, wheelTransform.M14,
-                                    wheelTransform.M21, wheelTransform.M22, wheelTransform.M23, wheelTransform.M24,
-                                    wheelTransform.M31, wheelTransform.M32, wheelTransform.M33, wheelTransform.M34,
-                                    wheelTransform.M41, wheelTransform.M42, wheelTransform.M43, wheelTransform.M44
-                                );
-                                modelMatrix = ew * modelMatrix;
-                            }
+                            modelMatrix = ApplyWheelTransformIfApplicable(gpuData, submesh, submeshIdx, carController, cacheKey, modelMatrix);
                         }
 
                         if (instIdx < MaxFrameInstances)
@@ -1635,15 +2197,17 @@ if (VerboseViewportLogging && _frameCount <= 3)
                         {
                             Entity = chunk.GetEntities()[i],
                             Transform = transform,
-                            StaticMesh = staticMesh,
                             GpuData = gpuData,
                             Submesh = submesh,
-                            Material = material,
+                            StrataPath = strataPath,
                             DistanceToCameraSq = distSq,
                             InstanceIndex = instIdx
                         };
 
-                        if (material != null && material.BlendMode == BlueSky.Rendering.Materials.BlendMode.AlphaBlend)
+                        item.Flags = AstraSurfaceFlags.ReceiveShadow | AstraSurfaceFlags.CastShadow;
+                        // Transparent-bit materials join the back-to-front blend pass;
+                        // everything else stays in the opaque batch.
+                        if ((itemMask & (uint)BlueSky.Rendering.Strata.StrataFeature.Transparent) != 0)
                             transparentItems.Add(item);
                         else
                             opaqueItems.Add(item);
@@ -1652,10 +2216,9 @@ if (VerboseViewportLogging && _frameCount <= 3)
             }
         }
 
-        if (matDbgRun)
+        if (_frameCount == 1 && opaqueItems.Count == 0 && transparentItems.Count == 0)
         {
-            Console.WriteLine($"[MatDbg] === end ({matDbgPrinted} lines) ===");
-            _materialDebugDumpPending = false;
+            Console.WriteLine($"[ViewportRenderer] ⚠️  Frame 1: NO render items! Camera=({cameraPos.X:F1},{cameraPos.Y:F1},{cameraPos.Z:F1}) Chunks={chunks.Count}");
         }
 
         // 2. Upload ALL instance transforms ONCE before any draw calls.
@@ -1669,26 +2232,39 @@ if (VerboseViewportLogging && _frameCount <= 3)
 
         // 3. Draw Transparent Pass (AlphaBlend) - Sorted Back-to-Front
         transparentItems.Sort((a, b) => b.DistanceToCameraSq.CompareTo(a.DistanceToCameraSq));
-        cmd.SetPipeline(_transparentMeshPipeline!);
-        
-        // Cannot strictly batch transparent items if they need strict sorting and overlap differently, 
-        // but for basic rendering we can still batch adjacent items with the same material.
-        // For production, transparency sorting overrides batching, but for simple tests, we use the same batcher.
-        DrawBatched(cmd, transparentItems);
+        cmd.SetPipeline(_transparentMeshPipeline ?? _meshPipeline!);
+
+        // DrawBatched re-sorts for batching by default; the transparent list
+        // must keep its far-to-near order (batching still merges runs).
+        DrawBatched(cmd, transparentItems, keepOrder: true);
 
         // Evict old meshes if cache is too large (VRAM optimization)
         if (_frameCount % 60 == 0 && _meshCache.Count > 64)
         {
             EvictOldMeshes(64);
         }
+        }
+        finally
+        {
+            BlueSky.Rendering.Strata.StrataBenchmark.EndSection("mesh");
+        }
     }
 
     private MeshGPUData? LoadGpuMesh(string assetId)
+        => LoadGpuMesh(assetId, BlueSky.Core.Assets.BlueAsset.Load(assetId));
+
+    private MeshGPUData? LoadGpuMesh(string assetId, BlueSky.Core.Assets.BlueAsset? asset)
     {
         try
         {
-            var asset = BlueSky.Core.Assets.BlueAsset.Load(assetId);
-            if (asset == null || asset.PayloadData == null) return null;
+            if (asset == null)
+            {
+                return null;
+            }
+            if (asset.PayloadData == null)
+            {
+                return null;
+            }
 
             using var ms = new System.IO.MemoryStream(asset.PayloadData);
             using var reader = new System.IO.BinaryReader(ms);
@@ -1722,22 +2298,35 @@ if (VerboseViewportLogging && _frameCount <= 3)
             _device.UpdateBuffer(ib, iData);
 
             var submeshes = new List<SubmeshInfo>();
+            var submeshSlots = new List<int>();
             try
             {
                 int submeshCount = reader.ReadInt32();
                 for (int s = 0; s < submeshCount; s++)
                 {
+                    int indexOffset = reader.ReadInt32();
+                    int indexCount = reader.ReadInt32();
+                    int slot = reader.ReadInt32(); // surface slot: kept for .stratamat links
+                    int totalIndices = (int)(iLen / sizeof(uint));
+                    // Never pass malformed ranges through to DrawIndexed. Check by
+                    // subtraction so offset + count cannot overflow.
+                    if (indexOffset < 0 || indexCount < 0 || indexOffset > totalIndices ||
+                        indexCount > totalIndices - indexOffset)
+                        continue;
                     submeshes.Add(new SubmeshInfo
                     {
-                        IndexOffset = reader.ReadInt32(),
-                        IndexCount = reader.ReadInt32(),
-                        MaterialSlot = reader.ReadInt32()
+                        IndexOffset = indexOffset,
+                        IndexCount = indexCount
                     });
+                    submeshSlots.Add(slot);
                 }
             }
             catch
             {
-                submeshes.Add(new SubmeshInfo { IndexOffset = 0, IndexCount = (int)(iLen / 4), MaterialSlot = 0 });
+                submeshes.Clear();
+                submeshSlots.Clear();
+                submeshes.Add(new SubmeshInfo { IndexOffset = 0, IndexCount = (int)(iLen / 4) });
+                submeshSlots.Add(0);
             }
 
             // Parse vertex positions on the CPU for centroid-based wheel detection.
@@ -1762,39 +2351,28 @@ if (VerboseViewportLogging && _frameCount <= 3)
                 IndexBuffer = ib, 
                 IndexCount = (int)(iLen / 4),
                 Submeshes = submeshes,
+                SubmeshSlots = submeshSlots,
                 RawIndices = rawIndices,
                 RawVertexPositions = rawPositions
             };
-            
-            var fullHeader = BlueSky.Core.Assets.BlueAsset.LoadHeader(assetId);
-            if (fullHeader != null)
+
+            // Strata slot links live in the mesh header (written at import).
+            var linkHeader = BlueSky.Core.Assets.BlueAsset.LoadHeader(assetId);
+            if (linkHeader != null)
             {
-                // Scan ALL material slots — DO NOT break on gaps!
-                // GLTF material indices can be sparse (e.g., slots 0,1,5,12,46)
-                // so we must scan the full range, not stop at the first missing one.
-                int maxSlotToScan = 256;
-                if (fullHeader.Metadata.TryGetValue("materialSlotCount", out var slotCountStr) &&
-                    int.TryParse(slotCountStr, out int declaredCount))
+                for (int s = 0; s < 64; s++)
                 {
-                    maxSlotToScan = declaredCount + 1; // +1 for safety
-                }
-                
-                for (int s = 0; s < maxSlotToScan; s++)
-                {
-                    if (fullHeader.Metadata.TryGetValue($"materialSlot{s}", out var slotPath) && !string.IsNullOrEmpty(slotPath))
-                    {
-                        gpuData.MaterialSlotPaths[s] = slotPath;
-                    }
-                    // DON'T break — continue scanning for sparse indices
+                    if (linkHeader.Metadata.TryGetValue($"strataSlot{s}", out var link)
+                        && !string.IsNullOrWhiteSpace(link))
+                        gpuData.StrataLinks[s] = link;
                 }
             }
             
             _meshCache[assetId] = gpuData;
             return gpuData;
         }
-        catch (Exception ex)
+        catch (Exception)
         {
-            Console.WriteLine($"[Viewport] Failed to load GPU mesh: {ex.Message}");
             return null;
         }
     }
@@ -1803,81 +2381,116 @@ if (VerboseViewportLogging && _frameCount <= 3)
     {
         public Entity Entity;
         public TransformComponent Transform;
-        public BlueSky.Core.ECS.Builtin.StaticMeshComponent StaticMesh;
         public MeshGPUData GpuData;
         public SubmeshInfo Submesh;
-        public BlueSky.Core.Assets.MaterialAsset? Material;
+        public string? StrataPath; // per-submesh .stratamat (null = global/orange path)
         public float DistanceToCameraSq;
-        /// <summary>
-        /// Index of this item's EntityUniforms entry in _frameInstances.
-        /// Set during the gather phase; used as firstInstance in DrawIndexed.
-        /// </summary>
         public int InstanceIndex;
+        public AstraSurfaceFlags Flags;
     }
 
-    private void BindMaterial(IRHICommandBuffer cmd, RenderItem item)
+    private void BindDefaultSurface(IRHICommandBuffer cmd, RenderItem item)
     {
-        var materialAsset = item.Material;
-
+        // Precedence: per-submesh .stratamat file > global StrataOverride > orange clay.
+        // Lighting still varies per pixel in every path.
+        var albedo = DefaultAlbedo;
+        float rough = 0.6f, metal = 0f, ao = 1f;
+        float wrap = 0f, tile = 8f, toksvigK = 0.5f;
+        float alpha = 1f;
+        var coatTint = System.Numerics.Vector3.One;
+        uint mask = 0u;
+        IRHITexture? rmaTex = null, detailA = null, detailN = null;
+        bool fileBound = false;
         IRHITexture? albedoTex = null;
-        IRHITexture? normalTex = null;
-        IRHITexture? rmaTex    = null;
-        IRHITexture? opacityTex = null;
-        
-        if (materialAsset != null)
+        IRHITexture? bentTex = null;
+        if (item.StrataPath != null && EnsureStrataFile(item.StrataPath) &&
+            _strataFileCache.TryGetValue(item.StrataPath, out var file))
         {
-            // glTF base color is sRGB; normal + MR + opacity are linear data.
-            if (!string.IsNullOrEmpty(materialAsset.AlbedoTexturePath))
-                albedoTex = LoadCachedTexture(materialAsset.AlbedoTexturePath, storedInSrgb: true);
-            if (!string.IsNullOrEmpty(materialAsset.NormalTexturePath))
-                normalTex = LoadCachedTexture(materialAsset.NormalTexturePath, storedInSrgb: false);
-            
-            // RMA texture: try RMATexturePath first, fall back to RoughnessTexturePath or MetallicTexturePath
-            if (!string.IsNullOrEmpty(materialAsset.RMATexturePath))
-                rmaTex = LoadCachedTexture(materialAsset.RMATexturePath, storedInSrgb: false);
-            else if (!string.IsNullOrEmpty(materialAsset.RoughnessTexturePath))
-                rmaTex = LoadCachedTexture(materialAsset.RoughnessTexturePath, storedInSrgb: false);
-            else if (!string.IsNullOrEmpty(materialAsset.MetallicTexturePath))
-                rmaTex = LoadCachedTexture(materialAsset.MetallicTexturePath, storedInSrgb: false);
-            
-            if (!string.IsNullOrEmpty(materialAsset.OpacityTexturePath))
-                opacityTex = LoadCachedTexture(materialAsset.OpacityTexturePath, storedInSrgb: false);
+            albedo = new System.Numerics.Vector3(
+                file.Params.BaseColor.X, file.Params.BaseColor.Y, file.Params.BaseColor.Z);
+            rough = file.Params.Roughness;
+            metal = file.Params.Metallic;
+            ao = file.Params.AO;
+            wrap = file.Params.Wrap;
+            tile = file.Params.DetailTile;
+            toksvigK = file.Params.ToksvigK;
+            alpha = file.Params.Alpha;
+            coatTint = file.Params.ClearcoatTintLinear;
+            mask = file.Params.FeatureMask;
+            file.Texs.TryGetValue("rma", out rmaTex);
+            file.Texs.TryGetValue("detailAlbedo", out detailA);
+            file.Texs.TryGetValue("detailNormal", out detailN);
+            file.Texs.TryGetValue("albedo", out albedoTex);
+            file.Texs.TryGetValue("bent", out bentTex);
+            // Data rules: lobes needing textures stay OFF without blobs.
+            if (bentTex == null)
+                mask &= ~(uint)BlueSky.Rendering.Strata.StrataFeature.BentNormal;
+            fileBound = true;
         }
-
-        var submeshMaterial = new MaterialData
+        if (!fileBound && _strataReady)
         {
-            AlbedoAndMetallic = new System.Numerics.Vector4(
-                materialAsset != null ? materialAsset.Albedo.X : DefaultAlbedo.X,
-                materialAsset != null ? materialAsset.Albedo.Y : DefaultAlbedo.Y,
-                materialAsset != null ? materialAsset.Albedo.Z : DefaultAlbedo.Z,
-                materialAsset?.Metallic ?? 0.1f), // Lower metallic for better visibility
-            Roughness = materialAsset?.Roughness ?? 0.6f, // Slightly rougher for better lighting visibility
-            Ao = materialAsset?.AO ?? 1.0f,
-            Emission = materialAsset != null
-                ? (materialAsset.Emission.X + materialAsset.Emission.Y + materialAsset.Emission.Z) / 3.0f * materialAsset.EmissionIntensity
-                : 0.0f,
-            Subsurface = 0.0f,
-            UseAlbedoTex = albedoTex != null ? 1 : 0,
-            UseNormalTex = normalTex != null ? 1 : 0,
-            UseRMATex = rmaTex != null ? 1 : 0,
-            BlendMode = (int)(materialAsset?.BlendMode ?? BlueSky.Rendering.Materials.BlendMode.Opaque),
-            UseOpacityTex = opacityTex != null ? 1 : 0
+            albedo = new System.Numerics.Vector3(
+                _strataParams.BaseColor.X, _strataParams.BaseColor.Y, _strataParams.BaseColor.Z);
+            rough = _strataParams.Roughness;
+            metal = _strataParams.Metallic;
+            ao = _strataParams.AO;
+            wrap = _strataParams.Wrap;
+            tile = _strataParams.DetailTile;
+            toksvigK = _strataParams.ToksvigK;
+            alpha = _strataParams.Alpha;
+            coatTint = _strataParams.ClearcoatTintLinear;
+            mask = _strataParams.FeatureMask;
+            StrataTexture("rma", out rmaTex);
+            StrataTexture("detailAlbedo", out detailA);
+            StrataTexture("detailNormal", out detailN);
+        }
+        // One-line diagnosis aid: which Strata branches + textures feed this draw.
+        // Keyed by strata path (or override name) so it prints once, not per frame.
+        {
+            string maskKey = item.StrataPath ?? (_strataReady ? ("override:" + _strataReadyFor) : "<clay>");
+            if (_strataMaskLogged.Add(maskKey))
+                Console.WriteLine($"[Strata] Draw '{maskKey}' mask=0x{mask:X} " +
+                    $"albedo={albedoTex != null} rma={rmaTex != null} " +
+                    $"detailA={detailA != null} detailN={detailN != null} bent={bentTex != null} " +
+                    $"rough={rough:F2} ao={ao:F2} tile={tile:F1}");
+        }
+        var surface = new AstraSurface
+        {
+            BaseColor = new System.Numerics.Vector4(albedo, 1.0f),
+            Roughness = rough,
+            Metallic = metal,
+            AO = ao,
+            EmissiveStrength = 0.0f,
+            SpecularStrength = 0.5f,
+            Shininess = 32.0f,
+            Alpha = alpha,
+            Flags = (uint)item.Flags | ((uint)(Program._debugView & 7) << 14),
+            UVScale = new System.Numerics.Vector2(1, 1),
+            UVOffset = new System.Numerics.Vector2(0, 0),
+            EmissiveColor = new System.Numerics.Vector4(0, 0, 0, 1),
+            Custom0 = new System.Numerics.Vector4(1, wrap, tile, toksvigK),
+            Custom1 = new System.Numerics.Vector4(mask, coatTint.X, coatTint.Y, coatTint.Z),
         };
-        
-        // CRITICAL: Use SetFragmentUniforms (Metal: setFragmentBytes:length:atIndex:)
-        // instead of UpdateBuffer + SetUniformBuffer. The _materialBuffer is a SHARED
-        // CPU→GPU buffer — UpdateBuffer does a CPU memcpy, and the GPU only reads
-        // at execution time. Since all draws are recorded before GPU executes,
-        // only the LAST UpdateBuffer write is visible → every submesh gets the same
-        // material. SetFragmentUniforms pushes INLINE constant data per draw call,
-        // giving each submesh its own unique snapshot of the material data.
-        var matSpan = MemoryMarshal.CreateSpan(ref submeshMaterial, 1);
-        cmd.SetFragmentUniforms(11, MemoryMarshal.AsBytes(matSpan));
+
+        // Push inline surface data to GPU at slot b11 (and b2 for legacy compatibility)
+        var surfaceSpan = MemoryMarshal.CreateSpan(ref surface, 1);
+        cmd.SetFragmentUniforms(11, MemoryMarshal.AsBytes(surfaceSpan));
+        cmd.SetFragmentUniforms(2, MemoryMarshal.AsBytes(surfaceSpan));
 
         cmd.SetTexture(albedoTex ?? _defaultWhiteTexture!, 2);
-        cmd.SetTexture(normalTex ?? _defaultNormalTexture!, 3);
+        cmd.SetTexture(_defaultNormalTexture!, 3);
         cmd.SetTexture(rmaTex ?? _defaultRmaTexture!, 4);
-        cmd.SetTexture(opacityTex ?? _defaultWhiteOpacityTexture!, 5);
+        cmd.SetTexture(_defaultWhiteOpacityTexture!, 5); // t5 unused in Astra; bind default
+        cmd.SetTexture(detailA ?? _defaultWhiteTexture!, 6);
+        cmd.SetTexture(detailN ?? _defaultNormalTexture!, 7);
+        cmd.SetTexture(bentTex ?? _defaultWhiteTexture!, 9); // t9 bent (world RGB); white = unused
+        int binds = 7;
+        if (_gradeLut != null)
+        {
+            cmd.SetTexture(_gradeLut, 8);
+            binds++;
+        }
+        BlueSky.Rendering.Strata.StrataBenchmark.RecordTextureBind(binds);
     }
     
     // ── Per-frame instance data staging ──────────────────────────────────────
@@ -1897,17 +2510,26 @@ if (VerboseViewportLogging && _frameCount <= 3)
         _device.UpdateBuffer(_frameInstanceBuffer, MemoryMarshal.AsBytes(span));
     }
 
-    private void DrawBatched(IRHICommandBuffer cmd, System.Collections.Generic.List<RenderItem> items)
+    private void DrawBatched(IRHICommandBuffer cmd, System.Collections.Generic.List<RenderItem> items,
+        bool keepOrder = false)
     {
         if (items.Count == 0) return;
-        
-        // FIX: Use _frameInstanceBuffer (uploaded ONCE before any draw calls by
-        // UploadFrameInstances). Each RenderItem carries its exact InstanceIndex,
-        // which becomes the firstInstance parameter in DrawIndexed, pointing the
-        // GPU at that entity's unique slot in the buffer.
-        cmd.SetUniformBuffer(_frameInstanceBuffer!, 30);
-        
-        items.Sort(CompareRenderItemsForBatching);
+
+        // Opaque lists sort for batching; transparent lists arrive far-to-near
+        // and must keep that order (batching still merges adjacent runs).
+        if (!keepOrder)
+            items.Sort(CompareRenderItemsForBatching);
+        bool useStableMetalInstances = cmd is BlueSky.Rendering.RHI.Metal.MetalCommandBuffer &&
+                                        _frameInstanceBuffer != null;
+        if (useStableMetalInstances)
+        {
+            // Metal command buffers execute after this method returns. Reusing
+            // one CPU-visible uniform buffer and rewriting it for every draw
+            // makes earlier draws observe the final upload. The frame buffer is
+            // uploaded once before drawing and baseInstance selects its stable
+            // per-submesh transform.
+            cmd.SetUniformBuffer(_frameInstanceBuffer!, 12);
+        }
 
         for (int i = 0; i < items.Count;)
         {
@@ -1915,11 +2537,9 @@ if (VerboseViewportLogging && _frameCount <= 3)
 
             cmd.SetVertexBuffer(firstItem.GpuData.VertexBuffer!, 0);
             cmd.SetIndexBuffer(firstItem.GpuData.IndexBuffer!, IndexType.UInt32);
-            BindMaterial(cmd, firstItem);
+            BindDefaultSurface(cmd, firstItem);
 
             // Emit one DrawIndexed per contiguous instance chunk.
-            // firstInstance = items[i].InstanceIndex  — the exact slot in
-            // _frameInstanceBuffer that was written for this entity during gather.
             int instanceCount = 1;
             while (i + instanceCount < items.Count && instanceCount < MaxInstancesPerBatch)
             {
@@ -1933,9 +2553,38 @@ if (VerboseViewportLogging && _frameCount <= 3)
                 instanceCount++;
             }
 
-            uint firstInst = (uint)firstItem.InstanceIndex;
+            if (useStableMetalInstances)
+            {
+                cmd.DrawIndexed((uint)firstItem.Submesh.IndexCount, (uint)instanceCount,
+                    (uint)firstItem.Submesh.IndexOffset, 0, (uint)firstItem.InstanceIndex);
+                BlueSky.Rendering.Strata.StrataBenchmark.RecordMeshDraw((long)firstItem.Submesh.IndexCount * instanceCount / 3);
+                i += instanceCount;
+                continue;
+            }
+
+            // ── FL10.1 / Intel HD 3000 COMPAT FIX ───────────────────────────────
+            // D3D11 Feature Level 10.x SILENTLY IGNORES the FirstInstance parameter
+            // of DrawIndexedInstanced — it is only honored at FL11.0+. On Intel HD
+            // 3000 (FL10.1) a non-zero firstInstance is treated as 0, so every
+            // instanced draw would read instance slot 0 and the car would collapse
+            // onto a single transform. To stay correct on FL10.1 we rebind a small
+            // per-batch instance buffer that holds ONLY this batch's contiguous
+            // slice of _frameInstances, and draw with firstInstance = 0. The shader
+            // reads EntityUniforms[SV_InstanceID], which now maps 1:1 onto the slice.
+            int srcStart = firstItem.InstanceIndex;
+            int srcEnd   = Math.Min(srcStart + instanceCount, _frameInstances.Count);
+            int sliceLen = srcEnd - srcStart;
+            if (sliceLen > 0 && _instanceBuffer != null)
+            {
+                var slice = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(_frameInstances)
+                    .Slice(srcStart, sliceLen);
+                _device.UpdateBuffer(_instanceBuffer, MemoryMarshal.AsBytes(slice));
+                cmd.SetUniformBuffer(_instanceBuffer, 12); // slot 12 → b12 (bound VS+PS)
+            }
+
             cmd.DrawIndexed((uint)firstItem.Submesh.IndexCount, (uint)instanceCount,
-                (uint)firstItem.Submesh.IndexOffset, 0, firstInst);
+                (uint)firstItem.Submesh.IndexOffset, 0, 0);
+            BlueSky.Rendering.Strata.StrataBenchmark.RecordMeshDraw((long)firstItem.Submesh.IndexCount * instanceCount / 3);
 
             i += instanceCount;
         }
@@ -1953,22 +2602,15 @@ if (VerboseViewportLogging && _frameCount <= 3)
         cmp = a.Submesh.IndexCount.CompareTo(b.Submesh.IndexCount);
         if (cmp != 0) return cmp;
 
-        cmp = a.Submesh.MaterialSlot.CompareTo(b.Submesh.MaterialSlot);
-        if (cmp != 0) return cmp;
-
-        return RuntimeHash(a.Material).CompareTo(RuntimeHash(b.Material));
+        return string.CompareOrdinal(a.StrataPath, b.StrataPath);
     }
-
-    private static int RuntimeHash(object? value) =>
-        value != null ? System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(value) : 0;
 
     private static bool CanBatchRenderItems(RenderItem a, RenderItem b)
     {
         return ReferenceEquals(a.GpuData, b.GpuData)
             && a.Submesh.IndexOffset == b.Submesh.IndexOffset
             && a.Submesh.IndexCount == b.Submesh.IndexCount
-            && a.Submesh.MaterialSlot == b.Submesh.MaterialSlot
-            && ReferenceEquals(a.Material, b.Material);
+            && string.Equals(a.StrataPath, b.StrataPath, StringComparison.Ordinal);
     }
     
     private void EvictOldMeshes(int maxCacheSize)
@@ -2201,6 +2843,189 @@ if (VerboseViewportLogging && _frameCount <= 3)
         _device.UpdateBuffer(_gizmoRingIB, ringIdxBytes);
         _gizmoRingIndexCount = ringIndices.Count;
         
+        // ── Sphere mesh (UV sphere, radius=1) for filled translucent rendering ──
+        {
+            int latSegs = 16, lonSegs = 16;
+            var sVerts = new List<Vertex>();
+            var sIdx = new List<ushort>();
+            float pi = MathF.PI, twoPi = MathF.PI * 2f;
+
+            for (int lat = 0; lat <= latSegs; lat++)
+            {
+                float phi = lat * pi / latSegs;
+                float sinP = MathF.Sin(phi), cosP = MathF.Cos(phi);
+                for (int lon = 0; lon <= lonSegs; lon++)
+                {
+                    float theta = lon * twoPi / lonSegs;
+                    float x = sinP * MathF.Cos(theta);
+                    float y = cosP;
+                    float z = sinP * MathF.Sin(theta);
+                    sVerts.Add(new Vertex
+                    {
+                        Position = new System.Numerics.Vector3(x, y, z),
+                        Normal = new System.Numerics.Vector3(x, y, z),
+                        UV = System.Numerics.Vector2.Zero
+                    });
+                }
+            }
+            for (int lat = 0; lat < latSegs; lat++)
+            {
+                for (int lon = 0; lon < lonSegs; lon++)
+                {
+                    ushort a = (ushort)(lat * (lonSegs + 1) + lon);
+                    ushort b = (ushort)(a + 1);
+                    ushort c = (ushort)(a + (lonSegs + 1));
+                    ushort d = (ushort)(c + 1);
+                    sIdx.Add(a); sIdx.Add(c); sIdx.Add(b);
+                    sIdx.Add(b); sIdx.Add(c); sIdx.Add(d);
+                }
+            }
+
+            var sVB = System.Runtime.InteropServices.MemoryMarshal.AsBytes(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(sVerts));
+            _gizmoSphereVB = _device.CreateBuffer(new BufferDesc
+            {
+                Size = (ulong)sVB.Length, Usage = BufferUsage.Vertex,
+                MemoryType = MemoryType.CpuToGpu, DebugName = "Gizmo.SphereVB"
+            });
+            _device.UpdateBuffer(_gizmoSphereVB, sVB);
+
+            var sIB = System.Runtime.InteropServices.MemoryMarshal.AsBytes(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(sIdx));
+            _gizmoSphereIB = _device.CreateBuffer(new BufferDesc
+            {
+                Size = (ulong)sIB.Length, Usage = BufferUsage.Index,
+                MemoryType = MemoryType.CpuToGpu, DebugName = "Gizmo.SphereIB"
+            });
+            _device.UpdateBuffer(_gizmoSphereIB, sIB);
+            _gizmoSphereIndexCount = sIdx.Count;
+        }
+        
+        // ── Capsule mesh (radius=0.5, Y from -1 to +1, total height=2) ──
+        // Bottom hemisphere: center (0,-0.5,0), radius 0.5, φ from 0 (south pole) to π/2 (equator)
+        // Cylinder: Y from -0.5 to +0.5, radius 0.5
+        // Top hemisphere: center (0,+0.5,0), radius 0.5, φ from π/2 (equator) to 0 (north pole)
+        {
+            int lonSegs = 16;
+            int hemiLatSegs = 8;
+            float capR = 0.5f;
+            float halfH = 0.5f; // cylinder half-height
+            var cVerts = new List<Vertex>();
+            var cIdx = new List<ushort>();
+            float pi = MathF.PI, twoPi = MathF.PI * 2f;
+
+            // Helper to add a vertex and return its index
+            ushort AddVert(System.Numerics.Vector3 pos, System.Numerics.Vector3 nrm)
+            {
+                ushort idx = (ushort)cVerts.Count;
+                cVerts.Add(new Vertex { Position = pos, Normal = nrm, UV = System.Numerics.Vector2.Zero });
+                return idx;
+            }
+
+            // ── Bottom hemisphere (south pole at Y=-1, equator at Y=-0.5) ──
+            // Center at (0, -halfH, 0)
+            int hemiBottomStart = cVerts.Count;
+            for (int lat = 0; lat <= hemiLatSegs; lat++)
+            {
+                float phi = lat * (pi * 0.5f) / hemiLatSegs; // 0 to π/2
+                float sinP = MathF.Sin(phi), cosP = MathF.Cos(phi);
+                for (int lon = 0; lon <= lonSegs; lon++)
+                {
+                    float theta = lon * twoPi / lonSegs;
+                    float nx = sinP * MathF.Cos(theta);
+                    float ny = -cosP; // pointing down from center
+                    float nz = sinP * MathF.Sin(theta);
+                    var pos = new System.Numerics.Vector3(nx * capR, -halfH + ny * capR, nz * capR);
+                    AddVert(pos, new System.Numerics.Vector3(nx, ny, nz));
+                }
+            }
+            for (int lat = 0; lat < hemiLatSegs; lat++)
+            {
+                for (int lon = 0; lon < lonSegs; lon++)
+                {
+                    ushort a = (ushort)(hemiBottomStart + lat * (lonSegs + 1) + lon);
+                    ushort b = (ushort)(a + 1);
+                    ushort c = (ushort)(a + (lonSegs + 1));
+                    ushort d = (ushort)(c + 1);
+                    cIdx.Add(a); cIdx.Add(c); cIdx.Add(b);
+                    cIdx.Add(b); cIdx.Add(c); cIdx.Add(d);
+                }
+            }
+
+            // ── Cylinder (Y from -halfH to +halfH, radius capR) ──
+            int cylStart = cVerts.Count;
+            // Bottom ring
+            for (int lon = 0; lon <= lonSegs; lon++)
+            {
+                float theta = lon * twoPi / lonSegs;
+                float cos = MathF.Cos(theta), sin = MathF.Sin(theta);
+                AddVert(new System.Numerics.Vector3(cos * capR, -halfH, sin * capR),
+                        new System.Numerics.Vector3(cos, 0, sin));
+            }
+            // Top ring
+            for (int lon = 0; lon <= lonSegs; lon++)
+            {
+                float theta = lon * twoPi / lonSegs;
+                float cos = MathF.Cos(theta), sin = MathF.Sin(theta);
+                AddVert(new System.Numerics.Vector3(cos * capR, halfH, sin * capR),
+                        new System.Numerics.Vector3(cos, 0, sin));
+            }
+            for (int lon = 0; lon < lonSegs; lon++)
+            {
+                ushort bl = (ushort)(cylStart + lon);
+                ushort br = (ushort)(bl + 1);
+                ushort tl = (ushort)(bl + lonSegs + 1);
+                ushort tr = (ushort)(tl + 1);
+                cIdx.Add(bl); cIdx.Add(tl); cIdx.Add(br);
+                cIdx.Add(br); cIdx.Add(tl); cIdx.Add(tr);
+            }
+
+            // ── Top hemisphere (equator at Y=+0.5, north pole at Y=+1) ──
+            // Center at (0, +halfH, 0)
+            int hemiTopStart = cVerts.Count;
+            for (int lat = 0; lat <= hemiLatSegs; lat++)
+            {
+                float phi = (pi * 0.5f) - lat * (pi * 0.5f) / hemiLatSegs; // π/2 to 0
+                float sinP = MathF.Sin(phi), cosP = MathF.Cos(phi);
+                for (int lon = 0; lon <= lonSegs; lon++)
+                {
+                    float theta = lon * twoPi / lonSegs;
+                    float nx = sinP * MathF.Cos(theta);
+                    float ny = cosP; // pointing up from center
+                    float nz = sinP * MathF.Sin(theta);
+                    var pos = new System.Numerics.Vector3(nx * capR, halfH + ny * capR, nz * capR);
+                    AddVert(pos, new System.Numerics.Vector3(nx, ny, nz));
+                }
+            }
+            for (int lat = 0; lat < hemiLatSegs; lat++)
+            {
+                for (int lon = 0; lon < lonSegs; lon++)
+                {
+                    ushort a = (ushort)(hemiTopStart + lat * (lonSegs + 1) + lon);
+                    ushort b = (ushort)(a + 1);
+                    ushort c = (ushort)(a + (lonSegs + 1));
+                    ushort d = (ushort)(c + 1);
+                    cIdx.Add(a); cIdx.Add(c); cIdx.Add(b);
+                    cIdx.Add(b); cIdx.Add(c); cIdx.Add(d);
+                }
+            }
+
+            var cVB = System.Runtime.InteropServices.MemoryMarshal.AsBytes(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(cVerts));
+            _gizmoCapsuleVB = _device.CreateBuffer(new BufferDesc
+            {
+                Size = (ulong)cVB.Length, Usage = BufferUsage.Vertex,
+                MemoryType = MemoryType.CpuToGpu, DebugName = "Gizmo.CapsuleVB"
+            });
+            _device.UpdateBuffer(_gizmoCapsuleVB, cVB);
+
+            var cIB = System.Runtime.InteropServices.MemoryMarshal.AsBytes(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(cIdx));
+            _gizmoCapsuleIB = _device.CreateBuffer(new BufferDesc
+            {
+                Size = (ulong)cIB.Length, Usage = BufferUsage.Index,
+                MemoryType = MemoryType.CpuToGpu, DebugName = "Gizmo.CapsuleIB"
+            });
+            _device.UpdateBuffer(_gizmoCapsuleIB, cIB);
+            _gizmoCapsuleIndexCount = cIdx.Count;
+        }
+
         // Gizmo uniform buffers (one per axis + center + terrain brush preview)
         for (int i = 0; i < _gizmoUniformBuffers.Length; i++)
         {
@@ -2214,7 +3039,6 @@ if (VerboseViewportLogging && _frameCount <= 3)
         }
         
         _gizmoGeometryCreated = true;
-        Console.WriteLine("[ViewportRenderer] Gizmo geometry created (arrow + cube)");
     }
 
     /// <summary>
@@ -2404,6 +3228,352 @@ if (VerboseViewportLogging && _frameCount <= 3)
         }
     }
 
+    private void RenderPhysicsDebugShapes(IRHICommandBuffer cmd, System.Numerics.Matrix4x4 viewProj)
+    {
+        if (!_gizmoGeometryCreated || _gizmoPipeline == null || _physicsDebugShapes.Count == 0)
+            return;
+
+        cmd.SetPipeline(_gizmoPipeline!);
+        int ubIdx = 4;
+
+        foreach (var shape in _physicsDebugShapes)
+        {
+            var model = shape.Transform;
+
+            // ═══════ Pass 1: Translucent fill ═══════
+            var fillUniforms = new GizmoUniforms
+            {
+                ViewProj = viewProj,
+                Model = model,
+                Color = shape.Color,
+                GizmoType = 0,
+                AxisId = 0,
+                IsHovered = 0f,
+            };
+            var fillSpan = MemoryMarshal.CreateSpan(ref fillUniforms, 1);
+            _device.UpdateBuffer(_gizmoUniformBuffers[ubIdx]!, MemoryMarshal.AsBytes(fillSpan));
+            cmd.SetUniformBuffer(_gizmoUniformBuffers[ubIdx]!, 10);
+
+            switch (shape.ShapeType)
+            {
+                case DebugShapeType.Box:
+                    cmd.SetVertexBuffer(_gizmoCubeVB!, 0);
+                    cmd.SetIndexBuffer(_gizmoCubeIB!, IndexType.UInt16);
+                    cmd.DrawIndexed((uint)_gizmoCubeIndexCount);
+                    break;
+                case DebugShapeType.Sphere:
+                    cmd.SetVertexBuffer(_gizmoSphereVB!, 0);
+                    cmd.SetIndexBuffer(_gizmoSphereIB!, IndexType.UInt16);
+                    cmd.DrawIndexed((uint)_gizmoSphereIndexCount);
+                    break;
+                case DebugShapeType.Capsule:
+                    cmd.SetVertexBuffer(_gizmoCapsuleVB!, 0);
+                    cmd.SetIndexBuffer(_gizmoCapsuleIB!, IndexType.UInt16);
+                    cmd.DrawIndexed((uint)_gizmoCapsuleIndexCount);
+                    break;
+                case DebugShapeType.ConvexHull:
+                    DrawFilledConvexHull(cmd, shape, model, ref fillUniforms, ubIdx);
+                    break;
+            }
+
+            // ═══════ Pass 2: Wireframe edges (alpha=0.85) ═══════
+            var wireColor = new System.Numerics.Vector4(shape.Color.X, shape.Color.Y, shape.Color.Z, 0.85f);
+            var wireUniforms = new GizmoUniforms
+            {
+                ViewProj = viewProj,
+                Model = model,
+                Color = wireColor,
+                GizmoType = 0,
+                AxisId = 0,
+                IsHovered = 0f,
+            };
+            var wireSpan = MemoryMarshal.CreateSpan(ref wireUniforms, 1);
+            _device.UpdateBuffer(_gizmoUniformBuffers[ubIdx]!, MemoryMarshal.AsBytes(wireSpan));
+            cmd.SetUniformBuffer(_gizmoUniformBuffers[ubIdx]!, 10);
+
+            switch (shape.ShapeType)
+            {
+                case DebugShapeType.Box:
+                    DrawWireframeBox(cmd, model, ref wireUniforms, ubIdx);
+                    break;
+                case DebugShapeType.Sphere:
+                    DrawWireframeRings(cmd, model, ref wireUniforms, ubIdx);
+                    break;
+                case DebugShapeType.Capsule:
+                    DrawWireframeCapsule(cmd, shape, model, ref wireUniforms, ubIdx);
+                    break;
+                case DebugShapeType.ConvexHull:
+                    DrawConvexHullWireframe(cmd, shape, model, ref wireUniforms, ubIdx);
+                    break;
+            }
+        }
+    }
+
+    private void DrawFilledConvexHull(IRHICommandBuffer cmd, DebugShape shape,
+        System.Numerics.Matrix4x4 model, ref GizmoUniforms uniforms, int ubIdx)
+    {
+        if (shape.HullVertices == null || shape.HullIndices == null || shape.HullIndices.Length < 3)
+            return;
+
+        var verts = shape.HullVertices;
+        var indices = shape.HullIndices;
+
+        var triVerts = new List<float>();
+        for (int i = 0; i + 2 < indices.Length; i += 3)
+        {
+            int i0 = indices[i], i1 = indices[i + 1], i2 = indices[i + 2];
+            if (i0 >= verts.Length || i1 >= verts.Length || i2 >= verts.Length) continue;
+
+            var p0 = System.Numerics.Vector3.Transform(verts[i0], model);
+            var p1 = System.Numerics.Vector3.Transform(verts[i1], model);
+            var p2 = System.Numerics.Vector3.Transform(verts[i2], model);
+
+            var edge1 = p1 - p0;
+            var edge2 = p2 - p0;
+            var n = System.Numerics.Vector3.Normalize(System.Numerics.Vector3.Cross(edge1, edge2));
+
+            AddTriVert(p0, n); AddTriVert(p1, n); AddTriVert(p2, n);
+        }
+
+        if (triVerts.Count == 0) return;
+
+        int vertCount = triVerts.Count / 8;
+        EnsureHullLineBuffer(vertCount);
+
+        var byteSpan = MemoryMarshal.Cast<float, byte>(triVerts.ToArray().AsSpan());
+        _device.UpdateBuffer(_hullLineVB!, byteSpan);
+
+        uniforms.Model = System.Numerics.Matrix4x4.Identity;
+        var span = MemoryMarshal.CreateSpan(ref uniforms, 1);
+        _device.UpdateBuffer(_gizmoUniformBuffers[ubIdx]!, MemoryMarshal.AsBytes(span));
+        cmd.SetUniformBuffer(_gizmoUniformBuffers[ubIdx]!, 10);
+        cmd.SetVertexBuffer(_hullLineVB!, 0);
+        cmd.Draw((uint)vertCount);
+
+        void AddTriVert(System.Numerics.Vector3 p, System.Numerics.Vector3 n)
+        {
+            triVerts.Add(p.X); triVerts.Add(p.Y); triVerts.Add(p.Z);
+            triVerts.Add(n.X); triVerts.Add(n.Y); triVerts.Add(n.Z);
+            triVerts.Add(0); triVerts.Add(0);
+        }
+    }
+
+    private void DrawWireframeBox(IRHICommandBuffer cmd, System.Numerics.Matrix4x4 model,
+        ref GizmoUniforms uniforms, int ubIdx)
+    {
+        float h = 0.5f;
+        var corners = new System.Numerics.Vector3[]
+        {
+            new(-h,-h,-h), new( h,-h,-h), new( h,-h, h), new(-h,-h, h),
+            new(-h, h,-h), new( h, h,-h), new( h, h, h), new(-h, h, h),
+        };
+        var edges = new int[][] {
+            new int[]{0,1}, new int[]{1,2}, new int[]{2,3}, new int[]{3,0},
+            new int[]{4,5}, new int[]{5,6}, new int[]{6,7}, new int[]{7,4},
+            new int[]{0,4}, new int[]{1,5}, new int[]{2,6}, new int[]{3,7}
+        };
+
+        var edgeVerts = new List<float>();
+        foreach (var e in edges)
+            AddEdgeAsQuad(corners[e[0]], corners[e[1]], edgeVerts);
+
+        if (edgeVerts.Count == 0) return;
+
+        int vertCount = edgeVerts.Count / 8;
+        EnsureHullLineBuffer(vertCount);
+
+        var byteSpan = MemoryMarshal.Cast<float, byte>(edgeVerts.ToArray().AsSpan());
+        _device.UpdateBuffer(_hullLineVB!, byteSpan);
+
+        uniforms.Model = model;
+        var span = MemoryMarshal.CreateSpan(ref uniforms, 1);
+        _device.UpdateBuffer(_gizmoUniformBuffers[ubIdx]!, MemoryMarshal.AsBytes(span));
+        cmd.SetUniformBuffer(_gizmoUniformBuffers[ubIdx]!, 10);
+        cmd.SetVertexBuffer(_hullLineVB!, 0);
+        cmd.Draw((uint)vertCount);
+    }
+
+    private void DrawWireframeRings(IRHICommandBuffer cmd, System.Numerics.Matrix4x4 model,
+        ref GizmoUniforms uniforms, int ubIdx)
+    {
+        var ringRotations = new[]
+        {
+            System.Numerics.Matrix4x4.Identity,
+            System.Numerics.Matrix4x4.CreateRotationX(MathF.PI / 2f),
+            System.Numerics.Matrix4x4.CreateRotationY(MathF.PI / 2f),
+        };
+        foreach (var rot in ringRotations)
+        {
+            uniforms.Model = rot * model;
+            var rSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
+            _device.UpdateBuffer(_gizmoUniformBuffers[ubIdx]!, MemoryMarshal.AsBytes(rSpan));
+            cmd.SetVertexBuffer(_gizmoRingVB!, 0);
+            cmd.SetIndexBuffer(_gizmoRingIB!, IndexType.UInt16);
+            cmd.DrawIndexed((uint)_gizmoRingIndexCount);
+        }
+    }
+
+    private void DrawWireframeCapsule(IRHICommandBuffer cmd, DebugShape shape,
+        System.Numerics.Matrix4x4 model, ref GizmoUniforms uniforms, int ubIdx)
+    {
+        // 3 orthogonal rings at center (sphere-style)
+        DrawWireframeRings(cmd, model, ref uniforms, ubIdx);
+
+        // 2 rings at hemisphere-cylinder junctions (Y=±0.5 in unit capsule)
+        float capR = 0.5f;
+        float halfH = 0.5f;
+        var ringVerts = new List<float>();
+        int ringSegs = 48;
+        float twoPi = MathF.PI * 2f;
+
+        for (int ring = -1; ring <= 1; ring += 2)
+        {
+            float y = ring * halfH;
+            ringVerts.Clear();
+            for (int i = 0; i <= ringSegs; i++)
+            {
+                float theta = i * twoPi / ringSegs;
+                float x = capR * MathF.Cos(theta);
+                float z = capR * MathF.Sin(theta);
+                // Position
+                ringVerts.Add(x); ringVerts.Add(y); ringVerts.Add(z);
+                // Normal (radially outward)
+                ringVerts.Add(MathF.Cos(theta)); ringVerts.Add(0); ringVerts.Add(MathF.Sin(theta));
+                // UV
+                ringVerts.Add(0); ringVerts.Add(0);
+            }
+            int vCount = ringVerts.Count / 8;
+            if (vCount < 2) continue;
+            EnsureHullLineBuffer(vCount);
+
+            var byteSpan = MemoryMarshal.Cast<float, byte>(ringVerts.ToArray().AsSpan());
+            _device.UpdateBuffer(_hullLineVB!, byteSpan);
+
+            uniforms.Model = model;
+            var span = MemoryMarshal.CreateSpan(ref uniforms, 1);
+            _device.UpdateBuffer(_gizmoUniformBuffers[ubIdx]!, MemoryMarshal.AsBytes(span));
+            cmd.SetUniformBuffer(_gizmoUniformBuffers[ubIdx]!, 10);
+            cmd.SetVertexBuffer(_hullLineVB!, 0);
+            // Draw as line strip for the ring outline
+            cmd.Draw((uint)vCount);
+        }
+
+        // 4 longitudinal lines along cylinder body
+        ringVerts.Clear();
+        for (int i = 0; i < 4; i++)
+        {
+            float theta = i * MathF.PI / 2f;
+            float x = capR * MathF.Cos(theta);
+            float z = capR * MathF.Sin(theta);
+            float nx = MathF.Cos(theta);
+            float nz = MathF.Sin(theta);
+
+            // Bottom point
+            ringVerts.Add(x); ringVerts.Add(-halfH); ringVerts.Add(z);
+            ringVerts.Add(nx); ringVerts.Add(0); ringVerts.Add(nz);
+            ringVerts.Add(0); ringVerts.Add(0);
+            // Top point
+            ringVerts.Add(x); ringVerts.Add(halfH); ringVerts.Add(z);
+            ringVerts.Add(nx); ringVerts.Add(0); ringVerts.Add(nz);
+            ringVerts.Add(0); ringVerts.Add(0);
+        }
+        int lineVertCount = ringVerts.Count / 8;
+        if (lineVertCount > 0)
+        {
+            EnsureHullLineBuffer(lineVertCount);
+            var byteSpan = MemoryMarshal.Cast<float, byte>(ringVerts.ToArray().AsSpan());
+            _device.UpdateBuffer(_hullLineVB!, byteSpan);
+
+            uniforms.Model = model;
+            var span = MemoryMarshal.CreateSpan(ref uniforms, 1);
+            _device.UpdateBuffer(_gizmoUniformBuffers[ubIdx]!, MemoryMarshal.AsBytes(span));
+            cmd.SetUniformBuffer(_gizmoUniformBuffers[ubIdx]!, 10);
+            cmd.SetVertexBuffer(_hullLineVB!, 0);
+            cmd.Draw((uint)lineVertCount);
+        }
+    }
+
+    private void EnsureHullLineBuffer(int vertCount)
+    {
+        if (_hullLineVB == null || _hullLineVertexCapacity < vertCount)
+        {
+            _hullLineVertexCapacity = Math.Max(vertCount, 256);
+            _hullLineVB?.Dispose();
+            _hullLineVB = _device.CreateBuffer(new BufferDesc
+            {
+                Size = (ulong)(_hullLineVertexCapacity * 32),
+                Usage = BufferUsage.Vertex,
+                DebugName = "HullLineVB"
+            });
+        }
+    }
+
+    private void DrawConvexHullWireframe(IRHICommandBuffer cmd, DebugShape shape,
+        System.Numerics.Matrix4x4 model, ref GizmoUniforms uniforms, int ubIdx)
+    {
+        var verts = shape.HullVertices!;
+        var indices = shape.HullIndices!;
+
+        var edgeSet = new HashSet<(int, int)>();
+        var edgeVerts = new List<float>();
+
+        for (int i = 0; i + 2 < indices.Length; i += 3)
+        {
+            int triA = indices[i], triB = indices[i + 1], triC = indices[i + 2];
+            AddEdge(triA, triB);
+            AddEdge(triB, triC);
+            AddEdge(triC, triA);
+        }
+
+        if (edgeVerts.Count == 0) return;
+
+        int vertCount = edgeVerts.Count / 8;
+
+        EnsureHullLineBuffer(vertCount);
+
+        var floatArr = edgeVerts.ToArray();
+        var byteSpan = MemoryMarshal.Cast<float, byte>(floatArr.AsSpan());
+        _device.UpdateBuffer(_hullLineVB!, byteSpan);
+
+        uniforms.Model = System.Numerics.Matrix4x4.Identity;
+        var span = MemoryMarshal.CreateSpan(ref uniforms, 1);
+        _device.UpdateBuffer(_gizmoUniformBuffers[ubIdx]!, MemoryMarshal.AsBytes(span));
+        cmd.SetUniformBuffer(_gizmoUniformBuffers[ubIdx]!, 10);
+        cmd.SetVertexBuffer(_hullLineVB!, 0);
+        cmd.Draw((uint)vertCount);
+
+        void AddEdge(int a, int b)
+        {
+            if (a >= verts.Length || b >= verts.Length) return;
+            var key = a < b ? (a, b) : (b, a);
+            if (!edgeSet.Add(key)) return;
+
+            var p0 = System.Numerics.Vector3.Transform(verts[a], model);
+            var p1 = System.Numerics.Vector3.Transform(verts[b], model);
+            AddEdgeAsQuad(p0, p1, edgeVerts);
+        }
+    }
+
+    private static void AddEdgeAsQuad(System.Numerics.Vector3 p0, System.Numerics.Vector3 p1,
+        System.Collections.Generic.List<float> outVerts)
+    {
+        var dir = System.Numerics.Vector3.Normalize(p1 - p0);
+        var up = System.MathF.Abs(System.Numerics.Vector3.Dot(dir, System.Numerics.Vector3.UnitY)) > 0.99f
+            ? System.Numerics.Vector3.UnitX : System.Numerics.Vector3.UnitY;
+        var perp = System.Numerics.Vector3.Normalize(System.Numerics.Vector3.Cross(dir, up));
+        float t = 0.01f;
+
+        AddLineVert(p0 + perp * t); AddLineVert(p1 + perp * t); AddLineVert(p0 - perp * t);
+        AddLineVert(p0 - perp * t); AddLineVert(p1 + perp * t); AddLineVert(p1 - perp * t);
+
+        void AddLineVert(System.Numerics.Vector3 p)
+        {
+            outVerts.Add(p.X); outVerts.Add(p.Y); outVerts.Add(p.Z);
+            outVerts.Add(0); outVerts.Add(1); outVerts.Add(0);
+            outVerts.Add(0); outVerts.Add(0);
+        }
+    }
+
     /// <summary>
     /// Performs hit-testing against gizmo geometry proxies (spheres/cylinders).
     /// Returns 0=X, 1=Y, 2=Z, 3=Center, or -1 if no hit.
@@ -2514,14 +3684,20 @@ if (VerboseViewportLogging && _frameCount <= 3)
         _lightBuffer?.Dispose();
         _lightCountBuffer?.Dispose();
         _lightSettingsBuffer?.Dispose();
-        _materialBuffer?.Dispose();
-        _materialBuffer?.Dispose();
+        _surfaceBuffer?.Dispose();
+        _shBuffer?.Dispose();
+        _skyParamsBuffer?.Dispose();
+        _gradeLut?.Dispose();
         _gizmoArrowVB?.Dispose();
         _gizmoArrowIB?.Dispose();
         _gizmoCubeVB?.Dispose();
         _gizmoCubeIB?.Dispose();
         _gizmoRingVB?.Dispose();
         _gizmoRingIB?.Dispose();
+        _gizmoCapsuleVB?.Dispose();
+        _gizmoCapsuleIB?.Dispose();
+        _gizmoSphereVB?.Dispose();
+        _gizmoSphereIB?.Dispose();
         
         foreach (var tex in _textureCache.Values)
         {
@@ -2537,9 +3713,114 @@ if (VerboseViewportLogging && _frameCount <= 3)
             mesh.Dispose();
         }
         _meshCache.Clear();
-        _materialCache.Clear();
 
         _disposed = true;
+    }
+
+    /// <summary>
+    private BlueSky.Core.Math.Matrix4x4 ApplyWheelTransformIfApplicable(
+        MeshGPUData gpuData, 
+        SubmeshInfo submesh, 
+        int submeshIdx, 
+        BlueSky.Core.Gameplay.CarController carController, 
+        (string assetId, uint entityId) cacheKey, 
+        BlueSky.Core.Math.Matrix4x4 worldMatrix)
+    {
+        if (carController == null || carController.WheelCount < 4)
+            return worldMatrix;
+
+        // GEOMETRIC CHASSIS GUARANTEE: If a submesh is large (> 1.7m on X or Z axis),
+        // or contains > 25% of total mesh geometry, it is the car body/chassis.
+        // It MUST NEVER be rotated as a wheel!
+        if (gpuData.RawIndices != null && gpuData.RawVertexPositions != null)
+        {
+            var (min, max) = ComputeSubmeshBounds(gpuData, submesh);
+            var size = max - min;
+            if (size.X > 1.7f || size.Z > 1.7f || (gpuData.IndexCount > 0 && (float)submesh.IndexCount / gpuData.IndexCount > 0.25f))
+            {
+                return worldMatrix;
+            }
+        }
+
+        int wheelSlot = -1;
+
+        // 1. Try bone-based wheel slot mapping first
+        if (carController.SkeletalMesh != null)
+        {
+            if (!_skeletalSubmeshBoneMap.TryGetValue(cacheKey, out var boneMap) || boneMap is null)
+            {
+                boneMap = BuildSkeletalSubmeshBoneMap(gpuData, carController.SkeletalMesh, carController);
+                _skeletalSubmeshBoneMap[cacheKey] = boneMap;
+            }
+            int boneIdx = (submeshIdx >= 0 && submeshIdx < boneMap.Length) ? boneMap[submeshIdx] : -1;
+            if (boneIdx >= 0)
+            {
+                carController.TryGetWheelSlotForBoneIndex(boneIdx, out wheelSlot);
+            }
+        }
+
+        // 1b. Pack skeleton (stratapack import): match wheels by BONE NAME.
+        // Pack meshes have a skeleton sidecar but no FBX SkeletalMesh, so the
+        // index-based path above can't run. Name matching beats the centroid
+        // fallback below and never touches body submeshes (slots 0-3 only).
+        if (wheelSlot < 0 && TryGetPackSubmeshBoneName(cacheKey.assetId, gpuData, submesh, submeshIdx, out var packBone))
+        {
+            carController.TryGetWheelSlotForBoneName(packBone, out wheelSlot);
+        }
+
+        // 2. Fallback to centroid-based geometry matching if bone mapping didn't yield a wheel slot
+        if (wheelSlot < 0 && gpuData.RawIndices != null && gpuData.RawVertexPositions != null)
+        {
+            if (!_submeshWheelMap.TryGetValue(cacheKey, out var wheelMap) || wheelMap is null)
+            {
+                wheelMap = BuildSubmeshWheelMap(gpuData, carController);
+                _submeshWheelMap[cacheKey] = wheelMap;
+            }
+            if (submeshIdx >= 0 && submeshIdx < wheelMap.Length)
+            {
+                wheelSlot = wheelMap[submeshIdx];
+            }
+        }
+
+        if (_debugFrameCounter % 60 == 0)
+        {
+            try
+            {
+                System.IO.File.AppendAllText("/tmp/bluesky_wheel_mapping.txt",
+                    $"[Frame {_debugFrameCounter}] Submesh[{submeshIdx}] -> WheelSlot={wheelSlot}\n");
+            }
+            catch { }
+        }
+
+        // Apply wheel rotation matrix ONLY if this submesh is a verified wheel slot (0 to 3)
+        if (wheelSlot >= 0 && wheelSlot < 4)
+        {
+            var wheelRot = carController.GetWheelTransformMatrix(wheelSlot);
+            var centroid = ComputeSubmeshCentroid(gpuData, submesh);
+            var wheelPos = carController.GetWheelLocalPosition(wheelSlot);
+
+            if (_debugFrameCounter % 60 == 0)
+            {
+                try
+                {
+                    System.IO.File.AppendAllText("/tmp/bluesky_centroid_debug.txt",
+                        $"[Frame {_debugFrameCounter}] Submesh[{submeshIdx}] WheelSlot={wheelSlot} Centroid=({centroid.X:F3},{centroid.Y:F3},{centroid.Z:F3}) WheelPos=({wheelPos.X:F3},{wheelPos.Y:F3},{wheelPos.Z:F3})\n");
+                }
+                catch { }
+            }
+
+            var wheelTransform = System.Numerics.Matrix4x4.CreateTranslation(-centroid) *
+                                 wheelRot *
+                                 System.Numerics.Matrix4x4.CreateTranslation(centroid);
+            var ew = new BlueSky.Core.Math.Matrix4x4(
+                wheelTransform.M11, wheelTransform.M12, wheelTransform.M13, wheelTransform.M14,
+                wheelTransform.M21, wheelTransform.M22, wheelTransform.M23, wheelTransform.M24,
+                wheelTransform.M31, wheelTransform.M32, wheelTransform.M33, wheelTransform.M34,
+                wheelTransform.M41, wheelTransform.M42, wheelTransform.M43, wheelTransform.M44);
+            return ew * worldMatrix;
+        }
+
+        return worldMatrix;
     }
 
     /// <summary>
@@ -2547,23 +3828,42 @@ if (VerboseViewportLogging && _frameCount <= 3)
     /// </summary>
     private static int[] BuildSubmeshWheelMap(MeshGPUData gpuData, CarController carController)
     {
-        // Get wheel world positions using the public API
         var wheelPositions = new System.Numerics.Vector3[4];
-        
-        // These correspond to: Front Left, Front Right, Rear Left, Rear Right
-        // Hardcoded fallback positions (will be overridden by physics at runtime)
-        wheelPositions[0] = new System.Numerics.Vector3(-0.8f, -0.3f, 1.5f);  // Front Left
-        wheelPositions[1] = new System.Numerics.Vector3(0.8f, -0.3f, 1.5f);   // Front Right
-        wheelPositions[2] = new System.Numerics.Vector3(-0.8f, -0.3f, -1.5f); // Rear Left
-        wheelPositions[3] = new System.Numerics.Vector3(0.8f, -0.3f, -1.5f);  // Rear Right
+        for (int i = 0; i < 4; i++)
+            wheelPositions[i] = carController.GetWheelLocalPosition(i);
 
         int[] wheelMap = new int[gpuData.Submeshes.Count];
         for (int i = 0; i < wheelMap.Length; i++) wheelMap[i] = -1;
 
+        int totalIndices = gpuData.IndexCount;
+
         for (int submeshIdx = 0; submeshIdx < gpuData.Submeshes.Count; submeshIdx++)
         {
             var submesh = gpuData.Submeshes[submeshIdx];
+            
+            // Exclude main chassis/body submeshes (submesh containing > 20% of all geometry)
+            if (totalIndices > 0 && (float)submesh.IndexCount / totalIndices > 0.20f)
+                continue;
+
             var centroid = ComputeSubmeshCentroid(gpuData, submesh);
+            var (min, max) = ComputeSubmeshBounds(gpuData, submesh);
+            var size = max - min;
+
+            // Chassis protection by bounding size (wheels are compact: <= 1.6m on X/Y/Z)
+            if (size.X > 1.6f || size.Z > 1.6f)
+                continue;
+            
+            // Wheels are compact (<= 1.6m on all axes)
+            bool compactWheelPart =
+                size.X <= 1.6f &&
+                size.Y <= 1.6f &&
+                size.Z <= 1.6f;
+
+            // Wheels are offset from centerline (|X| > 0.15m)
+            bool offCenter = MathF.Abs(centroid.X) > 0.15f || MathF.Abs(wheelPositions[0].X) < 0.1f;
+
+            if (!compactWheelPart || !offCenter)
+                continue;
 
             float minDist = float.MaxValue;
             int bestWheel = -1;
@@ -2578,14 +3878,175 @@ if (VerboseViewportLogging && _frameCount <= 3)
                 }
             }
 
-            // Only map if reasonably close (within 2 units)
-            if (bestWheel >= 0 && minDist < 2.0f)
+            // If distance to wheel position is within 2.2m
+            if (bestWheel >= 0 && minDist < 2.2f)
             {
                 wheelMap[submeshIdx] = bestWheel;
             }
         }
 
         return wheelMap;
+    }
+
+    /// <summary>
+    /// Build a mapping from submesh index to skeletal bone index using multi-phase heuristics:
+    /// 1. Fast-path bone weight voting (checking a subset of vertices).
+    /// 2. Deep-path bone weight voting (scanning up to 1000 vertices).
+    /// 3. Name similarity matching between submesh name and bone name.
+    /// 4. Array structural matching (fallback to 1:1 if sizes align).
+    /// </summary>
+    private static int[] BuildSkeletalSubmeshBoneMap(MeshGPUData gpuData, SkeletalMesh skelMesh, BlueSky.Core.Gameplay.CarController carController)
+    {
+        if (gpuData.Submeshes == null) return Array.Empty<int>();
+        int[] boneMap = new int[gpuData.Submeshes.Count];
+        for (int s = 0; s < boneMap.Length; s++)
+        {
+            boneMap[s] = -1;
+        }
+
+        if (skelMesh.Vertices == null || gpuData.RawIndices == null)
+            return boneMap;
+
+        var diag = new System.Text.StringBuilder();
+
+        for (int submeshIdx = 0; submeshIdx < gpuData.Submeshes.Count; submeshIdx++)
+        {
+            var submesh = gpuData.Submeshes[submeshIdx];
+            int indexOffset = submesh.IndexOffset;
+            int indexEnd = Math.Min(indexOffset + submesh.IndexCount, gpuData.RawIndices!.Length);
+
+            var boneVotes = new Dictionary<int, float>();
+
+            // Phase 1: Fast voting - check up to 100 vertices (every 3rd index)
+            int maxVertsToCheck = Math.Min(100, (indexEnd - indexOffset) / 3);
+            for (int vi = 0; vi < maxVertsToCheck && (indexOffset + vi * 3) < indexEnd; vi++)
+            {
+                int idxPos = indexOffset + vi * 3;
+                if (idxPos >= gpuData.RawIndices.Length) break;
+                uint vertexIdx = gpuData.RawIndices[idxPos];
+                if (vertexIdx >= skelMesh.Vertices.Length) continue;
+
+                var vertex = skelMesh.Vertices[vertexIdx];
+                AccumulateBoneVote(boneVotes, vertex.BoneIndex0, vertex.BoneWeight0);
+                AccumulateBoneVote(boneVotes, vertex.BoneIndex1, vertex.BoneWeight1);
+                AccumulateBoneVote(boneVotes, vertex.BoneIndex2, vertex.BoneWeight2);
+                AccumulateBoneVote(boneVotes, vertex.BoneIndex3, vertex.BoneWeight3);
+            }
+
+            float maxVote = 0f;
+            int bestBone = -1;
+            foreach (var kvp in boneVotes)
+            {
+                if (kvp.Value > maxVote)
+                {
+                    maxVote = kvp.Value;
+                    bestBone = kvp.Key;
+                }
+            }
+
+            // Phase 2: Deep voting - scan up to 1000 vertices sequentially if fast voting yielded no results
+            if (maxVote < 0.1f)
+            {
+                int scanLimit = Math.Min(1000, indexEnd - indexOffset);
+                for (int vi = 0; vi < scanLimit && (indexOffset + vi) < indexEnd; vi++)
+                {
+                    int idxPos = indexOffset + vi;
+                    uint vertexIdx = gpuData.RawIndices[idxPos];
+                    if (vertexIdx >= skelMesh.Vertices.Length) continue;
+
+                    var vertex = skelMesh.Vertices[vertexIdx];
+                    AccumulateBoneVote(boneVotes, vertex.BoneIndex0, vertex.BoneWeight0);
+                    AccumulateBoneVote(boneVotes, vertex.BoneIndex1, vertex.BoneWeight1);
+                    AccumulateBoneVote(boneVotes, vertex.BoneIndex2, vertex.BoneWeight2);
+                    AccumulateBoneVote(boneVotes, vertex.BoneIndex3, vertex.BoneWeight3);
+                }
+
+                foreach (var kvp in boneVotes)
+                {
+                    if (kvp.Value > maxVote)
+                    {
+                        maxVote = kvp.Value;
+                        bestBone = kvp.Key;
+                    }
+                }
+            }
+
+            string phaseUsed = "none";
+            int usedBone = -1;
+
+            if (maxVote >= 0.1f)
+            {
+                boneMap[submeshIdx] = bestBone;
+                usedBone = bestBone;
+                phaseUsed = $"weight(vote={maxVote:F3})";
+            }
+            else
+            {
+                // Phase 3: Name-based fuzzy matching
+                // (Submesh names died with the parser DTOs; bone-name voting
+                // in phases 1-2 plus structural fallback carry the mapping.)
+                string? submeshName = null;
+
+                if (!string.IsNullOrEmpty(submeshName))
+                {
+                    string cleanSubmeshName = submeshName.Replace(" ", "").Replace("_", "").ToLowerInvariant();
+                    int bestMatchIndex = -1;
+                    int bestMatchScore = 0;
+
+                    for (int bi = 0; bi < skelMesh.Bones.Length; bi++)
+                    {
+                        string cleanBoneName = skelMesh.Bones[bi].Name.Replace(" ", "").Replace("_", "").ToLowerInvariant();
+                        if (cleanBoneName == cleanSubmeshName)
+                        {
+                            bestMatchIndex = bi;
+                            break;
+                        }
+                        else if (cleanBoneName.Contains(cleanSubmeshName) || cleanSubmeshName.Contains(cleanBoneName))
+                        {
+                            int overlap = Math.Min(cleanBoneName.Length, cleanSubmeshName.Length);
+                            if (overlap > bestMatchScore)
+                            {
+                                bestMatchScore = overlap;
+                                bestMatchIndex = bi;
+                            }
+                        }
+                    }
+
+                    if (bestMatchIndex != -1)
+                    {
+                        boneMap[submeshIdx] = bestMatchIndex;
+                        usedBone = bestMatchIndex;
+                        phaseUsed = $"name('{submeshName}')";
+                    }
+                }
+
+                // Phase 4: Structural alignment fallback
+                if (usedBone < 0)
+                {
+                    if (skelMesh.Bones.Length == gpuData.Submeshes.Count)
+                    {
+                        boneMap[submeshIdx] = submeshIdx;
+                        usedBone = submeshIdx;
+                        phaseUsed = "structural";
+                    }
+                    else
+                    {
+                        boneMap[submeshIdx] = -1;
+                        usedBone = -1;
+                        phaseUsed = "unmapped";
+                    }
+                }
+            }
+
+            string boneName = usedBone >= 0 && usedBone < skelMesh.Bones.Length
+                ? skelMesh.Bones[usedBone].Name
+                : "NONE";
+            diag.AppendLine($"  submesh[{submeshIdx}] → bone[{usedBone}] ('{boneName}') phase={phaseUsed}");
+        }
+
+        try { System.IO.File.WriteAllText("/tmp/bluesky_bone_map.txt", diag.ToString()); } catch { }
+
+        return boneMap;
     }
 
     /// <summary>
@@ -2614,5 +4075,30 @@ if (VerboseViewportLogging && _frameCount <= 3)
             sum /= count;
 
         return sum;
+    }
+
+    private static (System.Numerics.Vector3 Min, System.Numerics.Vector3 Max) ComputeSubmeshBounds(MeshGPUData gpuData, SubmeshInfo submesh)
+    {
+        if (gpuData.RawIndices == null || gpuData.RawVertexPositions == null)
+            return (System.Numerics.Vector3.Zero, System.Numerics.Vector3.Zero);
+
+        var min = new System.Numerics.Vector3(float.MaxValue, float.MaxValue, float.MaxValue);
+        var max = new System.Numerics.Vector3(float.MinValue, float.MinValue, float.MinValue);
+        bool hasVertex = false;
+
+        int indexEnd = System.Math.Min(submesh.IndexOffset + submesh.IndexCount, gpuData.RawIndices.Length);
+        for (int idx = submesh.IndexOffset; idx < indexEnd; idx++)
+        {
+            uint vertIdx = gpuData.RawIndices[idx];
+            if (vertIdx >= gpuData.RawVertexPositions.Length)
+                continue;
+
+            var p = gpuData.RawVertexPositions[(int)vertIdx];
+            min = System.Numerics.Vector3.Min(min, p);
+            max = System.Numerics.Vector3.Max(max, p);
+            hasVertex = true;
+        }
+
+        return hasVertex ? (min, max) : (System.Numerics.Vector3.Zero, System.Numerics.Vector3.Zero);
     }
 }

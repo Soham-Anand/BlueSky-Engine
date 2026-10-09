@@ -1,6 +1,6 @@
 using System;
 
-namespace NotBSRenderer.Vulkan;
+namespace BlueSky.Rendering.RHI.Vulkan;
 
 /// <summary>
 /// Vulkan texture implementation wrapping VkImage + VkImageView + VkDeviceMemory.

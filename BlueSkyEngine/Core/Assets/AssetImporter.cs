@@ -1,54 +1,18 @@
-// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════
-// MATERIAL SLOT SYSTEM - COMPLETE WORKFLOW
-// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════
-// 
+// ═══════════════════════════════════════════════════════════════════════════
+// MESH IMPORT - GEOMETRY ONLY (no material system)
+// ═══════════════════════════════════════════════════════════════════════════
+//
 // OVERVIEW:
-// Multi-material mesh support (Blender-style) - each submesh can have its own material assigned via slot index (0-7).
-// 
-// WORKFLOW:
-// 1. FBX IMPORT (AssetImporter.cs):
-//    - Extracts submeshes from FBX (each with material name from DCC tool)
-//    - Creates binary mesh data: [vertices][indices][submesh_info(offset,count,slot)]
-//    - Auto-generates default materials for each slot with distinct neutral colors
-//    - Saves material paths in asset metadata: materialSlot0, materialSlot1, etc.
-// 
-// 2. ENTITY SPAWN (Program.cs - SpawnDraggedAsset):
-//    - Reads mesh asset metadata
-//    - Auto-assigns materials from metadata to StaticMeshComponent slots
-//    - Each slot (0-7) gets its material path from metadata
-// 
-// 3. VIEWPORT RENDERING (ViewportRenderer.cs - RenderEntities):
-//    - Loads mesh with submesh info from .blueskyasset
-//    - For each submesh: resolves material from slot index → loads MaterialAsset → binds textures → renders
-//    - Per-submesh material properties (albedo, metallic, roughness, textures) applied to GPU
-// 
-// 4. INSPECTOR UI (Program.cs - BuildWorkspaceUI):
-//    - Shows all material slots with drag-drop assignment
-//    - "Auto-Color Slots" button generates vibrant colored materials for easy visualization
-//    - Edit/Clear buttons per slot
-// 
-// KEY FEATURES:
-// - Up to 8 material slots per mesh (hardware-friendly limit)
-// - Automatic material slot detection from FBX material assignments
-// - Drag-drop material assignment in inspector
-// - Auto-color utility for quick multi-material visualization
-// - Material caching for performance (LRU eviction)
-// - Texture loading from file paths or .blueskyasset format
-// - PBR material support (albedo, metallic, roughness, normal, RMA textures)
-// 
-// USAGE:
-// 1. Import FBX with multiple materials → materials auto-created with distinct colors
-// 2. Drag mesh into viewport → materials auto-assigned from metadata
-// 3. Select entity → Inspector shows all material slots
-// 4. Drag .blueskyasset materials onto slots OR click "Auto-Color Slots" for quick visualization
-// 5. Viewport renders each submesh with its assigned material in real-time
-// 
-// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// Meshes carry geometry only: [vertices][indices][submesh_info(offset,count)].
+// Every surface shades with the single global clay in the viewport renderer.
+// Texture extraction from source files is preserved for Strata (future).
+//
+// ═══════════════════════════════════════════════════════════════════════════
 
 using BlueSky.Core.Diagnostics;
-using BlueSky.Animation.FBX;
-using BlueSky.Animation;
+using BlueSky.Motif;
 using System.Collections.Concurrent;
+using System.Globalization;
 using System.Threading.Tasks;
 
 namespace BlueSky.Core.Assets;
@@ -81,8 +45,7 @@ public class AssetImporter
         RegisterImporter(new MeshImportHandler());
         RegisterImporter(new FBXImportHandler());
         RegisterImporter(new GLTFImportHandler());
-        RegisterImporter(new TextureImportHandler());
-        RegisterImporter(new MaterialImportHandler());
+        RegisterImporter(new StratapackImportHandler());
         RegisterImporter(new ScriptImportHandler());
 
         ErrorHandler.LogInfo($"AssetImporter initialized for project: {project.ProjectName}", "AssetImporter");
@@ -136,9 +99,9 @@ public class AssetImporter
             var assetFileName = $"{asset.AssetName}.blueskyasset";
             string assetPath;
             
-            if (extension == ".obj" || extension == ".glb" || extension == ".gltf" || extension == ".fbx")
+            if (extension == ".obj" || extension == ".glb" || extension == ".gltf" || extension == ".fbx" || extension == ".stratapack")
             {
-                // Create subfolder for mesh formats and their materials/textures
+                // Create subfolder for mesh formats and their textures
                 string subDir = Path.Combine(_assetsDirectory, asset.AssetName);
                 Directory.CreateDirectory(subDir);
                 assetPath = Path.Combine(subDir, assetFileName);
@@ -282,7 +245,6 @@ public class AssetImporter
             AssetType.StaticMesh => "Meshes",
             AssetType.SkeletalMesh => "Meshes",
             AssetType.Texture => "Textures",
-            AssetType.Material => "Materials",
             AssetType.Scene => "Scenes",
             AssetType.Terrain => "Terrains",
             AssetType.Script => "Scripts",
@@ -320,311 +282,26 @@ public class ImportResult
 }
 
 /// <summary>
-/// Mesh import handler (OBJ, and other formats via plugins)
+/// Mesh import handler (.obj).
+/// Direct source-mesh import was removed: Blender Ease + .stratapack is the
+/// only mesh door. This handler stays registered so the dispatcher reports a
+/// loud rejection instead of "no importer".
 /// </summary>
 public class MeshImportHandler : IAssetImportHandler
 {
     public string[] SupportedExtensions => new[] { ".obj" };
     public AssetType AssetType => AssetType.StaticMesh;
 
-    /// <summary>
-    /// Case-insensitive file search in a directory. Returns full path or null.
-    /// </summary>
-    private static string? FindFileInsensitive(string directory, string fileName)
-    {
-        if (!Directory.Exists(directory)) return null;
-        try
-        {
-            foreach (var file in Directory.GetFiles(directory))
-            {
-                if (string.Equals(Path.GetFileName(file), fileName, StringComparison.OrdinalIgnoreCase))
-                    return file;
-            }
-        }
-        catch { }
-        return null;
-    }
-
     public ImportResult Import(string sourceFile, BlueAsset asset, ImportOptions? options)
     {
-        try
+        return new ImportResult
         {
-            // Use OBJ parser
-            var objMesh = OBJParser.Parse(sourceFile);
-            if (objMesh == null)
-            {
-                return new ImportResult
-                {
-                    Success = false,
-                    Error = "Failed to parse OBJ file"
-                };
-            }
-
-            // Convert to engine-ready data
-            var (vertexData, indexData, vertexCount, indexCount, submeshes) = OBJParser.ConvertToEngineData(objMesh);
-
-            // Pack binary data into Payload
-            using var ms = new MemoryStream();
-            using var writer = new BinaryWriter(ms);
-            writer.Write(vertexData.Length);
-            writer.Write(vertexData);
-            writer.Write(indexData.Length);
-            writer.Write(indexData);
-
-            writer.Write(submeshes.Count); // submesh count
-            
-            var materialSlots = new List<string>();
-            string targetDir = options?.Settings != null && options.Settings.TryGetValue("TargetDirectory", out var td) && td is string tdStr 
-                ? tdStr 
-                : Path.Combine("Assets", asset.AssetName);
-
-            if (!Directory.Exists(targetDir)) Directory.CreateDirectory(targetDir);
-
-            string materialsDir = Path.Combine(targetDir, "Materials");
-            string texturesDir = Path.Combine(targetDir, "Textures");
-            if (!Directory.Exists(materialsDir)) Directory.CreateDirectory(materialsDir);
-            if (!Directory.Exists(texturesDir)) Directory.CreateDirectory(texturesDir);
-
-            // Parse MTL if available
-            var materials = new Dictionary<string, MTLMaterial>(StringComparer.OrdinalIgnoreCase);
-            if (!string.IsNullOrEmpty(objMesh.MaterialLibrary))
-            {
-                string sourceDir = Path.GetDirectoryName(sourceFile) ?? "";
-                string mtlPath = Path.Combine(sourceDir, objMesh.MaterialLibrary);
-                ErrorHandler.LogInfo($"[MeshImportHandler] Looking for MTL at {mtlPath}", "AssetImporter");
-                if (File.Exists(mtlPath))
-                {
-                    materials = MTLParser.Parse(mtlPath);
-                    ErrorHandler.LogInfo($"[MeshImportHandler] Parsed {materials.Count} materials from MTL", "AssetImporter");
-                }
-                else
-                {
-                    ErrorHandler.LogWarning($"[MeshImportHandler] MTL file not found at {mtlPath}", "AssetImporter");
-                }
-            }
-
-            ErrorHandler.LogInfo($"[MeshImportHandler] ═══════════════════════════════════════════════════════════", "AssetImporter");
-            ErrorHandler.LogInfo($"[MeshImportHandler] MATERIAL SLOT ASSIGNMENT (Total submeshes: {submeshes.Count})", "AssetImporter");
-            ErrorHandler.LogInfo($"[MeshImportHandler] ═══════════════════════════════════════════════════════════", "AssetImporter");
-            
-            // ── PARALLEL TEXTURE PRE-IMPORT ────────────────────────────────────────────────
-            var textureMap = new ConcurrentDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            var uniqueTextureSources = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            string meshSourceDir = Path.GetDirectoryName(sourceFile) ?? "";
-
-            foreach (var mtl in materials.Values)
-            {
-                if (!string.IsNullOrEmpty(mtl.map_Kd)) uniqueTextureSources.Add(mtl.map_Kd);
-                if (!string.IsNullOrEmpty(mtl.map_Ka)) uniqueTextureSources.Add(mtl.map_Ka);
-                if (!string.IsNullOrEmpty(mtl.map_Bump)) uniqueTextureSources.Add(mtl.map_Bump);
-                if (!string.IsNullOrEmpty(mtl.map_Ns)) uniqueTextureSources.Add(mtl.map_Ns);
-                if (!string.IsNullOrEmpty(mtl.map_d)) uniqueTextureSources.Add(mtl.map_d);
-                if (!string.IsNullOrEmpty(mtl.map_Ke)) uniqueTextureSources.Add(mtl.map_Ke);
-            }
-
-            if (uniqueTextureSources.Count > 0)
-            {
-                ErrorHandler.LogInfo($"[MeshImportHandler] Pre-importing {uniqueTextureSources.Count} unique textures in parallel...", "AssetImporter");
-                
-                Parallel.ForEach(uniqueTextureSources, texRelPath =>
-                {
-                    string texSource = Path.Combine(meshSourceDir, texRelPath);
-                    if (!File.Exists(texSource))
-                    {
-                        string? found = FindFileInsensitive(meshSourceDir, texRelPath);
-                        if (found != null) texSource = found;
-                    }
-
-                    if (File.Exists(texSource))
-                    {
-                        var texImporter = new TextureImportHandler();
-                        string texFileName = Path.GetFileNameWithoutExtension(texSource);
-                        var texBlueAsset = new BlueAsset { AssetName = texFileName, Type = AssetType.Texture, SourceFile = texSource, ImportDate = DateTime.UtcNow };
-                        var texRes = texImporter.Import(texSource, texBlueAsset, null);
-                        
-                        if (texRes.Success)
-                        {
-                            texBlueAsset.PayloadData = texRes.PayloadData;
-                            string texDest = Path.Combine(texturesDir, $"{texFileName}.blueskyasset");
-                            if (texBlueAsset.Save(texDest))
-                            {
-                                textureMap[texRelPath] = texDest;
-                            }
-                        }
-                    }
-                });
-            }
-
-            int slotIndex = 0;
-            foreach (var submesh in submeshes)
-            {
-                writer.Write(submesh.IndexOffset);
-                writer.Write(submesh.IndexCount);
-                writer.Write(slotIndex);
-
-                string matName = submesh.MaterialName;
-                if (string.IsNullOrEmpty(matName)) matName = "default";
-                
-                ErrorHandler.LogInfo($"[MeshImportHandler] Slot {slotIndex}: Material '{matName}' (IndexOffset={submesh.IndexOffset}, IndexCount={submesh.IndexCount})", "AssetImporter");
-                
-                string matFileName = $"{matName}.blueskyasset";
-                string matPath = Path.Combine(materialsDir, matFileName);
-
-                if (materials.TryGetValue(matName, out var mtl))
-                {
-                    var matAsset = new MaterialAsset { MaterialName = matName, MaterialId = Guid.NewGuid() };
-                    matAsset.Albedo = new Vector3Data(mtl.Kd.X, mtl.Kd.Y, mtl.Kd.Z);
-                    
-                    float ns = System.Math.Max(mtl.Ns, 0f);
-                    float roughness = ns > 0f
-                        ? System.Math.Clamp(System.MathF.Sqrt(2.0f / (ns + 2.0f)), 0.02f, 1.0f)
-                        : 1.0f;
-                    matAsset.Roughness = roughness;
-                    
-                    float kdLuma = (mtl.Kd.X + mtl.Kd.Y + mtl.Kd.Z) / 3.0f;
-                    bool likelyMetal = kdLuma < 0.02f && string.IsNullOrEmpty(mtl.map_Kd);
-                    matAsset.Metallic = likelyMetal ? 0.95f : 0.0f;
-                    matAsset.Opacity = mtl.d;
-                    
-                    // Wire emissive from MTL Ke
-                    if (mtl.Ke.X > 0.01f || mtl.Ke.Y > 0.01f || mtl.Ke.Z > 0.01f)
-                    {
-                        matAsset.Emission = new Vector3Data(mtl.Ke.X, mtl.Ke.Y, mtl.Ke.Z);
-                        matAsset.EmissionIntensity = 1.0f;
-                    }
-
-                    if (!string.IsNullOrEmpty(mtl.map_Kd) && textureMap.TryGetValue(mtl.map_Kd, out var albedoPath))
-                        matAsset.AlbedoTexturePath = albedoPath;
-                    
-                    if (!string.IsNullOrEmpty(mtl.map_Bump) && textureMap.TryGetValue(mtl.map_Bump, out var normalPath))
-                        matAsset.NormalTexturePath = normalPath;
-                    
-                    if (!string.IsNullOrEmpty(mtl.map_Ns) && textureMap.TryGetValue(mtl.map_Ns, out var roughPath))
-                        matAsset.RoughnessTexturePath = roughPath;
-                    
-                    // ── Opacity / Blend Mode Detection ──────────────────────────────
-                    // Common pattern in OBJ: map_d == map_Kd (alpha embedded in diffuse)
-                    // We need to detect actual alpha pixels to avoid false transparency.
-                    if (!string.IsNullOrEmpty(mtl.map_d))
-                    {
-                        bool isSameAsAlbedo = string.Equals(mtl.map_d, mtl.map_Kd, StringComparison.OrdinalIgnoreCase);
-                        
-                        if (isSameAsAlbedo)
-                        {
-                            // map_d == map_Kd: Check if albedo texture actually has alpha pixels
-                            bool textureHasAlpha = false;
-                            if (textureMap.TryGetValue(mtl.map_Kd, out var albPath))
-                            {
-                                textureHasAlpha = TextureImportHandler.HasAlphaInAsset(albPath);
-                            }
-                            
-                            if (textureHasAlpha)
-                            {
-                                // Alpha is in the albedo texture itself — no separate opacity texture needed
-                                matAsset.BlendMode = BlueSky.Rendering.Materials.BlendMode.AlphaBlend;
-                                ErrorHandler.LogInfo($"[MeshImportHandler] Material '{matName}': map_d==map_Kd with real alpha → AlphaBlend (albedo alpha)", "AssetImporter");
-                            }
-                            else
-                            {
-                                // Texture has no alpha — stay opaque despite map_d being set
-                                matAsset.BlendMode = BlueSky.Rendering.Materials.BlendMode.Opaque;
-                                ErrorHandler.LogInfo($"[MeshImportHandler] Material '{matName}': map_d==map_Kd but NO alpha pixels → Opaque", "AssetImporter");
-                            }
-                        }
-                        else if (textureMap.TryGetValue(mtl.map_d, out var opacityPath))
-                        {
-                            // map_d is a different file — use it as separate opacity texture
-                            matAsset.OpacityTexturePath = opacityPath;
-                            matAsset.BlendMode = BlueSky.Rendering.Materials.BlendMode.AlphaBlend;
-                            ErrorHandler.LogInfo($"[MeshImportHandler] Material '{matName}': separate map_d → AlphaBlend (opacity texture)", "AssetImporter");
-                        }
-                    }
-                    else if (matAsset.Opacity < 0.9f)
-                    {
-                        matAsset.BlendMode = BlueSky.Rendering.Materials.BlendMode.AlphaBlend;
-                    }
-                    else
-                    {
-                        matAsset.BlendMode = BlueSky.Rendering.Materials.BlendMode.Opaque;
-                    }
-
-                    matAsset.Save(matPath);
-                }
-                else
-                {
-                    var matAsset = new MaterialAsset { MaterialName = matName, MaterialId = Guid.NewGuid() };
-                    matAsset.Save(matPath);
-                }
-
-                asset.Metadata[$"materialSlot{slotIndex}"] = matPath;
-                materialSlots.Add(matName);
-                slotIndex++;
-            }
-
-            ErrorHandler.LogInfo($"[MeshImportHandler] ═══════════════════════════════════════════════════════════", "AssetImporter");
-            ErrorHandler.LogInfo($"[MeshImportHandler] MATERIAL SLOT ASSIGNMENT COMPLETE", "AssetImporter");
-            ErrorHandler.LogInfo($"[MeshImportHandler] ═══════════════════════════════════════════════════════════", "AssetImporter");
-
-            // Update asset metadata
-            asset.Metadata["materialSlots"] = string.Join(",", materialSlots);
-            asset.Metadata["submeshCount"] = submeshes.Count.ToString();
-            asset.Metadata["vertexCount"] = vertexCount.ToString();
-            asset.Metadata["triangleCount"] = (indexCount / 3).ToString();
-            asset.Metadata["meshCount"] = submeshes.Count.ToString();
-            asset.Metadata["format"] = "Packed32"; // Position + Normal + UV
-
-            // Store bounds
-            asset.Metadata["boundsMin"] = $"{objMesh.Bounds.Min.X},{objMesh.Bounds.Min.Y},{objMesh.Bounds.Min.Z}";
-            asset.Metadata["boundsMax"] = $"{objMesh.Bounds.Max.X},{objMesh.Bounds.Max.Y},{objMesh.Bounds.Max.Z}";
-
-            return new ImportResult
-            {
-                Success = true,
-                PayloadData = ms.ToArray()
-            };
-        }
-        catch (Exception ex)
-        {
-            return new ImportResult
-            {
-                Success = false,
-                Error = ex.Message
-            };
-        }
+            Success = false,
+            Error = $"Direct .obj import is no longer supported — use BlueSky Engine Ease in Blender and import the .stratapack instead. (File: {Path.GetFileName(sourceFile)})"
+        };
     }
 }
 
-
-/// <summary>
-/// Material import handler.
-/// </summary>
-public class MaterialImportHandler : IAssetImportHandler
-{
-    public string[] SupportedExtensions => new[] { ".mat", ".mtl" };
-    public AssetType AssetType => AssetType.Material;
-
-    public ImportResult Import(string sourceFile, BlueAsset asset, ImportOptions? options)
-    {
-        try
-        {
-            asset.Metadata["shader"] = "Standard";
-            
-            return new ImportResult
-            {
-                Success = true,
-                DataFilePath = sourceFile + ".data"
-            };
-        }
-        catch (Exception ex)
-        {
-            return new ImportResult
-            {
-                Success = false,
-                Error = ex.Message
-            };
-        }
-    }
-}
 
 /// <summary>
 /// Script import handler (.bluescript, .cs, .tea files).
@@ -656,9 +333,10 @@ public class ScriptImportHandler : IAssetImportHandler
 }
 
 /// <summary>
-/// FBX import handler - imports static meshes from FBX files.
-/// Supports multi-mesh FBX files (all sub-meshes combined into submeshes).
-/// Properly handles per-polygon-vertex normals and UVs via vertex expansion.
+/// FBX import handler (.fbx).
+/// Direct source-mesh import was removed: Blender Ease + .stratapack is the
+/// only mesh door. This handler stays registered so the dispatcher reports a
+/// loud rejection instead of "no importer".
 /// </summary>
 public class FBXImportHandler : IAssetImportHandler
 {
@@ -667,271 +345,11 @@ public class FBXImportHandler : IAssetImportHandler
 
     public ImportResult Import(string sourceFile, BlueAsset asset, ImportOptions? options)
     {
-        try
+        return new ImportResult
         {
-            ErrorHandler.LogInfo($"Starting FBX import: {Path.GetFileName(sourceFile)}", "FBXImportHandler");
-
-            // Read user scale from import options (default 1.0 = no extra scaling)
-            float userScale = 1.0f;
-            if (options?.Settings != null && options.Settings.TryGetValue("scale", out var scaleObj))
-            {
-                if (scaleObj is float f) userScale = f;
-                else if (scaleObj is double d) userScale = (float)d;
-            }
-            // Actual scale is computed after parsing, using FBX UnitScaleFactor
-            float scale = userScale;
-
-            return ImportStaticMesh(sourceFile, asset, scale, options);
-        }
-        catch (Exception ex)
-        {
-            ErrorHandler.LogError($"FBX import failed: {ex.Message}", ex, "FBXImportHandler");
-            return new ImportResult
-            {
-                Success = false,
-                Error = ex.Message
-            };
-        }
-    }
-
-    private ImportResult ImportStaticMesh(string sourceFile, BlueAsset asset, float userScale, ImportOptions? options)
-    {
-        try
-        {
-            float scale = userScale;
-            // Parse all meshes from the FBX
-            var importer = new FbxImporterV2();
-            var allMeshes = importer.ImportAll(sourceFile);
-
-            if (allMeshes.Count == 0)
-            {
-                return new ImportResult
-                {
-                    Success = false,
-                    Error = "No geometry found in FBX file"
-                };
-            }
-
-            ErrorHandler.LogInfo($"[FBXImportHandler] Found {allMeshes.Count} sub-mesh(es) in FBX", "FBXImportHandler");
-
-            // Use UnitScaleFactor from FBX GlobalSettings for correct scaling
-            // FBX UnitScaleFactor gives cm-per-unit. Convert to meters: multiply by (UnitScaleFactor * 0.01)
-            if (allMeshes.Count > 0)
-            {
-                float unitScale = allMeshes[0].GlobalSettings.UnitScaleFactor;
-                // unitScale = 1.0 means 1 unit = 1 cm, so multiply by 0.01 for meters
-                // unitScale = 100.0 means 1 unit = 1 m, so multiply by 1.0 for meters
-                float autoScale = unitScale * 0.01f;
-                scale = autoScale * userScale;
-                ErrorHandler.LogInfo($"[FBXImportHandler] UnitScaleFactor={unitScale}, autoScale={autoScale:F4}, userScale={userScale:F2}, finalScale={scale:F4}", "FBXImportHandler");
-            }
-
-            // Expand and combine all sub-meshes into a single vertex/index buffer
-            // with submesh info for each sub-mesh
-            var finalVertices = new List<ExpandedVertex>();
-            var finalIndices = new List<uint>();
-            var submeshInfos = new List<(int indexOffset, int indexCount, int materialSlot)>();
-            var dedupMap = new Dictionary<ExpandedVertex, uint>();
-
-            var boundsMin = new System.Numerics.Vector3(float.MaxValue);
-            var boundsMax = new System.Numerics.Vector3(float.MinValue);
-
-            int meshSlot = 0;
-            foreach (var mesh in allMeshes)
-            {
-                int submeshIndexStart = finalIndices.Count;
-                bool normalsArePerPolygonVertex = mesh.Normals.Length == mesh.Indices.Length;
-                bool uvsArePerPolygonVertex = mesh.UVs.Length == mesh.Indices.Length;
-
-                for (int t = 0; t < mesh.Indices.Length; t++)
-                {
-                    uint origIdx = mesh.Indices[t];
-
-                    // Bounds check on vertex index
-                    if (origIdx >= mesh.Vertices.Length)
-                        continue;
-
-                    // Get position (apply scale)
-                    var pos = mesh.Vertices[origIdx] * scale;
-
-                    // Get normal: per-polygon-vertex or per-vertex
-                    System.Numerics.Vector3 normal;
-                    if (normalsArePerPolygonVertex && t < mesh.Normals.Length)
-                        normal = mesh.Normals[t];
-                    else if (!normalsArePerPolygonVertex && origIdx < mesh.Normals.Length)
-                        normal = mesh.Normals[origIdx];
-                    else
-                        normal = System.Numerics.Vector3.UnitY;
-
-                    // Get UV: per-polygon-vertex or per-vertex
-                    System.Numerics.Vector2 uv;
-                    if (uvsArePerPolygonVertex && t < mesh.UVs.Length)
-                        uv = mesh.UVs[t];
-                    else if (!uvsArePerPolygonVertex && origIdx < mesh.UVs.Length)
-                        uv = mesh.UVs[origIdx];
-                    else
-                        uv = System.Numerics.Vector2.Zero;
-
-                    var expanded = new ExpandedVertex(pos, normal, uv);
-
-                    // Deduplicate: reuse existing vertex if position+normal+uv match
-                    if (!dedupMap.TryGetValue(expanded, out uint newIdx))
-                    {
-                        newIdx = (uint)finalVertices.Count;
-                        finalVertices.Add(expanded);
-                        dedupMap[expanded] = newIdx;
-
-                        // Update bounds
-                        boundsMin = System.Numerics.Vector3.Min(boundsMin, pos);
-                        boundsMax = System.Numerics.Vector3.Max(boundsMax, pos);
-                    }
-
-                    finalIndices.Add(newIdx);
-                }
-
-                int submeshIndexCount = finalIndices.Count - submeshIndexStart;
-                if (submeshIndexCount > 0)
-                {
-                    submeshInfos.Add((submeshIndexStart, submeshIndexCount, meshSlot));
-                    meshSlot++;
-                }
-            }
-
-            if (finalVertices.Count == 0)
-            {
-                return new ImportResult
-                {
-                    Success = false,
-                    Error = "No valid vertices after processing FBX meshes"
-                };
-            }
-
-            // Write the payload in ViewportRenderer expected format:
-            // [int32 vertexDataLen][byte[] vertexData][uint32 indexDataLen][byte[] indexData]
-            // [int32 submeshCount][per submesh: int32 offset, int32 count, int32 slot]
-            using var ms = new MemoryStream();
-            using var writer = new BinaryWriter(ms);
-
-            // Vertex data: 32 bytes per vertex (Position(12) + Normal(12) + UV(8))
-            int vertexByteCount = finalVertices.Count * 32;
-            writer.Write(vertexByteCount);
-            for (int i = 0; i < finalVertices.Count; i++)
-            {
-                var v = finalVertices[i];
-                writer.Write(v.Position.X);
-                writer.Write(v.Position.Y);
-                writer.Write(v.Position.Z);
-                writer.Write(v.Normal.X);
-                writer.Write(v.Normal.Y);
-                writer.Write(v.Normal.Z);
-                writer.Write(v.UV.X);
-                writer.Write(v.UV.Y);
-            }
-
-            // Index data: 4 bytes per index (uint32)
-            uint indexByteCount = (uint)(finalIndices.Count * 4);
-            writer.Write(indexByteCount);
-            foreach (var idx in finalIndices)
-            {
-                writer.Write(idx);
-            }
-
-            // Submesh data
-            writer.Write(submeshInfos.Count);
-            foreach (var (offset, count, slot) in submeshInfos)
-            {
-                writer.Write(offset);
-                writer.Write(count);
-                writer.Write(slot);
-            }
-
-            // Metadata
-            int totalTriangles = finalIndices.Count / 3;
-            asset.Metadata["vertexCount"] = finalVertices.Count.ToString();
-            asset.Metadata["triangleCount"] = totalTriangles.ToString();
-            asset.Metadata["submeshCount"] = submeshInfos.Count.ToString();
-            asset.Metadata["meshCount"] = allMeshes.Count.ToString();
-            asset.Metadata["materialSlotCount"] = submeshInfos.Count.ToString();
-            
-            string targetDir = options?.Settings != null && options.Settings.TryGetValue("TargetDirectory", out var td) && td is string tdStr 
-                ? tdStr 
-                : Path.Combine("Assets", asset.AssetName);
-
-            if (!Directory.Exists(targetDir)) Directory.CreateDirectory(targetDir);
-            string materialsDir = Path.Combine(targetDir, "Materials");
-            if (!Directory.Exists(materialsDir)) Directory.CreateDirectory(materialsDir);
-
-            var slotNames = new List<string>();
-            for (int i = 0; i < submeshInfos.Count; i++)
-            {
-                // Use material name from FBX if available
-                string matName = (i < allMeshes.Count && !string.IsNullOrEmpty(allMeshes[i].MaterialName))
-                    ? allMeshes[i].MaterialName
-                    : $"Material_{i}";
-                // Sanitize for filename
-                matName = string.Join("_", matName.Split(Path.GetInvalidFileNameChars()));
-                slotNames.Add(matName);
-                
-                string matFileName = $"{matName}.blueskyasset";
-                string matPath = Path.Combine(materialsDir, matFileName);
-                
-                // Create a default material for each slot if it doesn't exist
-                // Use distinct colors for easy visualization (production-ready neutral palette)
-                if (!File.Exists(matPath))
-                {
-                    // Neutral color palette for auto-generated materials (subtle but distinct)
-                    var neutralPalette = new[]
-                    {
-                        (0.85f, 0.85f, 0.85f), // Slot 0: Light Grey (body)
-                        (0.15f, 0.15f, 0.15f), // Slot 1: Dark Grey (trim)
-                        (0.95f, 0.95f, 0.95f), // Slot 2: White (glass/chrome)
-                        (0.65f, 0.65f, 0.65f), // Slot 3: Medium Grey
-                        (0.45f, 0.45f, 0.45f), // Slot 4: Charcoal
-                        (0.75f, 0.75f, 0.75f), // Slot 5: Silver
-                        (0.55f, 0.55f, 0.55f), // Slot 6: Steel
-                        (0.35f, 0.35f, 0.35f)  // Slot 7: Graphite
-                    };
-                    
-                    var (r, g, b) = neutralPalette[i % neutralPalette.Length];
-                    var matAsset = new MaterialAsset 
-                    { 
-                        MaterialName = matName, 
-                        MaterialId = Guid.NewGuid(),
-                        Albedo = new Vector3Data(r, g, b),
-                        Metallic = 0.1f,
-                        Roughness = 0.6f,
-                        AO = 1.0f
-                    };
-                    matAsset.Save(matPath);
-                }
-                
-                asset.Metadata[$"materialSlot{i}"] = matPath;
-            }
-            asset.Metadata["materialSlots"] = string.Join(",", slotNames);
-            
-            asset.Metadata["format"] = "Packed32";
-            asset.Metadata["boundsMin"] = $"{boundsMin.X},{boundsMin.Y},{boundsMin.Z}";
-            asset.Metadata["boundsMax"] = $"{boundsMax.X},{boundsMax.Y},{boundsMax.Z}";
-            asset.Type = AssetType.StaticMesh;
-
-            ErrorHandler.LogInfo(
-                $"✓ FBX imported: {finalVertices.Count} verts, {totalTriangles} tris, {submeshInfos.Count} submesh(es) from {allMeshes.Count} mesh(es)",
-                "FBXImportHandler");
-
-            return new ImportResult
-            {
-                Success = true,
-                PayloadData = ms.ToArray()
-            };
-        }
-        catch (Exception ex)
-        {
-            return new ImportResult
-            {
-                Success = false,
-                Error = ex.Message
-            };
-        }
+            Success = false,
+            Error = $"Direct .fbx import is no longer supported — use BlueSky Engine Ease in Blender and import the .stratapack instead. (File: {Path.GetFileName(sourceFile)})"
+        };
     }
 }
 
@@ -969,8 +387,8 @@ internal readonly struct ExpandedVertex : IEquatable<ExpandedVertex>
 }
 
 /// <summary>
-/// GLTF/GLB import handler - imports ALL meshes, materials, and textures from GLTF 2.0 files.
-/// Handles multi-mesh GLB files (like Aston Martin Valhalla with 308 meshes + 47 materials).
+/// GLTF/GLB import handler - imports ALL meshes and textures from GLTF 2.0 files.
+/// Handles multi-mesh GLB files (geometry only; surface colors come from the global clay).
 /// Properly applies node transforms from scene graph to position mesh parts correctly.
 /// 
 /// CRITICAL FIX: Node Transform Application
@@ -996,626 +414,313 @@ internal readonly struct ExpandedVertex : IEquatable<ExpandedVertex>
 ///   Vertex Position = Transform(localPos, worldTransform) × scaleFactor
 ///   Vertex Normal = Normalize(TransformNormal(localNormal, worldTransform))
 /// </summary>
+public class StratapackImportHandler : IAssetImportHandler
+{
+    public string[] SupportedExtensions => new[] { ".stratapack" };
+    public AssetType AssetType => AssetType.StaticMesh;
+
+    public ImportResult Import(string sourceFile, BlueAsset asset, ImportOptions? options)
+    {
+        const string Ctx = "StratapackImportHandler";
+        try
+        {
+            BlueSky.Rendering.Strata.StrataPack.PackFile pack;
+            try
+            {
+                pack = BlueSky.Rendering.Strata.StrataPack.Decode(File.ReadAllBytes(sourceFile));
+            }
+            catch (InvalidOperationException ex)
+            {
+                return new ImportResult { Success = false, Error = ex.Message };
+            }
+
+            if (pack.Header.Meshes.Count == 0)
+            {
+                return new ImportResult
+                {
+                    Success = false,
+                    Error = $"Pack '{Path.GetFileName(sourceFile)}' contains no meshes — nothing assigned."
+                };
+            }
+
+            byte[] payload = pack.Payload;
+
+            static byte[] Slice(byte[] src, ulong off, ulong size)
+            {
+                var dst = new byte[size];
+                Buffer.BlockCopy(src, (int)off, dst, 0, (int)size);
+                return dst;
+            }
+
+            string targetDir = options?.Settings != null
+                && options.Settings.TryGetValue("TargetDirectory", out var td) && td is string tdStr
+                ? tdStr : Path.Combine("Assets", asset.AssetName);
+            var (strataDir, texturesDir) =
+                BlueSky.Core.Assets.StrataImportWriter.EnsureMaterialsLayout(targetDir);
+
+            byte[]? Blob(ulong off, ulong size)
+            {
+                if (size == 0) return null;
+                var dst = new byte[size];
+                Buffer.BlockCopy(payload, (int)off, dst, 0, (int)size);
+                return dst;
+            }
+
+            // One mesh file per pack mesh; Materials/ is shared across all of them.
+            // The dispatcher's asset carries the FIRST mesh; the rest save directly.
+            byte[]? primaryPayload = null;
+            int meshIndex = 0;
+            foreach (var mesh in pack.Header.Meshes)
+            {
+                bool isPrimary = meshIndex == 0;
+                BlueAsset meshAsset = asset;
+                string meshTag = asset.AssetName;
+                if (!isPrimary)
+                {
+                    meshTag = $"{asset.AssetName}_{mesh.Name}";
+                    meshAsset = new BlueAsset
+                    {
+                        AssetName = meshTag,
+                        Type = AssetType.StaticMesh,
+                        SourceFile = sourceFile,
+                        ImportDate = DateTime.UtcNow,
+                    };
+                }
+
+                byte[] vData = Slice(payload, mesh.VertexOffset, mesh.VertexSize);
+                byte[] iData = Slice(payload, mesh.IndexOffset, mesh.IndexSize);
+
+                // Bounds from Packed32 positions (stride 32, xyz = first 12 bytes).
+                var bmin = new System.Numerics.Vector3(float.MaxValue);
+                var bmax = new System.Numerics.Vector3(float.MinValue);
+                for (int v = 0; v < mesh.VertexCount; v++)
+                {
+                    int o = v * 32;
+                    var p = new System.Numerics.Vector3(
+                        BitConverter.ToSingle(vData, o),
+                        BitConverter.ToSingle(vData, o + 4),
+                        BitConverter.ToSingle(vData, o + 8));
+                    bmin = System.Numerics.Vector3.Min(bmin, p);
+                    bmax = System.Numerics.Vector3.Max(bmax, p);
+                }
+
+                using var ms = new MemoryStream();
+                using var writer = new BinaryWriter(ms);
+                writer.Write(vData.Length);
+                writer.Write(vData);
+                writer.Write((uint)iData.Length);
+                writer.Write(iData);
+                writer.Write(mesh.Submeshes.Count);
+                foreach (var sub in mesh.Submeshes)
+                {
+                    writer.Write(sub.Offset);
+                    writer.Write(sub.Count);
+                    writer.Write(sub.Slot);
+                }
+
+                // Surfaces → .stratamat. Texture roles resolved per slot from the
+                // pack's texture/aomap/bent tables (albedo + normal + RMA assembly).
+                var usedSlots = new HashSet<int>();
+                foreach (var sub in mesh.Submeshes) usedSlots.Add(sub.Slot);
+                if (usedSlots.Count == 0)
+                {
+                    if (isPrimary)
+                    {
+                        return new ImportResult
+                        {
+                            Success = false,
+                            Error = $"Mesh '{mesh.Name}' has NO surface slots — nothing assigned."
+                        };
+                    }
+                    ErrorHandler.LogError(
+                        $"Mesh '{mesh.Name}' has NO surface slots — skipped.", null, Ctx);
+                    meshIndex++;
+                    continue;
+                }
+
+                foreach (int slot in usedSlots)
+                {
+                    var surf = pack.Header.Surfaces.Find(s => s.Slot == slot);
+                    var alb = surf != null && surf.AlbedoLinear.Length == 3
+                        ? new System.Numerics.Vector3(surf.AlbedoLinear[0], surf.AlbedoLinear[1], surf.AlbedoLinear[2])
+                        : new System.Numerics.Vector3(0.5f, 0.5f, 0.5f);
+                    var emi = surf != null && surf.EmissiveLinear.Length == 3
+                        ? new System.Numerics.Vector3(surf.EmissiveLinear[0], surf.EmissiveLinear[1], surf.EmissiveLinear[2])
+                        : System.Numerics.Vector3.Zero;
+                    var coatTint = surf != null && surf.ClearcoatTintLinear != null && surf.ClearcoatTintLinear.Length == 3
+                        ? new System.Numerics.Vector3(surf.ClearcoatTintLinear[0], surf.ClearcoatTintLinear[1], surf.ClearcoatTintLinear[2])
+                        : System.Numerics.Vector3.One;
+
+                    byte[]? albedoBytes = null; int albedoW = 0, albedoH = 0;
+                    byte[]? normalBytes = null; int normalW = 0, normalH = 0;
+                    byte[]? rmaBytes = null; int rmaW = 0, rmaH = 0;
+                    foreach (var tex in pack.Header.Textures)
+                    {
+                        if (tex.Slot != slot) continue;
+                        var blob = Blob(tex.Offset, tex.Size);
+                        if (blob == null) continue;
+                        string role = (tex.Role ?? "").ToLowerInvariant();
+                        // Persist every pack texture for user override.
+                        BlueSky.Core.Assets.StrataImportWriter.WriteTextureBlob(
+                            texturesDir, $"slot{slot}_{role}_{tex.Width}x{tex.Height}",
+                            tex.Width, tex.Height, blob);
+                        if (role.Contains("albedo") || role.Contains("basecolor") || role.Contains("diffuse"))
+                        { albedoBytes = blob; albedoW = tex.Width; albedoH = tex.Height; }
+                        else if (role.Contains("normal"))
+                        { normalBytes = blob; normalW = tex.Width; normalH = tex.Height; }
+                        else if (role.Contains("rma") || role.Contains("rough") || role.Contains("metal") || role.Contains("orm"))
+                        { rmaBytes = blob; rmaW = tex.Width; rmaH = tex.Height; }
+                    }
+
+                    // Bent-normal map: separate BentMaps table. ONLY the "world"
+                    // encoding feeds the lobe (the shader reads world-space RGB
+                    // and the importer never guesses normal spaces) — anything
+                    // else persists for override but stays unassembled, loudly.
+                    byte[]? bentBytes = null; int bentW = 0, bentH = 0;
+                    foreach (var bent in pack.Header.BentMaps)
+                    {
+                        if (bent.Slot != slot) continue;
+                        var blob = Blob(bent.Offset, bent.Size);
+                        if (blob == null) continue;
+                        BlueSky.Core.Assets.StrataImportWriter.WriteTextureBlob(
+                            texturesDir, $"slot{slot}_bent_{bent.Width}x{bent.Height}",
+                            bent.Width, bent.Height, blob);
+                        if (string.Equals(bent.Encoding, "world", StringComparison.OrdinalIgnoreCase))
+                        { bentBytes = blob; bentW = bent.Width; bentH = bent.Height; }
+                        else
+                            ErrorHandler.LogInfo(
+                                $"[StratapackImportHandler] Slot {slot} bent map encoding '{bent.Encoding}' != world — persisted, not assembled.", Ctx);
+                    }
+
+                    var mat = BlueSky.Rendering.Strata.StrataImporter.Assemble(
+                        $"{meshTag}_slot{slot}",
+                        alb,
+                        surf?.Metallic ?? 0f,
+                        surf?.Roughness ?? 0.6f,
+                        1f,
+                        emi,
+                        surf != null && surf.EmissiveIntensity > 0f ? surf.EmissiveIntensity : 0f,
+                        albedoSrgb: albedoBytes, albedoW: albedoW, albedoH: albedoH,
+                        normalMap: normalBytes, normalW: normalW, normalH: normalH,
+                        rmaMap: rmaBytes, rmaW: rmaW, rmaH: rmaH,
+                        clearcoat: surf?.Clearcoat ?? 0f,
+                        clearcoatTintLinear: coatTint,
+                        alpha: surf?.Alpha ?? 1f,
+                        sheen: surf?.Sheen ?? 0f,
+                        anisotropy: surf?.Anisotropy ?? 0f,
+                        bentMap: bentBytes, bentW: bentW, bentH: bentH);
+
+                    string stratamatPath =
+                        BlueSky.Core.Assets.StrataImportWriter.WriteStrataMaterial(strataDir, mat);
+                    BlueSky.Core.Assets.StrataImportWriter.LinkSlot(meshAsset.Metadata, slot, stratamatPath);
+                    ErrorHandler.LogInfo(
+                        $"[StratapackImportHandler] ✓ Slot {slot} → '{Path.GetFileName(stratamatPath)}' " +
+                        $"(mask=0x{(uint)mat.Features:X})", Ctx);
+                }
+
+                // Vertex AO (Phase A): NO sidecar files. The .stratapack stays
+                // the database; the asset carries pack-relative references and
+                // readers slice straight from the pack via DecodeHeader.
+                if (mesh.AoSize > 0 && mesh.AoCount > 0)
+                {
+                    meshAsset.Metadata["sourcePack"] = sourceFile;
+                    meshAsset.Metadata["aoOffset"] = mesh.AoOffset.ToString();
+                    meshAsset.Metadata["aoSize"] = mesh.AoSize.ToString();
+                    meshAsset.Metadata["aoCount"] = mesh.AoCount.ToString();
+                }
+
+                // Skeleton + skinning (skeletal): same rule, no sidecars.
+                // Bones live in the pack header; the skin stream is sliced
+                // from the pack payload at read time.
+                if (mesh.SkeletonIndex >= 0 && mesh.SkinCount > 0 &&
+                    mesh.SkeletonIndex < pack.Header.Skeletons.Count)
+                {
+                    var skel = pack.Header.Skeletons[mesh.SkeletonIndex];
+                    meshAsset.Metadata["sourcePack"] = sourceFile;
+                    meshAsset.Metadata["skinOffset"] = mesh.SkinOffset.ToString();
+                    meshAsset.Metadata["skinSize"] = mesh.SkinSize.ToString();
+                    meshAsset.Metadata["skinCount"] = mesh.SkinCount.ToString();
+                    meshAsset.Metadata["skeletonIndex"] = mesh.SkeletonIndex.ToString();
+                    meshAsset.Metadata["skeletonName"] = skel.Name;
+                    meshAsset.Metadata["skeletonBones"] = skel.Bones.Count.ToString();
+                    ErrorHandler.LogInfo(
+                        $"[StratapackImportHandler] ✓ Skeleton '{skel.Name}' ({skel.Bones.Count} bones, {mesh.SkinCount} skinned verts, in-pack)", Ctx);
+                }
+
+                meshAsset.Metadata["vertexCount"] = (vData.Length / 32).ToString();
+                meshAsset.Metadata["triangleCount"] = (iData.Length / 12).ToString();
+                meshAsset.Metadata["submeshCount"] = mesh.Submeshes.Count.ToString();
+                meshAsset.Metadata["meshCount"] = "1";
+                // Every mesh cites its pack: Phase-B probes aggregate across all
+                // packs referenced by loaded meshes. No files, just the path.
+                meshAsset.Metadata["sourcePack"] = sourceFile;
+                meshAsset.Metadata["format"] = "Packed32";
+                meshAsset.Metadata["boundsMin"] = $"{bmin.X},{bmin.Y},{bmin.Z}";
+                meshAsset.Metadata["boundsMax"] = $"{bmax.X},{bmax.Y},{bmax.Z}";
+                meshAsset.Type = AssetType.StaticMesh;
+
+                ErrorHandler.LogInfo(
+                    $"✓ StrataPack imported: {mesh.Name} ({mesh.VertexCount} verts, " +
+                    $"{mesh.IndexCount / 3} tris, {mesh.Submeshes.Count} submesh(es))", Ctx);
+
+                if (isPrimary)
+                {
+                    primaryPayload = ms.ToArray();
+                }
+                else
+                {
+                    string extraPath = Path.Combine(targetDir, $"{meshTag}.blueskyasset");
+                    var extra = new BlueAsset
+                    {
+                        AssetName = meshTag,
+                        Type = AssetType.StaticMesh,
+                        SourceFile = sourceFile,
+                        ImportDate = DateTime.UtcNow,
+                        Metadata = meshAsset.Metadata,
+                        PayloadData = ms.ToArray(),
+                    };
+                    if (!extra.Save(extraPath))
+                    {
+                        ErrorHandler.LogError($"Mesh '{mesh.Name}': failed to save '{extraPath}'.", null, Ctx);
+                    }
+                }
+                meshIndex++;
+            }
+
+            if (primaryPayload == null)
+            {
+                return new ImportResult
+                {
+                    Success = false,
+                    Error = $"Pack '{Path.GetFileName(sourceFile)}' produced no importable mesh."
+                };
+            }
+
+            return new ImportResult { Success = true, PayloadData = primaryPayload };
+        }
+        catch (Exception ex)
+        {
+            return new ImportResult { Success = false, Error = ex.Message };
+        }
+    }
+}
+/// <summary>
+/// GLTF/GLB import handler (.gltf/.glb).
+/// Direct source-mesh import was removed: Blender Ease + .stratapack is the
+/// only mesh door. This handler stays registered so the dispatcher reports a
+/// loud rejection instead of "no importer".
+/// </summary>
 public class GLTFImportHandler : IAssetImportHandler
 {
     public string[] SupportedExtensions => new[] { ".gltf", ".glb" };
     public AssetType AssetType => AssetType.StaticMesh;
 
-    /// <summary>
-    /// Recursively compute world transforms for all nodes in the scene graph.
-    /// GLTF scene graph: each node has local transform (TRS or matrix) and children.
-    /// World transform = parent world transform × local transform.
-    /// This is CRITICAL for multi-mesh models where each mesh part has its own position/rotation.
-    /// </summary>
-    private static void ComputeNodeTransforms(
-        BlueSky.Animation.GLTF.GltfRoot root, 
-        int nodeIdx, 
-        System.Numerics.Matrix4x4 parentTransform, 
-        Dictionary<int, System.Numerics.Matrix4x4> outTransforms)
-    {
-        if (root.Nodes == null || nodeIdx >= root.Nodes.Length) return;
-        
-        var node = root.Nodes[nodeIdx];
-        
-        // Compute local transform from TRS or matrix
-        System.Numerics.Matrix4x4 localTransform;
-        
-        if (node.Matrix != null && node.Matrix.Length == 16)
-        {
-            // Matrix property (column-major)
-            localTransform = new System.Numerics.Matrix4x4(
-                node.Matrix[0], node.Matrix[1], node.Matrix[2], node.Matrix[3],
-                node.Matrix[4], node.Matrix[5], node.Matrix[6], node.Matrix[7],
-                node.Matrix[8], node.Matrix[9], node.Matrix[10], node.Matrix[11],
-                node.Matrix[12], node.Matrix[13], node.Matrix[14], node.Matrix[15]
-            );
-        }
-        else
-        {
-            // TRS properties (Translation, Rotation, Scale)
-            var translation = (node.Translation != null && node.Translation.Length == 3)
-                ? new System.Numerics.Vector3(node.Translation[0], node.Translation[1], node.Translation[2])
-                : System.Numerics.Vector3.Zero;
-            
-            var rotation = (node.Rotation != null && node.Rotation.Length == 4)
-                ? new System.Numerics.Quaternion(node.Rotation[0], node.Rotation[1], node.Rotation[2], node.Rotation[3])
-                : System.Numerics.Quaternion.Identity;
-            
-            var scale = (node.Scale != null && node.Scale.Length == 3)
-                ? new System.Numerics.Vector3(node.Scale[0], node.Scale[1], node.Scale[2])
-                : System.Numerics.Vector3.One;
-            
-            // Build TRS matrix: T × R × S (GLTF spec: apply scale, then rotation, then translation)
-            // System.Numerics uses row-major, so we compose right-to-left
-            localTransform = System.Numerics.Matrix4x4.CreateScale(scale) *
-                             System.Numerics.Matrix4x4.CreateFromQuaternion(rotation) *
-                             System.Numerics.Matrix4x4.CreateTranslation(translation);
-        }
-        
-        // Compute world transform: local × parent (GLTF column-major order)
-        // System.Numerics is row-major, so this becomes: parent * local in code
-        var worldTransform = localTransform * parentTransform;
-        outTransforms[nodeIdx] = worldTransform;
-        
-        // Recurse to children
-        if (node.Children != null)
-        {
-            foreach (var childIdx in node.Children)
-            {
-                ComputeNodeTransforms(root, childIdx, worldTransform, outTransforms);
-            }
-        }
-    }
-
-    private static void LogGltfSkinBones(BlueSky.Animation.GLTF.GltfRoot root)
-    {
-        if (root.Skins == null || root.Skins.Length == 0)
-        {
-            ErrorHandler.LogInfo("[GLTFImportHandler] Imported skin bones: <none>", "GLTFImportHandler");
-            return;
-        }
-
-        if (root.Nodes == null || root.Nodes.Length == 0)
-        {
-            ErrorHandler.LogWarning("[GLTFImportHandler] Skin exists, but GLTF has no nodes to name bones.", "GLTFImportHandler");
-            return;
-        }
-
-        for (int skinIndex = 0; skinIndex < root.Skins.Length; skinIndex++)
-        {
-            var skin = root.Skins[skinIndex];
-            ErrorHandler.LogInfo(
-                $"[GLTFImportHandler] Imported skin {skinIndex}: joints={skin.Joints.Length}, skeletonRoot={skin.Skeleton?.ToString() ?? "none"}",
-                "GLTFImportHandler");
-
-            for (int jointSlot = 0; jointSlot < skin.Joints.Length; jointSlot++)
-            {
-                int nodeIndex = skin.Joints[jointSlot];
-                if (nodeIndex < 0 || nodeIndex >= root.Nodes.Length)
-                {
-                    ErrorHandler.LogWarning(
-                        $"[GLTFImportHandler]   joint[{jointSlot:00}] references invalid node index {nodeIndex}",
-                        "GLTFImportHandler");
-                    continue;
-                }
-
-                var node = root.Nodes[nodeIndex];
-                string name = string.IsNullOrWhiteSpace(node.Name) ? $"<unnamed node {nodeIndex}>" : node.Name;
-                string translation = FormatFloatArray(node.Translation, 3, "0,0,0");
-                string rotation = FormatFloatArray(node.Rotation, 4, "0,0,0,1");
-                string scale = FormatFloatArray(node.Scale, 3, "1,1,1");
-                string children = node.Children != null && node.Children.Length > 0
-                    ? string.Join(",", node.Children)
-                    : "-";
-
-                ErrorHandler.LogInfo(
-                    $"[GLTFImportHandler]   joint[{jointSlot:00}] node={nodeIndex} name='{name}' children={children} " +
-                    $"T=({translation}) R=({rotation}) S=({scale})",
-                    "GLTFImportHandler");
-            }
-        }
-    }
-
-    private static string FormatFloatArray(float[]? values, int expectedLength, string fallback)
-    {
-        if (values == null || values.Length < expectedLength)
-            return fallback;
-
-        return string.Join(", ", values.Take(expectedLength).Select(v => v.ToString("F3", System.Globalization.CultureInfo.InvariantCulture)));
-    }
-    
-    /// <summary>
-    /// Flip texture horizontally (mirror left-right) to fix GLTF coordinate system mismatch.
-    /// Fixes mirrored text/logos like "ASTON MARTIN" appearing as "NITRAM NOTSA".
-    /// Operates in-place on RGBA8 pixel data.
-    /// </summary>
-    private static void FlipTextureHorizontally(byte[] pixels, int width, int height)
-    {
-        int stride = width * 4; // 4 bytes per pixel (RGBA)
-        byte[] rowBuffer = new byte[stride];
-        
-        for (int y = 0; y < height; y++)
-        {
-            int rowStart = y * stride;
-            
-            // Reverse pixels in this row
-            for (int x = 0; x < width / 2; x++)
-            {
-                int leftIdx = rowStart + x * 4;
-                int rightIdx = rowStart + (width - 1 - x) * 4;
-                
-                // Swap RGBA pixels
-                for (int c = 0; c < 4; c++)
-                {
-                    byte temp = pixels[leftIdx + c];
-                    pixels[leftIdx + c] = pixels[rightIdx + c];
-                    pixels[rightIdx + c] = temp;
-                }
-            }
-        }
-    }
-
     public ImportResult Import(string sourceFile, BlueAsset asset, ImportOptions? options)
     {
-        try
+        return new ImportResult
         {
-            ErrorHandler.LogInfo($"[GLTFImportHandler] Starting GLTF import: {Path.GetFileName(sourceFile)}", "GLTFImportHandler");
-
-            var importer = BlueSky.Animation.GLTF.GltfImporter.FromFile(sourceFile);
-            var root = importer.Root;
-
-            if (root.Meshes == null || root.Meshes.Length == 0)
-            {
-                return new ImportResult { Success = false, Error = "No meshes found in GLTF file" };
-            }
-
-            bool hasSkins = root.Skins != null && root.Skins.Length > 0;
-            bool hasJointAttributes = root.Meshes.Any(mesh =>
-                mesh.Primitives.Any(prim =>
-                    prim.Attributes.ContainsKey("JOINTS_0") ||
-                    prim.Attributes.ContainsKey("WEIGHTS_0")));
-
-            if (hasSkins || hasJointAttributes)
-            {
-                asset.Type = AssetType.SkeletalMesh;
-                asset.Metadata["assetKind"] = "SkeletalMesh";
-                asset.Metadata["skinCount"] = (root.Skins?.Length ?? 0).ToString();
-                asset.Metadata["hasSkins"] = hasSkins.ToString();
-                asset.Metadata["hasJointAttributes"] = hasJointAttributes.ToString();
-                asset.Metadata["hasAnimations"] = (root.Animations != null && root.Animations.Length > 0).ToString();
-                asset.Metadata["animationCount"] = (root.Animations?.Length ?? 0).ToString();
-
-                if (root.Skins != null && root.Skins.Length > 0)
-                {
-                    var skin = root.Skins[0];
-                    asset.Metadata["boneCount"] = skin.Joints.Length.ToString();
-                    if (root.Nodes != null)
-                    {
-                        var boneNames = skin.Joints
-                            .Where(nodeIndex => nodeIndex >= 0 && nodeIndex < root.Nodes.Length)
-                            .Select(nodeIndex => root.Nodes[nodeIndex].Name ?? $"Bone_{nodeIndex}")
-                            .ToArray();
-                        asset.Metadata["boneNames"] = string.Join(",", boneNames);
-                    }
-                }
-
-                ErrorHandler.LogInfo(
-                    $"[GLTFImportHandler] Detected skeletal GLTF data: skins={root.Skins?.Length ?? 0}, jointAttributes={hasJointAttributes}",
-                    "GLTFImportHandler");
-                LogGltfSkinBones(root);
-            }
-
-            // Setup directories
-            string targetDir = options?.Settings != null && options.Settings.TryGetValue("TargetDirectory", out var td) && td is string tdStr 
-                ? tdStr 
-                : Path.Combine("Assets", asset.AssetName);
-            if (!Directory.Exists(targetDir)) Directory.CreateDirectory(targetDir);
-            string materialsDir = Path.Combine(targetDir, "Materials");
-            string texturesDir = Path.Combine(targetDir, "Textures");
-            if (!Directory.Exists(materialsDir)) Directory.CreateDirectory(materialsDir);
-            if (!Directory.Exists(texturesDir)) Directory.CreateDirectory(texturesDir);
-
-            // ── STEP 1: Identify and Extract all textures ──────────────────────────────────
-            var texturePathMap = new Dictionary<int, string>(); // GLTF texture index → .blueskyasset path
-            var mrTextures = new HashSet<int>();
-            var aoTextures = new HashSet<int>();
-            var normalTextures = new HashSet<int>();
-            var albedoTextures = new HashSet<int>();
-
-            if (root.Materials != null)
-            {
-                foreach (var mat in root.Materials)
-                {
-                    if (mat.PbrMetallicRoughness != null)
-                    {
-                        if (mat.PbrMetallicRoughness.BaseColorTexture != null) albedoTextures.Add(mat.PbrMetallicRoughness.BaseColorTexture.Index);
-                        if (mat.PbrMetallicRoughness.MetallicRoughnessTexture != null) mrTextures.Add(mat.PbrMetallicRoughness.MetallicRoughnessTexture.Index);
-                    }
-                    if (mat.NormalTexture != null) normalTextures.Add(mat.NormalTexture.Index);
-                    if (mat.OcclusionTexture != null) aoTextures.Add(mat.OcclusionTexture.Index);
-                }
-            }
-
-            if (root.Textures != null && root.Textures.Length > 0)
-            {
-                ErrorHandler.LogInfo($"[GLTFImportHandler] ═══════════════════════════════════════════════════════════", "GLTFImportHandler");
-                ErrorHandler.LogInfo($"[GLTFImportHandler] EXTRACTING {root.Textures.Length} EMBEDDED TEXTURES", "GLTFImportHandler");
-                ErrorHandler.LogInfo($"[GLTFImportHandler] ═══════════════════════════════════════════════════════════", "GLTFImportHandler");
-                
-                for (int i = 0; i < root.Textures.Length; i++)
-                {
-                    try
-                    {
-                        var texData = importer.ExtractTexture(i);
-                        if (texData != null && texData.Length > 0)
-                        {
-                            StbImageSharp.StbImage.stbi_set_flip_vertically_on_load(0);
-                            using var stream = new MemoryStream(texData);
-                            var imageResult = StbImageSharp.ImageResult.FromStream(stream, StbImageSharp.ColorComponents.RedGreenBlueAlpha);
-                            
-                            if (imageResult != null)
-                            {
-                                string texName = $"Texture_{i}";
-                                if (root.Textures[i].Name != null && !string.IsNullOrWhiteSpace(root.Textures[i].Name))
-                                    texName = root.Textures[i].Name;
-                                else if (root.Textures[i].Source.HasValue && root.Images != null && root.Textures[i].Source.Value < root.Images.Length && root.Images[root.Textures[i].Source.Value].Name != null)
-                                    texName = root.Images[root.Textures[i].Source.Value].Name;
-                                
-                                texName = string.Join("_", texName.Split(Path.GetInvalidFileNameChars()));
-                                
-                                // ★ CRITICAL FIX: RMA Channel Packing ★
-                                // GLTF MR: G=Roughness, B=Metallic. AO: R channel of separate texture.
-                                // Engine RMA: R=Roughness, G=Metallic, B=AO.
-                                if (mrTextures.Contains(i) || aoTextures.Contains(i))
-                                {
-                                    bool isMR = mrTextures.Contains(i);
-                                    bool isAO = aoTextures.Contains(i);
-                                    
-                                    for (int p = 0; p < imageResult.Data.Length; p += 4)
-                                    {
-                                        byte r = imageResult.Data[p];
-                                        byte g = imageResult.Data[p + 1];
-                                        byte b = imageResult.Data[p + 2];
-                                        
-                                        if (isMR && isAO) {
-                                            // Combined GLTF texture: R=AO, G=Roughness, B=Metallic
-                                            imageResult.Data[p] = g;     // Roughness -> R
-                                            imageResult.Data[p + 1] = b; // Metallic -> G
-                                            imageResult.Data[p + 2] = r; // AO -> B
-                                        } else if (isMR) {
-                                            // Pure MR: G=Roughness, B=Metallic
-                                            imageResult.Data[p] = g;     // Roughness -> R
-                                            imageResult.Data[p + 1] = b; // Metallic -> G
-                                            imageResult.Data[p + 2] = 255; // Default AO
-                                        } else if (isAO) {
-                                            // Pure AO: R=AO
-                                            imageResult.Data[p] = 255;   // Default Roughness
-                                            imageResult.Data[p + 1] = 0; // Default Metallic
-                                            imageResult.Data[p + 2] = r; // AO -> B
-                                        }
-                                    }
-                                    if (isMR) texName += "_RMA";
-                                    else if (isAO) texName += "_AO";
-                                }
-
-                                var texAsset = new BlueAsset { AssetName = texName, Type = AssetType.Texture, ImportDate = DateTime.UtcNow };
-                                using var texMs = new MemoryStream();
-                                using var texWriter = new BinaryWriter(texMs);
-                                texWriter.Write(imageResult.Width);
-                                texWriter.Write(imageResult.Height);
-                                texWriter.Write(4);
-                                texWriter.Write(imageResult.Data.Length);
-                                texWriter.Write(imageResult.Data);
-                                
-                                texAsset.PayloadData = texMs.ToArray();
-                                texAsset.Metadata["width"] = imageResult.Width.ToString();
-                                texAsset.Metadata["height"] = imageResult.Height.ToString();
-                                texAsset.Metadata["format"] = "RGBA8";
-                                
-                                string texPath = Path.Combine(texturesDir, $"{texName}.blueskyasset");
-                                if (texAsset.Save(texPath))
-                                {
-                                    texturePathMap[i] = texPath;
-                                    ErrorHandler.LogInfo($"[GLTFImportHandler] ✓ Texture {i}: '{texName}'", "GLTFImportHandler");
-                                }
-                            }
-                        }
-                    }
-                    catch (Exception ex) { ErrorHandler.LogWarning($"[GLTFImportHandler] Failed texture {i}: {ex.Message}", "GLTFImportHandler"); }
-                }
-            }
-
-            // ── STEP 2: Convert and save all materials ─────────────────────────────────────
-            ErrorHandler.LogInfo($"[GLTFImportHandler] texturePathMap has {texturePathMap.Count} entries before material creation", "GLTFImportHandler");
-            foreach (var kvp in texturePathMap)
-                ErrorHandler.LogInfo($"[GLTFImportHandler]   texturePathMap[{kvp.Key}] = {Path.GetFileName(kvp.Value)}", "GLTFImportHandler");
-            
-            var materialPathMap = new Dictionary<int, string>();
-            if (root.Materials != null)
-            {
-                for (int i = 0; i < root.Materials.Length; i++)
-                {
-                    try
-                    {
-                        var gltfMat = root.Materials[i];
-                        string matName = string.IsNullOrEmpty(gltfMat.Name) ? $"Material_{i}" : gltfMat.Name;
-                        matName = string.Join("_", matName.Split(Path.GetInvalidFileNameChars()));
-
-                        var matAsset = new MaterialAsset { MaterialName = matName, Albedo = new Vector3Data(1,1,1), Metallic = 0, Roughness = 0.5f, Opacity = 1 };
-
-                        if (gltfMat.PbrMetallicRoughness != null)
-                        {
-                            var pbr = gltfMat.PbrMetallicRoughness;
-                            if (pbr.BaseColorFactor != null && pbr.BaseColorFactor.Length >= 4)
-                            {
-                                matAsset.Albedo = new Vector3Data(pbr.BaseColorFactor[0], pbr.BaseColorFactor[1], pbr.BaseColorFactor[2]);
-                                matAsset.Opacity = pbr.BaseColorFactor[3];
-                            }
-                            else if (pbr.BaseColorFactor != null && pbr.BaseColorFactor.Length >= 3)
-                            {
-                                matAsset.Albedo = new Vector3Data(pbr.BaseColorFactor[0], pbr.BaseColorFactor[1], pbr.BaseColorFactor[2]);
-                            }
-                            
-                            matAsset.Metallic = pbr.MetallicFactor;
-                            matAsset.Roughness = pbr.RoughnessFactor;
-                            
-                            // Adjust opacity based on AlphaMode
-                            if (gltfMat.AlphaMode == "BLEND")
-                                matAsset.Opacity = System.Math.Min(matAsset.Opacity, 0.99f); // Force some transparency
-                            else if (gltfMat.AlphaMode == "MASK")
-                                matAsset.Opacity = 1.0f; // Masking handled by clip in shader
-
-                            // Log texture lookup attempts
-                            if (pbr.BaseColorTexture != null)
-                            {
-                                bool found = texturePathMap.TryGetValue(pbr.BaseColorTexture.Index, out var albedoPath);
-                                ErrorHandler.LogInfo($"[GLTFImportHandler] Mat[{i}] '{matName}': BaseColorTexture.Index={pbr.BaseColorTexture.Index}, found={found}, path={albedoPath ?? "NULL"}", "GLTFImportHandler");
-                                if (found)
-                                    matAsset.AlbedoTexturePath = albedoPath!;
-                            }
-                            
-                            if (pbr.MetallicRoughnessTexture != null)
-                            {
-                                bool found = texturePathMap.TryGetValue(pbr.MetallicRoughnessTexture.Index, out var mrPath);
-                                ErrorHandler.LogInfo($"[GLTFImportHandler] Mat[{i}] '{matName}': MetallicRoughnessTex.Index={pbr.MetallicRoughnessTexture.Index}, found={found}", "GLTFImportHandler");
-                                if (found)
-                                    matAsset.RMATexturePath = mrPath!;
-                            }
-                        }
-                        else
-                        {
-                            ErrorHandler.LogWarning($"[GLTFImportHandler] Mat[{i}] '{matName}': NO PbrMetallicRoughness block!", "GLTFImportHandler");
-                        }
-
-                        if (gltfMat.NormalTexture != null && texturePathMap.TryGetValue(gltfMat.NormalTexture.Index, out var normalPath))
-                            matAsset.NormalTexturePath = normalPath;
-
-                        if (gltfMat.OcclusionTexture != null && texturePathMap.TryGetValue(gltfMat.OcclusionTexture.Index, out var aoPath))
-                        {
-                            if (string.IsNullOrEmpty(matAsset.RMATexturePath)) matAsset.RMATexturePath = aoPath;
-                        }
-
-                        if (!string.IsNullOrEmpty(gltfMat.AlphaMode))
-                            matAsset.BlendMode = gltfMat.AlphaMode == "BLEND" || gltfMat.AlphaMode == "MASK" ? BlueSky.Rendering.Materials.BlendMode.AlphaBlend : BlueSky.Rendering.Materials.BlendMode.Opaque;
-
-                        string matPath = Path.Combine(materialsDir, $"{matName}.blueskyasset");
-                        matAsset.Save(matPath);
-                        materialPathMap[i] = matPath;
-                    }
-                    catch (Exception ex) { ErrorHandler.LogError($"[GLTFImportHandler] Failed material {i}: {ex.Message}", ex, "GLTFImportHandler"); }
-                }
-            }
-
-            // ── STEP 3: Build scene graph and compute node transforms ──────────────────────
-            var nodeTransforms = new Dictionary<int, System.Numerics.Matrix4x4>();
-            var nodeToMesh = new Dictionary<int, int>(); // node index → mesh index
-            
-            if (root.Nodes != null)
-            {
-                // Build node hierarchy and compute world transforms
-                for (int i = 0; i < root.Nodes.Length; i++)
-                {
-                    var node = root.Nodes[i];
-                    if (node.Mesh.HasValue)
-                    {
-                        nodeToMesh[i] = node.Mesh.Value;
-                    }
-                }
-                
-                // Compute world transforms for all nodes (traverse from scene roots)
-                if (root.Scenes != null && root.Scene.HasValue && root.Scene.Value < root.Scenes.Length)
-                {
-                    var scene = root.Scenes[root.Scene.Value];
-                    if (scene.Nodes != null)
-                    {
-                        foreach (var rootNodeIdx in scene.Nodes)
-                        {
-                            ComputeNodeTransforms(root, rootNodeIdx, System.Numerics.Matrix4x4.Identity, nodeTransforms);
-                        }
-                    }
-                }
-                else if (root.Scenes != null && root.Scenes.Length > 0)
-                {
-                    // Fallback: use first scene
-                    var scene = root.Scenes[0];
-                    if (scene.Nodes != null)
-                    {
-                        foreach (var rootNodeIdx in scene.Nodes)
-                        {
-                            ComputeNodeTransforms(root, rootNodeIdx, System.Numerics.Matrix4x4.Identity, nodeTransforms);
-                        }
-                    }
-                }
-            }
-
-            // ── STEP 4: Extract ALL meshes and combine into submeshes ──────────────────────
-            var finalVertices = new List<ExpandedVertex>();
-            var finalIndices = new List<uint>();
-            var submeshInfos = new List<(int indexOffset, int indexCount, int materialSlot)>();
-
-            // GLTF spec uses meters as the default unit
-            // No scale factor applied - use native GLTF units
-            int totalPrimitives = 0;
-            
-            // Process meshes via scene graph nodes (to apply transforms)
-            foreach (var kvp in nodeToMesh)
-            {
-                int nodeIdx = kvp.Key;
-                int meshIdx = kvp.Value;
-                
-                if (meshIdx >= root.Meshes.Length) continue;
-                
-                // Get world transform for this node
-                System.Numerics.Matrix4x4 worldTransform = nodeTransforms.TryGetValue(nodeIdx, out var transform) 
-                    ? transform 
-                    : System.Numerics.Matrix4x4.Identity;
-                
-                var gltfMesh = importer.ExtractMesh(meshIdx);
-                foreach (var prim in gltfMesh.Primitives)
-                {
-                    if (prim.Positions == null) continue;
-
-                    int submeshIndexStart = finalIndices.Count;
-                    int submeshVertexStart = finalVertices.Count;
-
-                    // Add all vertices for this primitive (with world transform)
-                    for (int i = 0; i < prim.Positions.Length; i++)
-                    {
-                        // Apply world transform to position
-                        var localPos = prim.Positions[i];
-                        // glTF is right-handed, and the engine's projection/view matrices are also right-handed.
-                        // No handedness conversion is needed.
-                        var worldPos = System.Numerics.Vector3.Transform(localPos, worldTransform);
-                        
-                        // Apply node transform to normal (rotation only, no translation/scale)
-                        var localNormal = (prim.Normals != null && i < prim.Normals.Length) ? prim.Normals[i] : System.Numerics.Vector3.UnitY;
-                        var worldNormal = System.Numerics.Vector3.TransformNormal(localNormal, worldTransform);
-                        worldNormal = System.Numerics.Vector3.Normalize(worldNormal);
-                        
-                        var uv = (prim.TexCoords0 != null && i < prim.TexCoords0.Length) ? prim.TexCoords0[i] : System.Numerics.Vector2.Zero;
-
-                        finalVertices.Add(new ExpandedVertex(worldPos, worldNormal, uv));
-                    }
-
-                    // Add indices (offset by submeshVertexStart to reference global vertex buffer)
-                    if (prim.Indices != null && prim.Indices.Length > 0)
-                    {
-                        foreach (var idx in prim.Indices)
-                        {
-                            finalIndices.Add((uint)(submeshVertexStart + idx));
-                        }
-                    }
-                    else
-                    {
-                        // No indices - generate sequential
-                        for (int i = 0; i < prim.Positions.Length; i++)
-                        {
-                            finalIndices.Add((uint)(submeshVertexStart + i));
-                        }
-                    }
-
-                    int submeshIndexCount = finalIndices.Count - submeshIndexStart;
-                    
-                    // No winding order fix needed since we didn't flip any axis.
-                    
-                    if (submeshIndexCount > 0)
-                    {
-                        int matSlot = prim.Material ?? 0;
-                        submeshInfos.Add((submeshIndexStart, submeshIndexCount, matSlot));
-                        totalPrimitives++;
-                    }
-                }
-            }
-
-            if (finalVertices.Count == 0)
-            {
-                return new ImportResult { Success = false, Error = "No valid vertices after processing GLTF meshes" };
-            }
-
-            ErrorHandler.LogInfo($"[GLTFImportHandler] ✓ Extracted {totalPrimitives} primitives from {nodeToMesh.Count} nodes", "GLTFImportHandler");
-            ErrorHandler.LogInfo($"[GLTFImportHandler] ✓ Total: {finalVertices.Count} vertices, {finalIndices.Count / 3} triangles", "GLTFImportHandler");
-
-            // ── STEP 5: Pack binary data ───────────────────────────────────────────────────
-            using var ms = new MemoryStream();
-            using var writer = new BinaryWriter(ms);
-
-            // Vertex data (32 bytes per vertex)
-            int vertexByteCount = finalVertices.Count * 32;
-            writer.Write(vertexByteCount);
-            foreach (var v in finalVertices)
-            {
-                writer.Write(v.Position.X); writer.Write(v.Position.Y); writer.Write(v.Position.Z);
-                writer.Write(v.Normal.X); writer.Write(v.Normal.Y); writer.Write(v.Normal.Z);
-                writer.Write(v.UV.X); writer.Write(v.UV.Y);
-            }
-
-            // Index data
-            uint indexByteCount = (uint)(finalIndices.Count * 4);
-            writer.Write(indexByteCount);
-            foreach (var idx in finalIndices) writer.Write(idx);
-
-            // Submesh data
-            writer.Write(submeshInfos.Count);
-            foreach (var (offset, count, slot) in submeshInfos)
-            {
-                writer.Write(offset);
-                writer.Write(count);
-                writer.Write(slot);
-            }
-
-            // ── STEP 6: Assign materials to slots ──────────────────────────────────────────
-            var usedMaterialSlots = new HashSet<int>();
-            foreach (var (_, _, slot) in submeshInfos) usedMaterialSlots.Add(slot);
-
-            var slotNames = new List<string>();
-            foreach (var matSlot in usedMaterialSlots.OrderBy(x => x))
-            {
-                string matName = $"Material_{matSlot}";
-                
-                if (materialPathMap.TryGetValue(matSlot, out var matPath))
-                {
-                    // Extract material name from path
-                    matName = Path.GetFileNameWithoutExtension(matPath);
-                    asset.Metadata[$"materialSlot{matSlot}"] = matPath;
-                }
-                else
-                {
-                    // Fallback: create default material
-                    var fallbackMat = new MaterialAsset 
-                    { 
-                        MaterialName = matName, 
-                        MaterialId = Guid.NewGuid(),
-                        Albedo = new Vector3Data(0.8f, 0.8f, 0.8f)
-                    };
-                    string fallbackPath = Path.Combine(materialsDir, $"{matName}.blueskyasset");
-                    fallbackMat.Save(fallbackPath);
-                    asset.Metadata[$"materialSlot{matSlot}"] = fallbackPath;
-                }
-                
-                slotNames.Add(matName);
-            }
-
-            // Metadata
-            asset.Metadata["materialSlots"] = string.Join(",", slotNames); // CRITICAL: Static Mesh Editor needs this!
-            asset.Metadata["vertexCount"] = finalVertices.Count.ToString();
-            asset.Metadata["triangleCount"] = (finalIndices.Count / 3).ToString();
-            asset.Metadata["submeshCount"] = submeshInfos.Count.ToString();
-            asset.Metadata["materialSlotCount"] = (usedMaterialSlots.Count > 0 ? usedMaterialSlots.Max() + 1 : 0).ToString();
-            asset.Metadata["format"] = "Packed32";
-
-            ErrorHandler.LogInfo($"[GLTFImportHandler] ✓ GLTF import complete: {submeshInfos.Count} submeshes, {usedMaterialSlots.Count} material slots", "GLTFImportHandler");
-
-            return new ImportResult
-            {
-                Success = true,
-                PayloadData = ms.ToArray()
-            };
-        }
-        catch (Exception ex)
-        {
-            ErrorHandler.LogError($"GLTF import failed: {ex.Message}", ex, "GLTFImportHandler");
-            ErrorHandler.LogError($"Stack trace: {ex.StackTrace}", context: "GLTFImportHandler");
-            return new ImportResult { Success = false, Error = ex.Message };
-        }
+            Success = false,
+            Error = $"Direct {Path.GetExtension(sourceFile).ToLowerInvariant()} import is no longer supported — use BlueSky Engine Ease in Blender and import the .stratapack instead. (File: {Path.GetFileName(sourceFile)})"
+        };
     }
 }

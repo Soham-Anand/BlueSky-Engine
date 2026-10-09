@@ -35,17 +35,21 @@ public class PlayerController
     
     public IPossessable? PossessedEntity => _possessedEntity;
     public bool IsInFreeCameraMode => _isFreeCameraMode;
+
+    public void SetFreeCameraMode(bool enabled)
+    {
+        _isFreeCameraMode = enabled;
+        Console.WriteLine($"[PlayerController] Free camera mode set to {enabled}");
+    }
     
     /// <summary>
     /// Initialize the player controller with required systems
     /// </summary>
-    public void Initialize(IInputContext input, Viewport viewport)
+    public void Initialize(IInputContext input, Viewport? viewport)
     {
         _input = input;
         _viewport = viewport;
         
-        Console.WriteLine("[PlayerController] Initialized - Entities can call AdvertisePossession() to be possessed");
-        Console.WriteLine("[PlayerController] Press E to unpossess current entity");
     }
     
     /// <summary>
@@ -131,10 +135,6 @@ public class PlayerController
             _possessedEntity.ProcessInput(_input, deltaTime);
             UpdatePossessedCamera();
         }
-        else
-        {
-            UpdateFreeCamera(deltaTime);
-        }
     }
     
     private void ProcessPossessionRequests()
@@ -182,19 +182,4 @@ public class PlayerController
         cameraTransform.LookAt(target, BlueSky.Core.Math.Vector3.Up);
     }
     
-    private void UpdateFreeCamera(float deltaTime)
-    {
-        // Free camera is handled by the Viewport's own Update method
-        // No need to override it here
-    }
-    
-    /// <summary>
-    /// Get the nearest possessable entity to a world position (for click-to-possess)
-    /// </summary>
-    public IPossessable? FindNearestPossessable(Vector3 worldPosition, float maxDistance = 5.0f)
-    {
-        // This would need to be implemented with the ECS system
-        // For now, return null - entities will register themselves
-        return null;
-    }
 }

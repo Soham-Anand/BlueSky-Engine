@@ -22,14 +22,18 @@ public class CocoaWindow : IWindow
     private Vector2 _size;
     private Vector2 _position;
     private bool _isVisible;
-    private bool _isFocused;
+    private bool _isFocused = false;
     private bool _cursorCaptured;
+    private bool _fullscreenRequested;
+    private bool _fullscreenApplied;
     
     public CocoaWindow(WindowOptions options)
     {
         _stopwatch = Stopwatch.StartNew();
         _title = options.Title;
         _size = new Vector2(options.Width, options.Height);
+        _position = new Vector2(options.X, options.Y);
+        _fullscreenRequested = options.Fullscreen;
 
         // Set activation policy so the app can become active
         var nsApp = GetSharedApplication();
@@ -133,12 +137,17 @@ public class CocoaWindow : IWindow
     
     public event Action<Vector2>? Resize;
     public event Action<Vector2>? FramebufferResize;
+    // IWindow contract: subscribed externally (EditorApp), raised when the backend wires them.
+#pragma warning disable CS0067
     public event Action? FocusGained;
     public event Action? FocusLost;
+#pragma warning restore CS0067
     public event Action? Closing;
     public event Action<double>? Update;
     public event Action<double>? Render;
+#pragma warning disable CS0067 // subscribed in EditorApp; invoked by the ObjC backend
     public event Action<string[]>? FilesDropped;
+#pragma warning restore CS0067
 
     public string[]? ShowOpenFileDialog()
     {
@@ -264,9 +273,11 @@ public class CocoaWindow : IWindow
                 Console.WriteLine($"[CocoaWindow] Failed to enable drag and drop: {ex.Message}");
             }
 
-            // Center window on screen
-            var centerSel = GetSelector("center");
-            objc_msgSend_void(_nsWindow, centerSel);
+            if (_fullscreenRequested && !_fullscreenApplied)
+            {
+                objc_msgSend_void_ptr(_nsWindow, GetSelector("toggleFullScreen:"), IntPtr.Zero);
+                _fullscreenApplied = true;
+            }
 
             _isVisible = true;
 
@@ -320,7 +331,6 @@ public class CocoaWindow : IWindow
                         var scale = objc_msgSend_double(_nsWindow, backingScaleFactorSel);
                         
                         // We must set drawable size in physical pixels!
-                        System.Runtime.InteropServices.StructLayoutAttribute? attr = null; // Unused, just to trick parser
                         var cgSize = new { width = viewBounds.Size.Width * scale, height = viewBounds.Size.Height * scale };
                         // We actually have a CGSize struct from MetalSwapchain, but here we can just use the memory representation.
                         // Or we can rely on MetalSwapchain to resize the drawable.
@@ -514,6 +524,7 @@ public class CocoaWindow : IWindow
             case 1: return Input.KeyCode.S;
             case 2: return Input.KeyCode.D;
             case 3: return Input.KeyCode.F;
+            case 11: return Input.KeyCode.B;      // B key (benchmark hotkey with Cmd)
             case 6: return Input.KeyCode.Z;       // Z key for undo
             case 12: return Input.KeyCode.Q;
             case 13: return Input.KeyCode.W;
@@ -526,6 +537,19 @@ public class CocoaWindow : IWindow
             case 53: return Input.KeyCode.Escape; // Escape
             case 56: return Input.KeyCode.LeftShift;
             case 59: return Input.KeyCode.LeftControl;
+            // Function keys (macOS virtual keycodes; reached via Fn on MacBooks)
+            case 122: return Input.KeyCode.F1;
+            case 120: return Input.KeyCode.F2;
+            case 99: return Input.KeyCode.F3;
+            case 118: return Input.KeyCode.F4;
+            case 96: return Input.KeyCode.F5;
+            case 97: return Input.KeyCode.F6;
+            case 98: return Input.KeyCode.F7;
+            case 100: return Input.KeyCode.F8;
+            case 101: return Input.KeyCode.F9;
+            case 109: return Input.KeyCode.F10;
+            case 103: return Input.KeyCode.F11;
+            case 111: return Input.KeyCode.F12;
             case 123: return Input.KeyCode.Left;  // Left arrow
             case 124: return Input.KeyCode.Right; // Right arrow
             case 125: return Input.KeyCode.Down;  // Down arrow
@@ -590,12 +614,22 @@ public class CocoaWindow : IWindow
         
         // Note: Don't set background color - let the CAMetalLayer show through
         
-        // Center window if requested
+        // Center the window if requested; otherwise honor its explicit position.
         if (options.X == -1 || options.Y == -1)
         {
             var centerSel = GetSelector("center");
             objc_msgSend_void(window, centerSel);
         }
+        else
+        {
+            var frameSel = GetSelector("frame");
+            var frame = objc_msgSend_CGRect(window, frameSel);
+            frame.Origin = new CGPoint(options.X, options.Y);
+            objc_msgSend_void_rect(window, GetSelector("setFrameOrigin:"), frame);
+        }
+
+        var positionedFrame = objc_msgSend_CGRect(window, GetSelector("frame"));
+        _position = new Vector2((float)positionedFrame.Origin.X, (float)positionedFrame.Origin.Y);
         
         // NSWindow is retained by default; we need to release when closing later
         

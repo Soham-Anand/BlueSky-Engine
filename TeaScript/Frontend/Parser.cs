@@ -221,7 +221,7 @@ public class Parser
     {
         Expression expr = ParseUnary();
         
-        while (Match(TokenType.Star, TokenType.Slash))
+        while (Match(TokenType.Star, TokenType.Slash, TokenType.Percent))
         {
             TokenType op = Previous().Type;
             Expression right = ParseUnary();

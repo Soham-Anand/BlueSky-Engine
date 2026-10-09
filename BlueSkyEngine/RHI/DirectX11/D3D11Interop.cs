@@ -1,6 +1,6 @@
 using System.Runtime.InteropServices;
 
-namespace NotBSRenderer.DirectX11;
+namespace BlueSky.Rendering.RHI.DirectX11;
 
 /// <summary>
 /// DirectX 11 P/Invoke declarations and constants
@@ -124,14 +124,6 @@ internal static class D3D11Interop
         public uint StructureByteStride;
     }
     
-    [StructLayout(LayoutKind.Sequential)]
-    public struct D3D11_SUBRESOURCE_DATA
-    {
-        public IntPtr pSysMem;
-        public uint SysMemPitch;
-        public uint SysMemSlicePitch;
-    }
-    
     // Helper methods
     public static uint ToDXGIFormat(TextureFormat format)
     {
@@ -239,6 +231,22 @@ internal static class D3D11Interop
     // ── Bind Flags (additions) ──────────────────────────────────────────
     public const uint D3D11_BIND_UNORDERED_ACCESS = 0x80;
     public const uint D3D11_BIND_STREAM_OUTPUT = 0x10;
+
+    // ── Misc Flags ──────────────────────────────────────────────────────
+    public const uint D3D11_RESOURCE_MISC_BUFFER_STRUCTURED = 0x200;
+    public const uint D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS = 0x20000;
+
+    // ── Map Types ────────────────────────────────────────────────────────
+    public const uint D3D11_MAP_READ = 1;
+    public const uint D3D11_MAP_WRITE = 2;
+    public const uint D3D11_MAP_READ_WRITE = 3;
+    public const uint D3D11_MAP_WRITE_DISCARD = 4;
+    public const uint D3D11_MAP_WRITE_NO_OVERWRITE = 5;
+
+    // ── UAV Dimension ───────────────────────────────────────────────────
+    public const uint D3D11_UAV_DIMENSION_UNKNOWN = 0;
+    public const uint D3D11_UAV_DIMENSION_BUFFER = 1;
+    public const uint D3D11_UAV_DIMENSION_TEXTURE2D = 3;
 
     // ═══════════════════════════════════════════════════════════════════
     //  STATE CREATION STRUCTURES

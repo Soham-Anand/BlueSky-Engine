@@ -22,7 +22,7 @@ namespace BlueSky.Core.ECS
 
         public bool Equals(ArchetypeId other) => Id == other.Id;
         public override bool Equals(object? obj) => obj is ArchetypeId other && Equals(other);
-        public override int GetHashCode() => Hash;
+        public override int GetHashCode() => Id.GetHashCode();
         public static bool operator ==(ArchetypeId left, ArchetypeId right) => left.Equals(right);
         public static bool operator !=(ArchetypeId left, ArchetypeId right) => !left.Equals(right);
     }
@@ -32,19 +32,29 @@ namespace BlueSky.Core.ECS
     /// </summary>
     public class ArchetypeType
     {
-        private readonly List<Type> _componentTypes;
+        private readonly Type[] _componentTypes;
+        private readonly IReadOnlyList<Type> _componentTypesView;
         private readonly Dictionary<Type, int> _componentIndices;
         private int _hashCode;
 
-        public IReadOnlyList<Type> ComponentTypes => _componentTypes;
-        public int ComponentCount => _componentTypes.Count;
+        public IReadOnlyList<Type> ComponentTypes => _componentTypesView;
+        public int ComponentCount => _componentTypes.Length;
 
         public ArchetypeType(params Type[] componentTypes)
         {
-            _componentTypes = componentTypes.OrderBy(t => t.FullName).ToList();
+            if (componentTypes == null)
+                componentTypes = Array.Empty<Type>();
+            if (componentTypes.Any(type => type == null))
+                throw new ArgumentException("Archetype component types cannot contain null.", nameof(componentTypes));
+
+            _componentTypes = componentTypes
+                .Distinct()
+                .OrderBy(t => t.AssemblyQualifiedName ?? t.FullName ?? t.Name, StringComparer.Ordinal)
+                .ToArray();
+            _componentTypesView = Array.AsReadOnly(_componentTypes);
             _componentIndices = new Dictionary<Type, int>();
             
-            for (int i = 0; i < _componentTypes.Count; i++)
+            for (int i = 0; i < _componentTypes.Length; i++)
             {
                 _componentIndices[_componentTypes[i]] = i;
             }
@@ -73,9 +83,9 @@ namespace BlueSky.Core.ECS
         public override bool Equals(object? obj)
         {
             if (obj is not ArchetypeType other) return false;
-            if (_componentTypes.Count != other._componentTypes.Count) return false;
+            if (_componentTypes.Length != other._componentTypes.Length) return false;
             
-            for (int i = 0; i < _componentTypes.Count; i++)
+            for (int i = 0; i < _componentTypes.Length; i++)
             {
                 if (_componentTypes[i] != other._componentTypes[i])
                     return false;
@@ -91,7 +101,7 @@ namespace BlueSky.Core.ECS
             if (HasComponent(type))
                 return this;
             
-            var newTypes = new Type[_componentTypes.Count + 1];
+            var newTypes = new Type[_componentTypes.Length + 1];
             _componentTypes.CopyTo(newTypes, 0);
             newTypes[^1] = type;
             return new ArchetypeType(newTypes);

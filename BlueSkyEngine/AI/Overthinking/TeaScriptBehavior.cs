@@ -10,66 +10,39 @@ namespace BlueSky.AI.Overthinking;
 public class TeaScriptBehavior : AIBehavior
 {
     private readonly Interpreter _interpreter;
-    private readonly string _scriptPath;
 
     public TeaScriptBehavior(string scriptPath, Interpreter interpreter, int priority = 0)
     {
-        _scriptPath = scriptPath;
-        _interpreter = interpreter;
+        _interpreter = interpreter ?? throw new ArgumentNullException(nameof(interpreter));
+        if (!_interpreter.HasFunction("execute"))
+            throw new ArgumentException("A TeaScript AI behavior must define fn execute(deltaTime).", nameof(interpreter));
         Priority = priority;
         Name = System.IO.Path.GetFileNameWithoutExtension(scriptPath);
     }
 
     public override bool CanExecute()
     {
-        // Call TeaScript function: canExecute()
-        try
-        {
-            var result = _interpreter.CallFunction("canExecute");
-            return result is bool b && b;
-        }
-        catch
-        {
-            return true; // Default to always executable if function doesn't exist
-        }
+        if (!_interpreter.HasFunction("canExecute"))
+            return true;
+        return _interpreter.CallFunction("canExecute") is bool canExecute
+            ? canExecute
+            : throw new InvalidOperationException("AI behavior canExecute() must return a boolean.");
     }
 
     public override void OnEnter()
     {
-        // Call TeaScript function: onEnter()
-        try
-        {
+        if (_interpreter.HasFunction("onEnter"))
             _interpreter.CallFunction("onEnter");
-        }
-        catch
-        {
-            // Function doesn't exist, ignore
-        }
     }
 
     public override void Execute(float deltaTime)
     {
-        // Call TeaScript function: execute(deltaTime)
-        try
-        {
-            _interpreter.CallFunction("execute", deltaTime);
-        }
-        catch
-        {
-            // Function doesn't exist, ignore
-        }
+        _interpreter.CallFunction("execute", deltaTime);
     }
 
     public override void OnExit()
     {
-        // Call TeaScript function: onExit()
-        try
-        {
+        if (_interpreter.HasFunction("onExit"))
             _interpreter.CallFunction("onExit");
-        }
-        catch
-        {
-            // Function doesn't exist, ignore
-        }
     }
 }

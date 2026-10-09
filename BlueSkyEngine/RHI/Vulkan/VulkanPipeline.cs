@@ -3,7 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Runtime.InteropServices;
 
-namespace NotBSRenderer.Vulkan;
+namespace BlueSky.Rendering.RHI.Vulkan;
 
 internal readonly struct VulkanDescriptorBindingInfo
 {

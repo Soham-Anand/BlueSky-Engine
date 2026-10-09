@@ -1,4 +1,4 @@
-// BlueSkyEngine - Project Polaris: Main Ray Tracer Orchestrator
+// BlueSkyEngine - Project Polaris: Main Ray Tracer Echotor
 //
 // 60 FPS RAY TRACING ON i5-2410M + INTEL HD 3000
 // =================================================
@@ -29,7 +29,7 @@ using System.Runtime.Intrinsics.X86;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Diagnostics;
-using NotBSRenderer;
+using BlueSky.Rendering.RHI;
 
 namespace BlueSky.Rendering.RayTracing.Polaris;
 
@@ -310,7 +310,7 @@ public class PolarisRayTracer : IDisposable
                 shadow = TraceShadowRay(hitPos + normal * 0.01f, _sunDirection) ? 0.0f : 1.0f;
             }
             
-            // Simple material color (based on normal for now — looks like clay/AO)
+            // Simple clay color (based on normal for now — looks like clay/AO)
             var albedo = new Vector3(
                 0.5f + 0.3f * MathF.Abs(normal.X),
                 0.5f + 0.3f * MathF.Abs(normal.Y),

@@ -12,7 +12,8 @@ struct ViewUniforms {
     float4x4 lightSpaceMatrix;
     float4   cameraPos;    // w unused — matches C# Vector4
     float    time;
-    float3   sunDirection;
+    float4   sunDirection; // float4 (not float3): cross-API float3 packing differs,
+                          // xyz = direction toward sun, w unused
     float4   windParams;
 };
 
@@ -40,12 +41,8 @@ vertex SkyVaryings vs_sky(uint vertexID [[vertex_id]],
 }
 
 // Atmospheric scattering constants
-constant float3 RAYLEIGH_BETA = float3(5.8e-6, 1.35e-5, 3.31e-5); // Scattering coefficients for Rayleigh
-constant float3 MIE_BETA = float3(2.0e-5, 2.0e-5, 2.0e-5); // Scattering coefficients for Mie
-constant float MIE_G = 0.758; // Mie phase function parameter
 constant float ATMOSPHERE_SCALE_HEIGHT = 8000.0; // Scale height in meters
 constant float EARTH_RADIUS = 6371000.0; // Earth radius in meters
-constant float ATMOSPHERE_RADIUS = EARTH_RADIUS + ATMOSPHERE_SCALE_HEIGHT * 4.0;
 
 // Compute atmospheric density based on height
 float computeAtmosphericDensity(float height) {
@@ -106,13 +103,14 @@ float fbm(float2 x) {
     return v;
 }
 
-// Compute realistic daytime sky with proper sun disc rendering
-float3 computeSky(float3 rayDir, float3 sunDir, float time) {
+// Compute daytime/studio sky with proper sun disc rendering.
+// preset: 0 = day, 1 = studio. Palettes lerp; must match StrataSkyCapture.
+float3 computeSky(float3 rayDir, float3 sunDir, float time, float preset) {
     float height = saturate(rayDir.y);
-    
-    // Natural Sky Colors (Rayleigh-inspired)
-    float3 zenithColor  = float3(0.15, 0.45, 0.85);
-    float3 horizonColor = float3(0.55, 0.82, 0.98);
+
+    // Natural Sky Colors (Rayleigh-inspired) ↔ studio variants
+    float3 zenithColor  = mix(float3(0.15, 0.45, 0.85), float3(0.015, 0.02, 0.03), preset);
+    float3 horizonColor = mix(float3(0.55, 0.82, 0.98), float3(0.07, 0.08, 0.10), preset);
     
     // Smooth vertical gradient
     float3 skyColor = mix(horizonColor, zenithColor, pow(height, 0.6));
@@ -131,21 +129,22 @@ float3 computeSky(float3 rayDir, float3 sunDir, float time) {
     float sunGlow = exp(-theta * 10.0) * 0.4;
     float sunHaze = exp(-theta * 2.5) * 0.15;
     
-    float3 sunColor = float3(1.0, 1.0, 0.95);
-    float3 glowColor = float3(1.0, 0.95, 0.85);
+    float3 sunColor = mix(float3(1.0, 1.0, 0.95), float3(0.85, 0.9, 1.0), preset);
+    float3 glowColor = mix(float3(1.0, 0.95, 0.85), float3(0.45, 0.5, 0.6), preset);
     
-    float3 finalSun = (sunColor * sunDisc * 1.5) + (glowColor * (sunGlow + sunHaze));
+    float3 finalSun = (sunColor * sunDisc * mix(1.5, 1.1, preset)) + (glowColor * (sunGlow + sunHaze));
     skyColor += finalSun;
     
     // Subtle horizon haze
     float haze = exp(-height * 3.5) * 0.2;
-    skyColor = mix(skyColor, float3(0.8, 0.9, 1.0), haze);
+    skyColor = mix(skyColor, mix(float3(0.8, 0.9, 1.0), float3(0.04, 0.05, 0.07), preset), haze);
     
     return saturate(skyColor);
 }
 
 fragment float4 fs_sky(SkyVaryings in [[stage_in]],
-                       constant ViewUniforms& u [[buffer(10)]])
+                       constant ViewUniforms& u [[buffer(10)]],
+                       constant float& skyPreset [[buffer(17)]])
 {
     // Reconstruct rayDir here to avoid any interpolation artifacts
     float2 ndc = in.uv * 2.0 - 1.0;
@@ -153,7 +152,7 @@ fragment float4 fs_sky(SkyVaryings in [[stage_in]],
     float3 worldPos = worldPosH.xyz / worldPosH.w;
     float3 rayDir = normalize(worldPos - u.cameraPos.xyz);
 
-    float3 skyColor = computeSky(rayDir, u.sunDirection, u.time);
+    float3 skyColor = computeSky(rayDir, u.sunDirection.xyz, u.time, skyPreset);
     return float4(skyColor, 1.0);
 }
 
@@ -229,7 +228,7 @@ struct GridFragOut {
 
 fragment GridFragOut fs_grid(GridVaryings in [[stage_in]],
                             constant ViewUniforms& u [[buffer(10)]],
-                            depth2d<float> shadowMap [[texture(1)]])
+                        depth2d<float> shadowMap [[texture(1)]])
 {
     // Ray-plane intersection: Y = 0
     float3 ray = in.farPoint - in.nearPoint;
@@ -378,7 +377,7 @@ struct MeshVaryings {
 
 vertex MeshVaryings vs_mesh(MeshVertexIn in [[stage_in]],
                            uint instance_id [[instance_id]],
-                           constant EntityUniforms* entities [[buffer(30)]],
+                           constant EntityUniforms* entities [[buffer(12)]],
                            constant ViewUniforms& view [[buffer(10)]])
 {
     MeshVaryings out;
@@ -405,7 +404,7 @@ struct ShadowVaryings {
 
 vertex ShadowVaryings vs_shadow(MeshVertexIn in [[stage_in]],
                                 uint instance_id [[instance_id]],
-                                constant EntityUniforms* entities [[buffer(30)]],
+                                constant EntityUniforms* entities [[buffer(12)]],
                                 constant ViewUniforms& view [[buffer(10)]])
 {
     ShadowVaryings out;
@@ -454,26 +453,27 @@ struct LightingSettings_PBR {
 // ── Procedural sky environment sampling with roughness-based filtering ──────
 // Roughness controls sun highlight sharpness and sky detail preservation.
 // Smooth surfaces get crisp sun reflections; rough surfaces see blurred sky.
-float3 sampleSkyEnv(float3 dir, float3 sunDir, float roughness) {
+float3 sampleSkyEnv(float3 dir, float3 sunDir, float roughness, float preset) {
     float height = saturate(dir.y);
-    float3 zenith  = float3(0.15, 0.45, 0.85);
-    float3 horizon = float3(0.55, 0.82, 0.98);
+    float3 zenith  = mix(float3(0.15, 0.45, 0.85), float3(0.015, 0.02, 0.03), preset);
+    float3 horizon = mix(float3(0.55, 0.82, 0.98), float3(0.07, 0.08, 0.10), preset);
     float3 sky = mix(horizon, zenith, pow(height, 0.6));
     
     // Sun contribution — blur sun disc based on roughness
     float cosTheta = dot(dir, normalize(sunDir));
     float sunPower = exp2(10.0 * (1.0 - roughness) + 1.0); // 2048 sharp → 2 blurry
-    float sunGlow = pow(saturate(cosTheta), sunPower) * (2.0 / (1.0 + roughness * roughness));
-    float sunHaze = pow(saturate(cosTheta), max(8.0 * (1.0 - roughness), 1.0)) * 0.3;
-    sky += float3(1.0, 0.95, 0.85) * (sunGlow + sunHaze);
+    float sunGlow = pow(saturate(cosTheta), sunPower) * (2.0 / (1.0 + roughness * roughness)) * mix(1.0, 0.7, preset);
+    float sunHaze = pow(saturate(cosTheta), max(8.0 * (1.0 - roughness), 1.0)) * 0.3 * mix(1.0, 0.5, preset);
+    sky += mix(float3(1.0, 0.95, 0.85), float3(0.45, 0.5, 0.6), preset) * (sunGlow + sunHaze);
     
-    // Ground color for downward reflections
-    float3 ground = float3(0.15, 0.12, 0.10);
-    sky = mix(ground, sky, smoothstep(-0.05, 0.1, dir.y));
+    // Ground color for downward reflections — kept near the horizon tone so
+    // orbit reflections glide instead of cratering into black pits.
+    float3 ground = mix(float3(0.30, 0.29, 0.28), float3(0.10, 0.10, 0.11), preset);
+    sky = mix(ground, sky, smoothstep(-0.25, 0.25, dir.y));
     
     // For rough surfaces, converge towards hemisphere irradiance average
     // (simulates pre-filtered environment map without cubemap generation)
-    float3 avgIrradiance = float3(0.35, 0.40, 0.52);
+    float3 avgIrradiance = mix(float3(0.35, 0.40, 0.52), float3(0.05, 0.055, 0.07), preset);
     sky = mix(sky, avgIrradiance, roughness * roughness * 0.7);
     
     return max(sky, 0.0);
@@ -518,10 +518,11 @@ float3 ACESFitted(float3 color) {
 // impossible — smoothly darken as R approaches the geometric horizon.
 float computeHorizonAO(float3 N, float3 R) {
     float horizon = saturate(1.0 + dot(R, N));
-    return horizon * horizon;
+    // Floored so grazing reflections dim instead of cratering to black.
+    return 0.45 + 0.55 * horizon * horizon;
 }
 
-// ── Specular Occlusion from material AO (Marmoset Toolbag) ──────────────────
+// ── Specular Occlusion from surface AO (Marmoset Toolbag) ──────────────────
 // Derives specular occlusion from the diffuse AO term. Rougher surfaces get
 // more occlusion; smooth mirrors are mostly unaffected by cavity darkening.
 float specularOcclusionFromAO(float NdotV, float ao, float roughness) {
@@ -557,21 +558,74 @@ float geometrySmith(float NdotV, float NdotL, float roughness) {
     return ggx1 * ggx2;
 }
 
-// Material data structure (matches C# MaterialData — float3 padded to float4 in Metal)
-struct MaterialData {
-    float4 albedo;      // xyz=albedo, w=metallic
-    float  roughness;
-    float  ao;
-    float  emission;
-    float  subsurface;
-    int    useAlbedoTex;
-    int    useNormalTex;
-    int    useRMATex;
-    int    blendMode;   // 0=Opaque, 1=AlphaTest, 2=AlphaBlend
-    int    useOpacityTex; // Separate opacity/alpha map (map_d)
-    int    _pad0;
-    int    _pad1;
-    int    _pad2;
+// ── Khronos PBR Neutral Tonemapping ─────────────────────────────────────────
+// Hue-preserving, LDR-safe. Single output curve for the whole engine.
+float3 PBRNeutral(float3 color) {
+    const float startCompression = 0.8 - 0.04;
+    const float desaturation = 0.15;
+    float x = min(color.r, min(color.g, color.b));
+    float offset = x < 0.08 ? x - 6.25 * x * x : 0.04;
+    color -= offset;
+    float peak = max(color.r, max(color.g, color.b));
+    if (peak < startCompression) return color;
+    const float d = 1.0 - startCompression;
+    float newPeak = 1.0 - d * d / (peak + d - startCompression);
+    color *= newPeak / max(peak, 1e-6);
+    float g = 1.0 - 1.0 / (desaturation * (peak - newPeak) + 1.0);
+    return mix(color, float3(newPeak), g);
+}
+
+// ── Exact sRGB Output Encoding (linear → sRGB, piecewise) ────────────────────
+float3 LinearToSRGB(float3 c) {
+    c = saturate(c);
+    float3 low = c * 12.92;
+    float3 high = 1.055 * pow(c, float3(1.0 / 2.4)) - 0.055;
+    return mix(low, high, step(float3(0.0031308), c));
+}
+
+// ── Strata sky-captured diffuse: 9-coefficient SH, Y-up basis ────────────────
+// Must match StrataSkyCapture basis order exactly.
+float3 SHEval(float3 n, constant float4* sh) {
+    float3 r = sh[0].rgb * 0.282095;
+    r += sh[1].rgb * (0.488603 * n.y);
+    r += sh[2].rgb * (0.488603 * n.z);
+    r += sh[3].rgb * (0.488603 * n.x);
+    r += sh[4].rgb * (1.092548 * n.x * n.y);
+    r += sh[5].rgb * (1.092548 * n.y * n.z);
+    r += sh[6].rgb * (0.315392 * (3.0 * n.y * n.y - 1.0));
+    r += sh[7].rgb * (1.092548 * n.x * n.z);
+    r += sh[8].rgb * (0.546274 * (n.x * n.x - n.z * n.z));
+    return r;
+}
+
+// ── Display-referred 16³ LUT as 256×16 strip ──────────────────────────────────
+float3 LUTSample(float3 c, texture2d<float> lut, sampler s) {
+    c = saturate(c);
+    float bx = c.b * 15.0;
+    float b0 = floor(bx);
+    float f = bx - b0;
+    float2 uv0 = float2((b0 * 16.0 + c.r * 15.0 + 0.5) / 256.0, (c.g * 15.0 + 0.5) / 16.0);
+    float2 uv1 = float2((min(b0 + 1.0, 15.0) * 16.0 + c.r * 15.0 + 0.5) / 256.0, (c.g * 15.0 + 0.5) / 16.0);
+    return mix(lut.sample(s, uv0).rgb, lut.sample(s, uv1).rgb, f);
+}
+
+// Surface data structure (MUST match C# AstraSurface in ViewportRenderer.cs byte-for-byte!)
+// Single global surface — no material system. Layout identical to the old struct.
+struct AstraSurface {
+    float4 baseColor;          // 16 bytes (xyz=base color, w=opacity)
+    float  roughness;          // 4 bytes
+    float  metallic;           // 4 bytes
+    float  ao;                 // 4 bytes
+    float  emissiveStrength;   // 4 bytes
+    float  specularStrength;   // 4 bytes
+    float  shininess;          // 4 bytes
+    float  alpha;              // 4 bytes
+    uint   flags;              // 4 bytes
+    float2 uvScale;            // 8 bytes
+    float2 uvOffset;           // 8 bytes
+    float4 emissiveColor;      // 16 bytes
+    float4 custom0;            // 16 bytes
+    float4 custom1;            // 16 bytes
 };
 
 // UV passthrough — MeshVaryings now carries UV for texture sampling in fs_mesh
@@ -579,77 +633,121 @@ struct MaterialData {
 fragment float4 fs_mesh(MeshVaryings in [[stage_in]],
                         bool isFrontFace [[front_facing]],
                         constant ViewUniforms& view [[buffer(10)]],
-                        constant MaterialData& material [[buffer(11)]],
+                        constant AstraSurface& surface [[buffer(11)]],
                         constant LightData_PBR* lights [[buffer(13)]],
                         constant int& lightCount [[buffer(14)]],
                         constant LightingSettings_PBR& lightSettings [[buffer(15)]],
                         depth2d<float> shadowMap [[texture(1)]],
                         texture2d<float> albedoTex [[texture(2)]],
-                        texture2d<float> normalTex [[texture(3)]],
-                        texture2d<float> rmaTex    [[texture(4)]],
-                        texture2d<float> opacityTex [[texture(5)]])
+                        texture2d<float> rmaTex [[texture(4)]],
+                        texture2d<float> detailAlbedo [[texture(6)]],
+                        texture2d<float> detailNormal [[texture(7)]],
+                        texture2d<float> gradeLUT [[texture(8)]],
+                        texture2d<float> bentTex [[texture(9)]],
+                        constant float4* sh [[buffer(16)]],
+                        constant float& skyPreset [[buffer(17)]])
 {
     // ═══════════════════════════════════════════════════════════════════════════
-    // PRODUCTION-QUALITY PBR SHADER WITH TWO-SIDED LIGHTING
+    // ASTRA SURFACE SHADER — single global clay, full PBR lighting
+    // No material system: albedo/roughness/metallic come from the one global
+    // surface constant. Lighting, shadows, sky ambient all fully live.
     // ═══════════════════════════════════════════════════════════════════════════
     
-    constexpr sampler texSampler(coord::normalized, filter::linear,
-                                 mip_filter::linear, address::repeat);
-    
-    // ── Material Properties ────────────────────────────────────────────────────
-    // albedo.xyz = color, albedo.w = metallic (packed to avoid float3 padding gap)
-    float3 albedo   = material.albedo.xyz;
-    float  metallic = material.albedo.w;
-    if (material.useAlbedoTex != 0)
-        albedo = albedoTex.sample(texSampler, in.uv).rgb;
-    
-    // ── TERRAIN CHECKERBOARD PATTERN ───────────────────────────────────────────
-    // Apply to light grey materials (terrain = 0.7, 0.7, 0.7)
-    if (albedo.r > 0.65 && albedo.g > 0.65 && albedo.b > 0.65 &&
-        albedo.r < 0.75 && albedo.g < 0.75 && albedo.b < 0.75) {
-        // World-space checkerboard (2-unit squares)
-        float2 checkerCoord = in.worldPos.xz * 0.5;
-        float2 checker = floor(checkerCoord);
-        float checkerPattern = fmod(checker.x + checker.y, 2.0);
-        
-        // Grey and dark grey
-        float3 lightGrey = float3(0.45, 0.45, 0.45);
-        float3 darkGrey = float3(0.28, 0.28, 0.28);
-        albedo = mix(darkGrey, lightGrey, checkerPattern);
+    // ── Surface Properties (global constant — historic orange clay) ──────────
+    // Bit layout mirrors StrataFeature: 1=AO 4=Detail 8=Wrap 16=Toksvig
+    // 32=Bump 1024=ScreenDoor 2048=AlbedoMap. Unset bits cost nothing.
+    constexpr sampler surfSampler(coord::normalized, filter::linear,
+                                  mip_filter::linear, address::repeat);
+    uint feat = (uint)surface.custom1.x;
+    float3 albedo   = surface.baseColor.rgb;
+    if ((feat & 2048u) != 0u)
+        albedo *= albedoTex.sample(surfSampler, in.uv).rgb;
+    float  metallic = clamp(surface.metallic, 0.0, 1.0);
+    float  roughness = max(0.04, surface.roughness);
+    float  ao        = surface.ao;
+    float  subsurface = 0.0;
+
+    // ── Terrain (ASTRA_TERRAIN 4096u): plain white, lit normally ──
+    if ((surface.flags & 4096u) != 0u) {
+        albedo = float3(1.0);
+        metallic = 0.0;
+        roughness = max(roughness, 0.65);
     }
-    
-    float roughness  = max(0.04, material.roughness);
-    float ao         = material.ao;
-    float subsurface = material.subsurface;
-    
-    // Sample RMA (Roughness/Metallic/AO packed) if assigned
-    if (material.useRMATex != 0)
-    {
-        float3 rma = rmaTex.sample(texSampler, in.uv).rgb;
-        roughness = max(0.04, rma.r);
-        metallic  = rma.g;
-        ao        = rma.b;
+
+    // ── Debug views (flags bits 14-15): 1 normals, 2 unlit albedo ────────
+    // (3 = shadow factor, evaluated later once `shadow` is known.)
+    uint dbg = (surface.flags >> 14u) & 7u;
+    if (dbg == 2u) {
+        return float4(LinearToSRGB(albedo), 1.0);
     }
-    
+
+    // ── Skin (Tier-2 flesh: fixed response driving the SSS terms) ──
+    // v1: fixed subsurface weight + dielectric clamp + specular soften.
+    // The sss/translucency terms below were ×0 until this bit existed.
+    if ((feat & 8192u) != 0u) {
+        subsurface = 0.6;
+        metallic = 0.0;
+        roughness = max(roughness, 0.35f);
+    }
+
+    // ── Strata Tier-1 lobes (mask in Custom1.x; uniform control flow) ─────────
+    // Unset bits cost nothing (uniform branch).
+    float diffWrap = surface.custom0.y;
+    float detailTile = max(1.0, surface.custom0.z);
+    float toksvigK = surface.custom0.w;
+    half3 coatTint = half3(clamp(surface.custom1.yzw, float3(0.0), float3(1.0)));
+
+    // Screen-door coverage first (early-out before any lighting work).
+    if ((feat & 1024u) != 0u) {
+        float coverage = surface.baseColor.a * surface.alpha;
+        float2 bpx = floor(in.position.xy);
+        float b2 = fract(bpx.x * 0.5 + bpx.y * bpx.y * 0.75);
+        float b4 = fract(bpx.x * 0.25 + bpx.y * bpx.y * 0.1875) * 0.25 + b2;
+        float b8 = fract(bpx.x * 0.125 + bpx.y * bpx.y * 0.046875) * 0.25 + b4;
+        if (coverage < fract(b8))
+            discard_fragment();
+    }
+
+    // Baked AO + Toksvig variance from the RMA texture (R=rough G=metal B=AO A=variance).
+    if ((feat & (1u | 16u)) != 0u) {
+        float4 rma = rmaTex.sample(surfSampler, in.uv);
+        if ((feat & 1u) != 0u)
+            ao = rma.b;
+        if ((feat & 16u) != 0u)
+            roughness = clamp(roughness + (1.0 - rma.a) * toksvigK, 0.04, 1.0);
+    }
+
+    // ── Debug view: baked AO factor only ─────────────────────────────
+    if (dbg == 4u) {
+        return float4(ao, ao, ao, 1.0);
+    }
+
     // ── Geometry Setup ─────────────────────────────────────────────────────────
     float3 V = normalize(view.cameraPos.xyz - in.worldPos);
-    
+
     float3 N = normalize(in.normal);
     if (!isFrontFace) N = -N;
-    
-    // Perturb normal from normal map if assigned
-    if (material.useNormalTex != 0)
-    {
-        float3 tangentNormal = normalTex.sample(texSampler, in.uv).rgb * 2.0 - 1.0;
-        // Build TBN from geometry normal (simplified — no tangent attribute yet)
-        float3 up = abs(N.y) < 0.999 ? float3(0,1,0) : float3(1,0,0);
-        float3 T  = normalize(cross(up, N));
-        float3 B  = cross(N, T);
-        N = normalize(T * tangentNormal.x + B * tangentNormal.y + N * tangentNormal.z);
+
+    // Bump-offset parallax + RNM detail blend (detail UV only; base UV untouched).
+    if ((feat & (4u | 32u)) != 0u) {
+        float2 dUV = in.uv * detailTile;
+        if ((feat & 32u) != 0u) {
+            float h = detailAlbedo.sample(surfSampler, dUV).a;
+            float2 poff = (V.xy / max(V.z, 0.3)) * (h - 0.5) * 0.06;
+            dUV += poff;
+        }
+        float3 dn = detailNormal.sample(surfSampler, dUV).rgb * 2.0 - 1.0;
+        float dFade = saturate(1.0 - length(in.worldPos - view.cameraPos.xyz) / 40.0);
+        N = normalize(float3(N.xy + dn.xy * dFade, N.z));
+    }
+
+    // ── Debug view: raw world-space normals (bypasses all lighting) ────
+    if (dbg == 1u) {
+        return float4(N * 0.5 + 0.5, 1.0);
     }
     
 // Light direction (sun) - sunDirection already points TOWARD the sun
-float3 L = normalize(view.sunDirection);
+float3 L = normalize(view.sunDirection.xyz);
     
     // Half vector for specular
     float3 H = normalize(L + V);
@@ -659,6 +757,11 @@ float3 L = normalize(view.sunDirection);
     float NdotV = max(dot(N, V), 0.0);
     float NdotH = max(dot(N, H), 0.0);
     float VdotH = max(dot(V, H), 0.0);
+
+    // ── Debug view: sun NdotL only ───────────────────────────────────
+    if (dbg == 7u) {
+        return float4(NdotL, NdotL, NdotL, 1.0);
+    }
     
     // ═══════════════════════════════════════════════════════════════════════════
     // OPTIMIZED PBR BRDF — half precision, manual pow5, Hammon visibility
@@ -705,32 +808,123 @@ float3 L = normalize(view.sunDirection);
     // ═══════════════════════════════════════════════════════════════════════════
     
     // ── Direct Lighting (Sun) ──────────────────────────────────────────────────
-    half3 directLight = (diffuse + specular) * hNdotL * 3.5h;
+    // Wrapped diffuse softens the terminator when the Wrap bit is set.
+    half hNdotLw = (diffWrap > 0.0) ? half(saturate((NdotL + diffWrap) / (1.0 + diffWrap))) : hNdotL;
+    half3 directLight = (diffuse * hNdotLw + specular * hNdotL) * 3.5h;
+
+    // ── Clearcoat (Tier-2 lacquer: fixed-F0 Blinn lobe, reuses base normal) ──
+    if ((feat & 64u) != 0u) {
+        half3 coatF = half3(0.04) + half3(0.96) * ft5;
+        half coat = pow(half(max(dot(N, H), 0.0)), 600.0h);
+        directLight += coat * coatF * coatTint * hNdotL * 1.5h;
+    }
+
+    // ── Iridescence (Tier-2 thin film: fixed-thickness spectral ramp) ──
+    // v1: fixed 350nm-equivalent sweep; film phase from the view angle so the
+    // hue cycles as the view grazes. Strength fixed (clearcoat precedent).
+    if ((feat & 512u) != 0u) {
+        half cosV = half(NdotV);
+        half phase = cosV * 2.0h;
+        half3 irid = 0.5h + 0.5h * cos(6.28318h * (phase * half3(1.0h, 0.85h, 0.7h) + half3(0.0h, 0.33h, 0.67h)));
+        half iriAmt = (1.0h - cosV) * (1.0h - cosV);
+        directLight += iriAmt * irid * hNdotL * 0.6h;
+        directLight += (irid - 1.0h) * specular * hNdotL * iriAmt * 0.5h;
+    }
+
+    // ── Sheen (Tier-2 cloth: Charlie NDF retro-reflection) ──
+    // v1: Neubelt-Pettineo Charlie approximation, fixed fabric roughness 0.5,
+    // sheen tint fixed to albedo (documented rule), strength fixed. HD3000
+    // ALU cost watched at the bench, not here.
+    if ((feat & 128u) != 0u) {
+        half sheenRough = 0.5h;
+        half shInvAlpha = 1.0h / max(sheenRough, 0.05h);
+        half shCos2h = hNdotH * hNdotH;
+        half shSin2h = max(1.0h - shCos2h, 0.0078125h);
+        half Dsheen = (2.0h + shInvAlpha * shInvAlpha) / 6.28318h
+            * pow(shSin2h, shInvAlpha * shInvAlpha * 0.5h);
+        half Vsheen = 0.25h / max(hNdotL + hNdotV - hNdotL * hNdotV, 0.001h);
+        directLight += Dsheen * hAlbedo * Vsheen * hNdotL;
+    }
+
+    // ── Anisotropy (Tier-2 brushed metal: derivative-frame highlight stretch) ──
+    // v1: tangent derived from screen-space UV gradients — Packed32 carries no
+    // tangents (documented rule). Fixed stretch (60) + strength. Degenerate
+    // UVs yield a zero tangent and skip cleanly.
+    if ((feat & 256u) != 0u) {
+        float3 aq0 = dfdx(in.worldPos);
+        float3 aq1 = dfdy(in.worldPos);
+        float2 ast0 = dfdx(in.uv);
+        float2 ast1 = dfdy(in.uv);
+        float3 anaT = aq0 * ast1.y - aq1 * ast0.y;
+        float anaLen = length(anaT);
+        if (anaLen > 0.00001) {
+            anaT /= anaLen;
+            half TH = half(dot(anaT, H));
+            half ano = pow(sqrt(max(1.0h - TH * TH, 0.0h)), 60.0h);
+            directLight += ano * specular * hNdotL * 0.8h;
+        }
+    }
+
+    // ── Hair (Tier-2 Kajiya-Kay: strand highlight, two lobes) ──
+    // v1: strand direction = +V of the mesh UVs (documented rule for hair
+    // cards); fixed primary (R, white) + secondary (TRT-shifted, warm) lobes,
+    // fixed strengths. Degenerate UVs skip cleanly.
+    if ((feat & 16384u) != 0u) {
+        float3 hq0 = dfdx(in.worldPos);
+        float3 hq1 = dfdy(in.worldPos);
+        float2 hst0 = dfdx(in.uv);
+        float2 hst1 = dfdy(in.uv);
+        float3 strandT = hq1 * hst0.x - hq0 * hst1.x;
+        float strandLen = length(strandT);
+        if (strandLen > 0.00001) {
+            strandT /= strandLen;
+            half TH = half(dot(strandT, H));
+            half sinTH = sqrt(max(1.0h - TH * TH, 0.0h));
+            half primary = pow(sinTH, 60.0h);
+            float3 tilted = normalize(strandT + N * 0.1);
+            half TH2 = half(dot(tilted, H));
+            half secondary = pow(sqrt(max(1.0h - TH2 * TH2, 0.0h)), 30.0h);
+            directLight += (primary * half3(0.9, 0.9, 0.95) + secondary * half3(0.55, 0.3, 0.2)) * specular * hNdotL;
+        }
+    }
     
     // ── Additional Lights (half-precision, Hammon visibility) ────────────────────
+    // ── Debug view: sun-driven direct only ─────────────────────────────
+    if (dbg == 5u) {
+        float3 dd = float3(directLight) * lightSettings.exposure;
+        return float4(LinearToSRGB(PBRNeutral(dd)), 1.0);
+    }
     int maxL = min(lightCount, lightSettings.maxLights);
     for (int li = 0; li < maxL; li++) {
         LightData_PBR light = lights[li];
-        if (light.type == 0) continue;
-        
-        float3 toLight = float3(light.position) - in.worldPos;
-        float dist = length(toLight);
-        if (dist >= light.range) continue;
-        float3 Ll = toLight / dist;
+        float3 Ll;
+        half atten = 1.0h;
+        float dist = 0.0;
+        if (light.type == 0) {
+            float directionLength = length(float3(light.direction));
+            if (directionLength <= 1e-5) continue;
+            Ll = -float3(light.direction) / directionLength;
+        } else {
+            float3 toLight = float3(light.position) - in.worldPos;
+            dist = length(toLight);
+            if (dist <= 1e-5 || dist >= light.range) continue;
+            Ll = toLight / dist;
+            half rangeFade = half(saturate(1.0 - dist / light.range));
+            atten = rangeFade * rangeFade / (1.0h + half(dist * dist * light.attenuation));
+        }
         
         half lNdotL = half(max(dot(N, Ll), 0.0));
         if (lNdotL <= 0.0h) continue;
         
-        half rangeFade = half(saturate(1.0 - dist / light.range));
-        half atten = rangeFade * rangeFade / (1.0h + half(dist * dist * light.attenuation));
-        
         if (light.type == 2) {
-            float spotDot = dot(-Ll, normalize(float3(light.direction)));
-            float spotAng = acos(saturate(spotDot));
+            float directionLength = length(float3(light.direction));
+            if (directionLength <= 1e-5) continue;
+            float spotDot = dot(-Ll, float3(light.direction) / directionLength);
+            float spotAng = acos(clamp(spotDot, -1.0, 1.0));
             if (spotAng > light.outerAngle) continue;
             if (spotAng > light.innerAngle) {
-                half t = half((spotAng - light.innerAngle) / (light.outerAngle - light.innerAngle));
-                atten *= 1.0h - t * t;
+                half t = half(clamp((spotAng - light.innerAngle) / max(light.outerAngle - light.innerAngle, 1e-5), 0.0, 1.0));
+                atten *= 1.0h - t * t * (3.0h - 2.0h * t);
             }
         }
         
@@ -756,17 +950,27 @@ float3 L = normalize(view.sunDirection);
     float3 R = reflect(-V, N);
     half3 hF_env = half3(fresnelSchlickRoughness_PBR(NdotV, float3(hF0), roughness));
     
-    // Diffuse irradiance from hemisphere
-    half hSkyFac = half(N.y) * 0.5h + 0.5h;
-    half3 irradiance = mix(half3(0.18, 0.15, 0.12), half3(0.5, 0.6, 0.8), hSkyFac);
+    // Diffuse irradiance from the sky-captured SH probe (replaces constants).
+    // BentNormal bit (2u): world-space bent direction from t9 replaces N for
+    // the irradiance lookup only — specular keeps the geometric normal.
+    float3 shadeN = N;
+    if ((feat & 2u) != 0u) {
+        float3 bent = bentTex.sample(surfSampler, in.uv).rgb * 2.0 - 1.0;
+        if (length_squared(bent) > 1e-6) shadeN = normalize(bent);
+    }
+    half3 irradiance = half3(SHEval(shadeN, sh));
     half3 kD_env = (1.0h - hF_env) * (1.0h - half(metallic));
     half3 ambientDiffuse = kD_env * irradiance * hAlbedo;
     
     // Specular reflection from sky
-    half3 prefilteredColor = half3(sampleSkyEnv(R, view.sunDirection, roughness));
+    half3 prefilteredColor = half3(sampleSkyEnv(R, view.sunDirection.xyz, roughness, skyPreset));
     half2 AB = half2(envBRDFApprox(NdotV, roughness));
     half3 specEnergy = half3(multiscatterCompensation(float3(hF0), float2(AB)));
     half3 ambientSpecular = prefilteredColor * specEnergy;
+    // An authored coat tint colors the sky reflection as well as the sun lobe.
+    // This keeps saturated Blender coat colors from being overlaid by a white sky.
+    if ((feat & 64u) != 0u)
+        ambientSpecular *= coatTint;
     
     // Horizon + specular occlusion
     half horizonAO = half(computeHorizonAO(N, R));
@@ -779,6 +983,12 @@ float3 L = normalize(view.sunDirection);
     // ── Rim Lighting (reuses irradiance — saves second sampleSkyEnv call) ──────
     half hRim = 1.0h - hNdotV; hRim = hRim * hRim * hRim * hRim; // manual pow4
     half3 rimLight = irradiance * hRim * 0.15h * (1.0h - half(metallic));
+
+    // ── Debug view: ambient/IBL only ───────────────────────────────────
+    if (dbg == 6u) {
+        float3 ee = (float3(ambient) + float3(rimLight)) * lightSettings.exposure;
+        return float4(LinearToSRGB(PBRNeutral(ee)), 1.0);
+    }
     
     // ── Shadow Mapping with Enhanced PCF ───────────────────────────────────────
     float shadow = 1.0;
@@ -819,50 +1029,33 @@ float3 L = normalize(view.sunDirection);
     // ═══════════════════════════════════════════════════════════════════════════
     // FINAL COMPOSITION
     // ═══════════════════════════════════════════════════════════════════════════
+
+    // ── Debug view: shadow factor only ───────────────────────────────────
+    if (dbg == 3u) {
+        return float4(shadow, shadow, shadow, 1.0);
+    }
     
     // Combine all lighting components (half → float at composition boundary)
     float3 finalColor = float3(ambient) + float3(directLight + sss + translucency) * shadow + float3(rimLight);
     
-    // Add emission if present
-    finalColor += albedo * material.emission;
-    
     // Exposure from lighting settings
     finalColor *= lightSettings.exposure;
     
-    // ── Tone Mapping (ACES Fitted — Stephen Hill RRT+ODT) ──────────────────────
-    finalColor = ACESFitted(finalColor);
+    // ── Tone Mapping (Khronos PBR Neutral — hue-preserving, LDR-safe) ──────────
+    finalColor = PBRNeutral(finalColor);
     
-    // Keep viewport color neutral; grading belongs in configurable post-process.
-    finalColor *= float3(1.0, 1.0, 1.0);
-    
-    // ── Gamma Correction (sRGB) ────────────────────────────────────────────────
-    finalColor = pow(finalColor, float3(1.0 / 2.2));
-    
-    // ── Output ─────────────────────────────────────────────────────────────────
-    float outAlpha = in.color.a;
-    
-    // Only use texture alpha for transparency modes (AlphaTest or AlphaBlend)
-    if (material.blendMode != 0) {
-        // Priority 1: Dedicated opacity texture (map_d as separate file)
-        if (material.useOpacityTex != 0) {
-            outAlpha *= opacityTex.sample(texSampler, in.uv).r; // map_d is grayscale — use red channel
-        }
-        // Priority 2: Albedo texture alpha channel (map_d == map_Kd, or PNG with embedded alpha)
-        else if (material.useAlbedoTex != 0) {
-            outAlpha *= albedoTex.sample(texSampler, in.uv).a;
-        }
-    }
+    // ── Output Encoding (exact sRGB EOTF-inverse) ──────────────────────────────
+    finalColor = LinearToSRGB(finalColor);
 
-    // Alpha Test (Masking) — hard cutoff, no blending
-    if (material.blendMode == 1) { // AlphaTest
-        if (outAlpha < 0.5) discard_fragment();
-        outAlpha = 1.0; // Opaque after test
-    }
-    else if (material.blendMode == 0) { // Opaque
-        outAlpha = 1.0;
-    }
+    // ── Display-referred grade LUT + interlaced gradient noise dither ─────────
+    // Dither is absolutely last: ±0.5 LSB in display space kills banding.
+    finalColor = LUTSample(finalColor, gradeLUT, surfSampler);
+    float ign = fract(52.9829189 * fract(dot(floor(in.position.xy), float2(0.06711056, 0.00583715))));
+    finalColor += (ign - 0.5) / 255.0;
     
-    return float4(finalColor, outAlpha);
+    // ── Output Alpha ───────────────────────────────────────────────────────────
+    // Opaque pipeline ignores it (blend off); transparent pipeline blends it.
+    return float4(finalColor, surface.alpha);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -940,8 +1133,8 @@ fragment float4 fs_gizmo(GizmoVaryings in [[stage_in]])
     float rim = pow(1.0 - max(abs(N.z), 0.0), 2.0) * 0.3;
     finalColor += float3(rim);
     
-    // Gizmos are semi-transparent so you can see through them slightly
-    float alpha = mix(0.85, 1.0, hover);
+    // Alpha controlled by C# (color.a) — translucent fills use 0.3, wireframe uses 0.85
+    float alpha = in.color.a;
     
     return float4(finalColor, alpha);
 }

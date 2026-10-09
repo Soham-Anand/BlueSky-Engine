@@ -4,18 +4,13 @@
 // 
 // FEATURES:
 // - Glassmorphic modern UI with smooth animations
-// - Real-time material preview cards with color swatches
-// - Drag-and-drop material assignment with visual feedback
 // - Advanced 3D viewport with lighting/rotation controls
-// - Inline material property editing (albedo, metallic, roughness)
-// - Material browser with search and filtering
 // - LOD configuration with visual distance indicators
 // - Collision settings with preview overlay
 // - Comprehensive mesh statistics and optimization suggestions
 // 
 // ARCHITECTURE:
 // - Cache-friendly data structures (fixed arrays, no heap churn)
-// - Demand-loaded material thumbnails with LRU eviction
 // - Smooth 60fps animations with delta-time interpolation
 // - Robust error handling with graceful degradation
 // - Atomic save operations with backup/restore
@@ -35,14 +30,13 @@ using System.Numerics;
 using BlueSky.Core.Assets;
 using BlueSky.Editor.UI;
 using BlueSky.Rendering;
-using NotBSRenderer;
+using BlueSky.Rendering.RHI;
 
 namespace BlueSky.Editor;
 
 /// <summary>
 /// Static Mesh Editor - Production-grade editor for mesh properties.
-/// Supports Material Slots, LOD configuration, Collision settings, mesh preview, and material browser.
-/// Master-level implementation with cache-friendly data structures and robust error handling.
+/// Supports LOD configuration, Collision settings and mesh preview.
 /// </summary>
 public class StaticMeshEditor
 {
@@ -50,12 +44,6 @@ public class StaticMeshEditor
     private BlueAsset? _currentAsset;
     private string _assetPath = "";
     private bool _isDirty = false;
-    // Asset picker state
-    private bool _showAssetPicker = false;
-    private Action<string>? _assetPickerCallback = null;
-    private string _assetPickerTitle = "";
-    private string[] _availableMaterials = Array.Empty<string>();
-    private string _filterText = "";
     
     // ── Viewport Hijacking ────────────────────────────────────────────────
     private Core.ECS.Entity _previewEntity;
@@ -72,15 +60,8 @@ public class StaticMeshEditor
     // ── Public Preview Properties ──────────────────────────────────────────
     public Vector4 PreviewRect { get; private set; }
     
-    // ── Material Slots (up to 8 slots, matching StaticMeshComponent limit) ──
-    private readonly string[] _materialSlots = new string[8];
-    private int _materialSlotCount = 0;
-    /// <summary>Slot count from mesh metadata (e.g. 34); <see cref="_materialSlotCount"/> only counts inline slots 0–7.</summary>
-    private int _declaredMaterialSlotCount = 0;
-    private int _selectedSlotIndex = -1;
-    
     // ── LOD Configuration ────────────────────────────────────────────────
-    private readonly LODSystem.LODSettings _lodSettings = new()
+    private readonly LODSettings _lodSettings = new()
     {
         LODCount = 3,
         LOD0Distance = 10.0f,
@@ -104,11 +85,8 @@ public class StaticMeshEditor
     private Vector3 _boundsMax = Vector3.Zero;
     
     // ── UI State ─────────────────────────────────────────────────────────
-    private int _selectedTab = 0; // 0=Materials, 1=LODs, 2=Collision, 3=Info
+    private int _selectedTab = 0; // 0=LODs, 1=Collision, 2=Info
     private float _previewRotation = 0f;
-    private float _previewZoom = 1.0f;
-    private float _previewPitch = 15f; // Camera pitch angle
-    private float _previewYaw = 45f;   // Camera yaw angle
     private bool _autoRotate = true;
     private bool _showWireframe = false;
     private bool _showBounds = false;
@@ -116,14 +94,8 @@ public class StaticMeshEditor
     // Animation state
     private float _tabTransition = 0f;
     private int _previousTab = 0;
-    private readonly Dictionary<int, float> _slotHoverAnim = new();
-    private readonly Dictionary<int, float> _slotPressAnim = new();
+    private readonly Dictionary<int, float> _tabHoverAnim = new();
     private float _saveButtonPulse = 0f;
-    
-    // Drag-drop state
-    private bool _isDraggingMaterial = false;
-    private string _draggedMaterialPath = "";
-    private int _dragTargetSlot = -1;
     
     public bool IsOpen { get; set; } = false;
     
@@ -207,15 +179,15 @@ public class StaticMeshEditor
         try
         {
             // Create preview texture (render target)
-            _previewTexture = _rhi.CreateTexture(new NotBSRenderer.TextureDesc
+            _previewTexture = _rhi.CreateTexture(new BlueSky.Rendering.RHI.TextureDesc
             {
                 Width = _previewWidth,
                 Height = _previewHeight,
                 Depth = 1,
                 MipLevels = 1,
                 ArrayLayers = 1,
-                Format = NotBSRenderer.TextureFormat.RGBA8Unorm,
-                Usage = NotBSRenderer.TextureUsage.RenderTarget | NotBSRenderer.TextureUsage.Sampled,
+                Format = BlueSky.Rendering.RHI.TextureFormat.RGBA8Unorm,
+                Usage = BlueSky.Rendering.RHI.TextureUsage.RenderTarget | BlueSky.Rendering.RHI.TextureUsage.Sampled,
                 DebugName = "StaticMeshPreview"
             });
             
@@ -291,13 +263,6 @@ public class StaticMeshEditor
             {
                 ref var meshComp = ref world.GetComponent<Core.ECS.Builtin.StaticMeshComponent>(_previewEntity);
                 meshComp.MeshAssetId = _assetPath;
-                // Reset material slots
-                for (int i = 0; i < 8; i++) meshComp.SetMaterialSlot(i, null);
-                for (int i = 0; i < _materialSlotCount; i++)
-                {
-                    if (!string.IsNullOrEmpty(_materialSlots[i]))
-                        meshComp.SetMaterialSlot(i, _materialSlots[i]);
-                }
                 
                 // Reset transform
                 if (world.HasComponent<Core.ECS.Builtin.TransformComponent>(_previewEntity))
@@ -308,7 +273,7 @@ public class StaticMeshEditor
                     transform.Scale = new Core.Math.Vector3(1, 1, 1);
                 }
                 
-                Console.WriteLine($"[StaticMeshEditor] Updated preview mesh: {_currentAsset.AssetName}");
+                Console.WriteLine($"[StaticMeshEditor] Updated preview mesh: {_currentAsset!.AssetName}");
                 Program.GetMainViewport()?.InvalidateMeshGpuCache(_assetPath);
                 return;
             }
@@ -330,24 +295,16 @@ public class StaticMeshEditor
             
             // Add static mesh component — use the FILE PATH, not the GUID!
             // ViewportRenderer demand-loads meshes by path, not by GUID.
+            // (geometry only — material system removed)
             var meshComp = new Core.ECS.Builtin.StaticMeshComponent
             {
                 MeshAssetId = _assetPath
             };
-            
-            // Apply material slots if any
-            for (int i = 0; i < _materialSlotCount; i++)
-            {
-                if (!string.IsNullOrEmpty(_materialSlots[i]))
-                {
-                    meshComp.SetMaterialSlot(i, _materialSlots[i]);
-                }
-            }
-            
+
             world.AddComponent(_previewEntity, meshComp);
             
             _hasSpawnedPreview = true;
-            Console.WriteLine($"[StaticMeshEditor] ✓ Spawned preview mesh: {_currentAsset.AssetName}");
+            Console.WriteLine($"[StaticMeshEditor] ✓ Spawned preview mesh: {_currentAsset!.AssetName}");
             Console.WriteLine($"[StaticMeshEditor]   Entity ID: {_previewEntity.Id}");
             Console.WriteLine($"[StaticMeshEditor]   Mesh Path: {_assetPath}");
             Console.WriteLine($"[StaticMeshEditor]   Vertices: {_vertexCount}, Triangles: {_triangleCount}");
@@ -424,7 +381,7 @@ public class StaticMeshEditor
     }
     
     /// <summary>
-    /// Load asset metadata and material slots from the asset file.
+    /// Load asset metadata from the asset file.
     /// Cache-friendly sequential reads with validation.
     /// </summary>
     private void LoadAssetData()
@@ -461,30 +418,6 @@ public class StaticMeshEditor
             }
         }
         
-        // Load material slots from metadata (inline buffer: first 8 only)
-        for (int i = 0; i < 8; i++)
-        {
-            if (_currentAsset.Metadata.TryGetValue($"materialSlot{i}", out var matId))
-            {
-                _materialSlots[i] = matId;
-                _materialSlotCount = Math.Max(_materialSlotCount, i + 1);
-            }
-            else
-            {
-                _materialSlots[i] = "";
-            }
-        }
-
-        _declaredMaterialSlotCount = _materialSlotCount;
-        if (_currentAsset.Metadata.TryGetValue("materialSlotCount", out var slotCountStr)
-            && int.TryParse(slotCountStr, out var declared))
-            _declaredMaterialSlotCount = Math.Max(_declaredMaterialSlotCount, declared);
-        if (_currentAsset.Metadata.TryGetValue("materialSlots", out var slotsCsv))
-        {
-            int n = slotsCsv.Split(',', StringSplitOptions.RemoveEmptyEntries).Length;
-            _declaredMaterialSlotCount = Math.Max(_declaredMaterialSlotCount, n);
-        }
-        
         // Load LOD settings from metadata
         if (_currentAsset.Metadata.TryGetValue("lodCount", out var lodCount))
             int.TryParse(lodCount, out _lodSettings.LODCount);
@@ -510,16 +443,9 @@ public class StaticMeshEditor
     /// Render the static mesh editor UI with modern glassmorphic design.
     /// 60fps smooth animations, professional visual hierarchy, stunning aesthetics.
     /// </summary>
-    public void Render(NotBSUI ui, float x, float y, float width, float height)
+    public void Render(EditorUI ui, float x, float y, float width, float height)
     {
         if (!IsOpen || _currentAsset == null) return;
-        
-        // Show material picker overlay if active
-        if (_showAssetPicker)
-        {
-            DrawMaterialPicker(ui, x, y, width, height);
-            return;
-        }
         
         // ═══════════════════════════════════════════════════════════════════
         // MAIN BACKGROUND - Dark with subtle gradient
@@ -549,7 +475,7 @@ public class StaticMeshEditor
         ui.Text($"🎨 Static Mesh Editor", new Vector4(1.0f, 1.0f, 1.0f, 1.0f));
         
         ui.SetCursor(x + 20, y + 32);
-        ui.Text(_currentAsset.AssetName, new Vector4(0.7f, 0.85f, 1.0f, 0.9f));
+        ui.Text(_currentAsset!.AssetName, new Vector4(0.7f, 0.85f, 1.0f, 0.9f));
         
         // Close button with hover animation
         float closeX = x + width - 50;
@@ -609,9 +535,9 @@ public class StaticMeshEditor
     /// <summary>
     /// Render modern tab bar with smooth animations and visual feedback.
     /// </summary>
-    private void RenderModernTabBar(NotBSUI ui, float x, float y, float width, float height)
+    private void RenderModernTabBar(EditorUI ui, float x, float y, float width, float height)
     {
-        string[] tabs = { "🎨 Materials", "📊 LODs", "🛡️ Collision", "ℹ️ Info" };
+        string[] tabs = { "📊 LODs", "🛡️ Collision", "ℹ️ Info" };
         float tabW = width / tabs.Length;
         
         // Background bar with subtle gradient
@@ -628,10 +554,10 @@ public class StaticMeshEditor
             bool isHovered = ui.IsHovering(tx, y, tw, height);
             
             // Smooth hover animation
-            if (!_slotHoverAnim.ContainsKey(i + 100)) _slotHoverAnim[i + 100] = 0f;
+            if (!_tabHoverAnim.ContainsKey(i + 100)) _tabHoverAnim[i + 100] = 0f;
             float targetHover = (isHovered || isSelected) ? 1f : 0f;
-            _slotHoverAnim[i + 100] += (targetHover - _slotHoverAnim[i + 100]) * 0.15f;
-            float hoverAnim = _slotHoverAnim[i + 100];
+            _tabHoverAnim[i + 100] += (targetHover - _tabHoverAnim[i + 100]) * 0.15f;
+            float hoverAnim = _tabHoverAnim[i + 100];
             
             // Tab background with gradient based on state
             Vector4 bgColor, bgColorBottom;
@@ -680,7 +606,7 @@ public class StaticMeshEditor
     /// <summary>
     /// Render left panel with modern card-based design.
     /// </summary>
-    private void RenderLeftPanelModern(NotBSUI ui, float x, float y, float width, float height)
+    private void RenderLeftPanelModern(EditorUI ui, float x, float y, float width, float height)
     {
         // Glassmorphic card background
         ui.RoundedGradientPanel(x, y, width, height,
@@ -699,263 +625,16 @@ public class StaticMeshEditor
         
         switch (_selectedTab)
         {
-            case 0: RenderMaterialsTabModern(ui, contentX, contentY, contentW, contentH); break;
-            case 1: RenderLODsTabModern(ui, contentX, contentY, contentW, contentH); break;
-            case 2: RenderCollisionTabModern(ui, contentX, contentY, contentW, contentH); break;
-            case 3: RenderInfoTabModern(ui, contentX, contentY, contentW, contentH); break;
+            case 0: RenderLODsTabModern(ui, contentX, contentY, contentW, contentH); break;
+            case 1: RenderCollisionTabModern(ui, contentX, contentY, contentW, contentH); break;
+            case 2: RenderInfoTabModern(ui, contentX, contentY, contentW, contentH); break;
         }
     }
     
     /// <summary>
-    /// Render materials tab with stunning card-based material slots.
-    /// Supports any number of slots (not capped at 8 — that's the component limit, not the display limit).
-    /// </summary>
-    private void RenderMaterialsTabModern(NotBSUI ui, float x, float y, float width, float height)
+    private void RenderTabBar(EditorUI ui, float x, float y, float width, float height)
     {
-        float rowY = y;
-        
-        // Section header
-        ui.SetCursor(x, rowY);
-        ui.Text("Material Slots", new Vector4(1.0f, 1.0f, 1.0f, 1.0f));
-        rowY += 35;
-        
-        var asset = Core.Assets.BlueAsset.Load(_assetPath);
-        if (asset != null && asset.Metadata.TryGetValue("materialSlots", out var slotsStr))
-        {
-            var slotNames = slotsStr.Split(',');
-            
-            // Slot count badge
-            ui.RoundedPanel(x, rowY, 130, 24,
-                new Vector4(0.25f, 0.45f, 0.65f, 0.3f), 6f);
-            ui.SetCursor(x + 10, rowY + 5);
-            ui.Text($"📦 {slotNames.Length} Slots", new Vector4(0.7f, 0.9f, 1.0f, 1.0f));
-            rowY += 35;
-            
-            // Scrollable material slot cards
-            // Each card is cardH tall + gap. Auto-color button at bottom adds 50.
-            float cardH = 80;
-            float gap = 8;
-            float scrollAreaH = height - (rowY - y);
-            float scrollContentH = slotNames.Length * (cardH + gap) + 60; // 60 for auto-color btn
-            
-            float scrollOffset = ui.BeginScrollArea("MeshEditor_Materials", x, rowY, width, scrollAreaH, scrollContentH);
-            
-            // Items are drawn at their virtual Y (rowY + i*(cardH+gap)) then shifted by -scrollOffset.
-            // The clip rect from BeginScrollArea handles actual clipping — no manual culling needed.
-            for (int i = 0; i < slotNames.Length; i++)
-            {
-                float itemVirtualY = rowY + i * (cardH + gap);
-                float drawY = itemVirtualY - scrollOffset;
-                
-                // Skip items fully outside the visible window (perf only — clip rect handles visuals)
-                if (drawY + cardH < rowY || drawY > rowY + scrollAreaH)
-                    continue;
-                
-                RenderMaterialSlotCard(ui, x, drawY, width - 10, cardH, i, slotNames[i].Trim(), asset);
-            }
-            
-            // Auto-color button pinned after last card
-            float autoColorVirtualY = rowY + slotNames.Length * (cardH + gap) + 8;
-            float autoColorDrawY = autoColorVirtualY - scrollOffset;
-            if (autoColorDrawY + 40 >= rowY && autoColorDrawY <= rowY + scrollAreaH)
-            {
-                if (ui.ButtonEx(x, autoColorDrawY, width - 10, 40, "🎨 Auto-Color All Slots",
-                    new Vector4(0.25f, 0.55f, 0.75f, 0.9f),
-                    new Vector4(0.30f, 0.65f, 0.85f, 1.0f),
-                    new Vector4(0.20f, 0.50f, 0.70f, 0.9f),
-                    new Vector4(0, 0, 0, 0.4f),
-                    new Vector4(1, 1, 1, 1)))
-                {
-                    AutoColorAllSlots(asset);
-                }
-            }
-            
-            ui.EndScrollArea("MeshEditor_Materials");
-        }
-        else
-        {
-            // No slots detected - show helpful message
-            ui.RoundedPanel(x, rowY, width, 100,
-                new Vector4(0.3f, 0.2f, 0.2f, 0.3f), 8f);
-            
-            ui.SetCursor(x + 20, rowY + 20);
-            ui.Text("⚠️ No Material Slots Detected", new Vector4(1.0f, 0.7f, 0.5f, 1.0f));
-            
-            ui.SetCursor(x + 20, rowY + 45);
-            ui.Text("Re-import your FBX with materials", new Vector4(0.7f, 0.7f, 0.7f, 0.8f));
-            
-            ui.SetCursor(x + 20, rowY + 65);
-            ui.Text("to enable multi-material support.", new Vector4(0.7f, 0.7f, 0.7f, 0.8f));
-        }
-    }
-    
-    /// <summary>
-    /// Render a single material slot as a beautiful card with preview swatch.
-    /// Safe for any slotIndex — does NOT index into the fixed-size _materialSlots[8] array.
-    /// Material paths are read/written directly through the asset metadata.
-    /// </summary>
-    private void RenderMaterialSlotCard(NotBSUI ui, float x, float y, float width, float height, int slotIndex, string slotName, Core.Assets.BlueAsset asset)
-    {
-        bool isSelected = _selectedSlotIndex == slotIndex;
-        bool isHovered = ui.IsHovering(x, y, width, height);
-        bool isDragTarget = _isDraggingMaterial && _dragTargetSlot == slotIndex;
-        
-        // Smooth hover animation — keyed by slotIndex, safe for any count
-        if (!_slotHoverAnim.ContainsKey(slotIndex)) _slotHoverAnim[slotIndex] = 0f;
-        float targetHover = (isHovered || isSelected) ? 1f : 0f;
-        _slotHoverAnim[slotIndex] += (targetHover - _slotHoverAnim[slotIndex]) * 0.12f;
-        float hoverAnim = _slotHoverAnim[slotIndex];
-        
-        // Card background
-        Vector4 cardBg = isSelected
-            ? new Vector4(0.22f + hoverAnim * 0.03f, 0.35f + hoverAnim * 0.03f, 0.50f + hoverAnim * 0.03f, 0.95f)
-            : new Vector4(0.16f + hoverAnim * 0.02f, 0.17f + hoverAnim * 0.02f, 0.20f + hoverAnim * 0.02f, 0.9f);
-        
-        if (isDragTarget)
-            cardBg = new Vector4(0.3f, 0.6f, 0.4f, 0.95f);
-        
-        ui.RoundedPanel(x, y, width, height, cardBg, 8f);
-        
-        if (isSelected || hoverAnim > 0.1f)
-            ui.Shadow(x, y, width, height, 6f, 8f, 0.3f + hoverAnim * 0.2f);
-        
-        // Left accent bar
-        Vector4 accentColor = isSelected 
-            ? new Vector4(0.4f, 0.75f, 1.0f, 1.0f)
-            : new Vector4(0.3f, 0.5f, 0.7f, 0.6f + hoverAnim * 0.3f);
-        ui.RoundedPanel(x + 5, y + 10, 4, height - 20, accentColor, 2f);
-        
-        // Slot index badge
-        ui.RoundedPanel(x + 15, y + 10, 30, 24, new Vector4(0.2f, 0.2f, 0.25f, 0.8f), 4f);
-        ui.SetCursor(x + 22, y + 15);
-        ui.Text($"{slotIndex}", new Vector4(0.8f, 0.8f, 0.8f, 1.0f));
-        
-        // Slot name — truncate if too long
-        string displayName = slotName.Length > 28 ? slotName[..26] + ".." : slotName;
-        ui.SetCursor(x + 55, y + 12);
-        ui.Text(displayName, new Vector4(0.95f, 0.95f, 0.95f, 1.0f));
-        
-        // Resolve material path from metadata (safe — no fixed array access)
-        string currentMatPath = "";
-        asset.Metadata.TryGetValue($"materialSlot{slotIndex}", out currentMatPath!);
-        currentMatPath ??= "";
-        
-        string matInfo = "No Material";
-        Vector4 matColor = new Vector4(0.5f, 0.5f, 0.5f, 0.7f);
-        
-        if (!string.IsNullOrEmpty(currentMatPath))
-        {
-            matInfo = System.IO.Path.GetFileNameWithoutExtension(currentMatPath);
-            if (matInfo.Length > 28) matInfo = matInfo[..26] + "..";
-            matColor = new Vector4(0.6f, 0.9f, 0.7f, 1.0f);
-            
-            // Color swatch from material albedo
-            var matAsset = Core.Assets.MaterialAsset.Load(currentMatPath);
-            if (matAsset != null)
-            {
-                float swatchSize = 22;
-                float swatchX = x + width - swatchSize - 12;
-                float swatchY = y + 10;
-                ui.RoundedPanel(swatchX, swatchY, swatchSize, swatchSize,
-                    new Vector4(matAsset.Albedo.X, matAsset.Albedo.Y, matAsset.Albedo.Z, 1.0f), 4f);
-                // Thin border
-                ui.Panel(swatchX, swatchY, swatchSize, 1, new Vector4(1, 1, 1, 0.25f));
-                ui.Panel(swatchX, swatchY, 1, swatchSize, new Vector4(1, 1, 1, 0.25f));
-            }
-        }
-        
-        ui.SetCursor(x + 55, y + 32);
-        ui.Text($"→ {matInfo}", matColor);
-        
-        // Action buttons row
-        float btnY = y + height - 30;
-        float btnW = (width - 65) / 3;
-        
-        // Edit
-        if (ui.ButtonEx(x + 15, btnY, btnW, 22, "✏️ Edit",
-            new Vector4(0.25f, 0.35f, 0.50f, 0.8f),
-            new Vector4(0.30f, 0.40f, 0.55f, 1.0f),
-            new Vector4(0.20f, 0.30f, 0.45f, 0.8f),
-            new Vector4(0, 0, 0, 0.3f),
-            new Vector4(0.9f, 0.9f, 0.9f, 1.0f)))
-        {
-            string editMatPath = currentMatPath;
-            if (string.IsNullOrEmpty(editMatPath))
-            {
-                string projectDir = ProjectManager.CurrentProjectDir ?? "";
-                editMatPath = System.IO.Path.Combine(projectDir, "Assets", "Materials", $"{_currentAsset!.AssetName}_Mat{slotIndex}.blueskyasset");
-                System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(editMatPath)!);
-                asset.Metadata[$"materialSlot{slotIndex}"] = editMatPath;
-                asset.Save(_assetPath);
-            }
-            Program.OpenMaterialEditor(editMatPath);
-        }
-        
-        // Browse
-        if (ui.ButtonEx(x + 18 + btnW, btnY, btnW, 22, "📁 Browse",
-            new Vector4(0.45f, 0.35f, 0.25f, 0.8f),
-            new Vector4(0.55f, 0.45f, 0.35f, 1.0f),
-            new Vector4(0.40f, 0.30f, 0.20f, 0.8f),
-            new Vector4(0, 0, 0, 0.3f),
-            new Vector4(0.9f, 0.9f, 0.9f, 1.0f)))
-        {
-            LoadAvailableMaterials();
-            _showAssetPicker = true;
-            _selectedSlotIndex = slotIndex;
-            int capturedSlot = slotIndex; // Capture for lambda
-            _assetPickerCallback = (materialPath) =>
-            {
-                asset.Metadata[$"materialSlot{capturedSlot}"] = materialPath;
-                // Also update _materialSlots if within range
-                if (capturedSlot < _materialSlots.Length)
-                    _materialSlots[capturedSlot] = materialPath;
-                asset.Save(_assetPath);
-                _isDirty = true;
-                RefreshPreviewMaterials();
-            };
-            _assetPickerTitle = $"Select Material for Slot {slotIndex}";
-        }
-        
-        // Clear
-        if (ui.ButtonEx(x + 21 + btnW * 2, btnY, btnW, 22, "✕ Clear",
-            new Vector4(0.6f, 0.3f, 0.3f, 0.8f),
-            new Vector4(0.7f, 0.4f, 0.4f, 1.0f),
-            new Vector4(0.5f, 0.25f, 0.25f, 0.8f),
-            new Vector4(0, 0, 0, 0.3f),
-            new Vector4(0.9f, 0.9f, 0.9f, 1.0f)))
-        {
-            asset.Metadata[$"materialSlot{slotIndex}"] = "";
-            if (slotIndex < _materialSlots.Length)
-                _materialSlots[slotIndex] = "";
-            asset.Save(_assetPath);
-            _isDirty = true;
-        }
-        
-        // Click to select
-        if (isHovered && ui.IsMouseDown)
-            _selectedSlotIndex = slotIndex;
-    }
-    
-    /// <summary>
-    /// Push current _materialSlots state to the preview entity.
-    /// </summary>
-    private void RefreshPreviewMaterials()
-    {
-        if (!_hasSpawnedPreview || _lastWorld == null) return;
-        if (!_lastWorld.HasComponent<Core.ECS.Builtin.StaticMeshComponent>(_previewEntity)) return;
-        
-        ref var meshComp = ref _lastWorld.GetComponent<Core.ECS.Builtin.StaticMeshComponent>(_previewEntity);
-        for (int i = 0; i < 8; i++) meshComp.SetMaterialSlot(i, "");
-        for (int i = 0; i < Math.Min(_materialSlotCount, 8); i++)
-        {
-            if (!string.IsNullOrEmpty(_materialSlots[i]))
-                meshComp.SetMaterialSlot(i, _materialSlots[i]);
-        }
-    }
-    
-    private void RenderTabBar(NotBSUI ui, float x, float y, float width, float height)
-    {
-        string[] tabs = { "Materials", "LODs", "Collision", "Info" };
+        string[] tabs = { "LODs", "Collision", "Info" };
         float tabW = width / tabs.Length;
         
         for (int i = 0; i < tabs.Length; i++)
@@ -981,194 +660,24 @@ public class StaticMeshEditor
         }
     }
     
-    private void RenderLeftPanel(NotBSUI ui, float x, float y, float width, float height)
+    private void RenderLeftPanel(EditorUI ui, float x, float y, float width, float height)
     {
         ui.RoundedPanel(x, y, width, height, new Vector4(0.18f, 0.18f, 0.2f, 1), 6f);
         
         switch (_selectedTab)
         {
-            case 0: RenderMaterialsTab(ui, x + 10, y + 10, width - 20, height - 20); break;
-            case 1: RenderLODsTab(ui, x + 10, y + 10, width - 20, height - 20); break;
-            case 2: RenderCollisionTab(ui, x + 10, y + 10, width - 20, height - 20); break;
-            case 3: RenderInfoTab(ui, x + 10, y + 10, width - 20, height - 20); break;
+            case 0: RenderLODsTab(ui, x + 10, y + 10, width - 20, height - 20); break;
+            case 1: RenderCollisionTab(ui, x + 10, y + 10, width - 20, height - 20); break;
+            case 2: RenderInfoTab(ui, x + 10, y + 10, width - 20, height - 20); break;
         }
     }
     
-    private void RenderMaterialsTab(NotBSUI ui, float x, float y, float width, float height)
-    {
-        float rowY = y;
-        float rowH = 32;
-        
-        ui.SetCursor(x + 10, rowY);
-        ui.Text("Material Slots", new Vector4(0.95f, 0.95f, 0.95f, 1));
-        rowY += 28;
-        
-        var asset = Core.Assets.BlueAsset.Load(_assetPath);
-        if (asset != null && asset.Metadata.TryGetValue("materialSlots", out var slotsStr))
-        {
-            var slotNames = slotsStr.Split(',');
-            
-            ui.SetCursor(x + 10, rowY);
-            ui.Text($"Detected: {slotNames.Length} slots", new Vector4(0.7f, 0.9f, 0.7f, 1));
-            rowY += 25;
-            
-            float contentHeight = slotNames.Length * (rowH + 4) + 150;
-            float scrollOffset = ui.BeginScrollArea("MeshEditor_Props", x, rowY, width, height - (rowY - y), contentHeight);
-            
-            float currentItemY = rowY;
-            for (int i = 0; i < slotNames.Length; i++)
-            {
-                float drawY = currentItemY - scrollOffset;
-                
-                // Culling check
-                if (drawY + rowH < rowY || drawY > rowY + (height - (rowY - y))) 
-                {
-                    currentItemY += rowH + 4;
-                    continue;
-                }
-                
-                string slotName = slotNames[i].Trim();
-                bool isSelected = _selectedSlotIndex == i;
-                var slotBg = isSelected ? new Vector4(0.35f, 0.5f, 0.65f, 1) : new Vector4(0.2f, 0.2f, 0.22f, 1);
-                
-                if (ui.ButtonEx(x + 5, drawY, width - 10, rowH, $"[{i}] {slotName}",
-                    slotBg,
-                    new Vector4(0.25f, 0.25f, 0.27f, 1),
-                    new Vector4(0.3f, 0.45f, 0.6f, 1),
-                    new Vector4(0, 0, 0, 0.3f),
-                    new Vector4(0.9f, 0.9f, 0.9f, 1)))
-                {
-                    _selectedSlotIndex = i;
-                }
-                
-                currentItemY += rowH + 4;
-            }
-            
-            currentItemY += 15;
-            float drawLabelY = currentItemY - scrollOffset;
-            
-            // Only draw label and button if visible
-            if (drawLabelY + 50 >= rowY && drawLabelY <= rowY + (height - (rowY - y)))
-            {
-                ui.SetCursor(x + 10, drawLabelY);
-            ui.Text("Assign Material to Slot", new Vector4(0.85f, 0.85f, 0.85f, 1));
-            rowY += 25;
-            
-            if (_selectedSlotIndex >= 0 && _selectedSlotIndex < slotNames.Length)
-            {
-                string slotName = slotNames[_selectedSlotIndex].Trim();
-                
-                string matInfo = "None";
-                if (asset.Metadata.TryGetValue($"materialSlot{_selectedSlotIndex}", out var slotPath) && !string.IsNullOrEmpty(slotPath))
-                {
-                    matInfo = System.IO.Path.GetFileNameWithoutExtension(slotPath);
-                }
-
-                float drawSlotY = rowY - scrollOffset;
-                ui.SetCursor(x + 10, drawSlotY);
-                ui.Text($"Slot: {slotName}", new Vector4(0.75f, 0.75f, 0.75f, 1));
-                ui.SetCursor(x + 100, drawSlotY);
-                ui.Text($"➜ {matInfo}", new Vector4(0.5f, 0.8f, 0.5f, 1));
-                rowY += 22;
-                
-                float drawBtn1Y = rowY - scrollOffset;
-                if (ui.ButtonEx(x + 10, drawBtn1Y, width - 20, 28, "📁 Edit Material",
-                    new Vector4(0.25f, 0.35f, 0.45f, 1),
-                    new Vector4(0.3f, 0.4f, 0.5f, 1),
-                    new Vector4(0.2f, 0.3f, 0.4f, 1),
-                    new Vector4(0, 0, 0, 0.3f),
-                    new Vector4(0.9f, 0.9f, 0.9f, 1)))
-                {
-                    string matPath = "";
-                    if (asset.Metadata.TryGetValue($"materialSlot{_selectedSlotIndex}", out var existingPath) && !string.IsNullOrEmpty(existingPath))
-                    {
-                        matPath = existingPath;
-                    }
-                    else
-                    {
-                        string projectDir = ProjectManager.CurrentProjectDir ?? "";
-                        matPath = System.IO.Path.Combine(projectDir, "Assets", "Materials", $"{_currentAsset.AssetName}_Mat{_selectedSlotIndex}.blueskyasset");
-                        System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(matPath)!);
-                        asset.Metadata[$"materialSlot{_selectedSlotIndex}"] = matPath;
-                        asset.Save(_assetPath);
-                    }
-                    
-                    Program.OpenMaterialEditor(matPath);
-                }
-                rowY += 35;
-                
-                float drawBtn2Y = rowY - scrollOffset;
-                if (ui.ButtonEx(x + 10, drawBtn2Y, width - 20, 28, "� Browse Materials",
-                    new Vector4(0.35f, 0.25f, 0.15f, 1),
-                    new Vector4(0.45f, 0.35f, 0.25f, 1),
-                    new Vector4(0.3f, 0.2f, 0.1f, 1),
-                    new Vector4(0, 0, 0, 0.3f),
-                    new Vector4(0.9f, 0.9f, 0.9f, 1)))
-                {
-                    // Load available materials and show picker
-                    LoadAvailableMaterials();
-                    _showAssetPicker = true;
-                    _assetPickerCallback = (materialPath) => {
-                        if (_selectedSlotIndex >= 0 && asset != null)
-                        {
-                            asset.Metadata[$"materialSlot{_selectedSlotIndex}"] = materialPath;
-                            _materialSlots[_selectedSlotIndex] = materialPath;
-                            asset.Save(_assetPath);
-                            _isDirty = true;
-                            
-                            // Update preview mesh - just update the existing entity materials
-                            if (_hasSpawnedPreview && _lastWorld != null)
-                            {
-                                if (_lastWorld.HasComponent<Core.ECS.Builtin.StaticMeshComponent>(_previewEntity))
-                                {
-                                    ref var meshComp = ref _lastWorld.GetComponent<Core.ECS.Builtin.StaticMeshComponent>(_previewEntity);
-                                    // Update material slots
-                                    for (int i = 0; i < 8; i++) meshComp.SetMaterialSlot(i, null);
-                                    for (int i = 0; i < _materialSlotCount; i++)
-                                    {
-                                        if (!string.IsNullOrEmpty(_materialSlots[i]))
-                                            meshComp.SetMaterialSlot(i, _materialSlots[i]);
-                                    }
-                                }
-                            }
-                        }
-                    };
-                    _assetPickerTitle = "Select Material for Slot " + _selectedSlotIndex;
-                }
-                rowY += 35;
-            }
-            } // Closing brace for the culling if-block
-            
-            ui.EndScrollArea("MeshEditor_Props");
-        }
-        else
-        {
-            ui.SetCursor(x + 10, rowY);
-            ui.Text("No material slots detected", new Vector4(0.8f, 0.6f, 0.6f, 1));
-            rowY += 25;
-            ui.SetCursor(x + 10, rowY);
-            ui.Text("(Re-import FBX with materials)", new Vector4(0.6f, 0.6f, 0.6f, 1));
-            rowY += 25;
-            
-            // Clear button
-            if (ui.ButtonEx(x, rowY, 100, 30, "Clear",
-                new Vector4(0.6f, 0.3f, 0.2f, 1),
-                new Vector4(0.7f, 0.35f, 0.25f, 1),
-                new Vector4(0.5f, 0.25f, 0.15f, 1),
-                new Vector4(0, 0, 0, 0.3f),
-                new Vector4(0.9f, 0.9f, 0.9f, 1)))
-            {
-                _materialSlots[_selectedSlotIndex] = "";
-                _isDirty = true;
-            }
-        }
-    }
     
     
     /// <summary>
     /// Render LODs tab with modern visual distance indicators.
     /// </summary>
-    private void RenderLODsTabModern(NotBSUI ui, float x, float y, float width, float height)
+    private void RenderLODsTabModern(EditorUI ui, float x, float y, float width, float height)
     {
         float rowY = y;
         
@@ -1238,9 +747,9 @@ public class StaticMeshEditor
                 new Vector4(1, 1, 1, 1)))
             {
                 // Apply preset based on index
-                if (i == 0) ApplyLODPreset(LODSystem.LODPresets.Low);
-                else if (i == 1) ApplyLODPreset(LODSystem.LODPresets.Medium);
-                else if (i == 2) ApplyLODPreset(LODSystem.LODPresets.High);
+                if (i == 0) ApplyLODPreset(LODPresets.Low);
+                else if (i == 1) ApplyLODPreset(LODPresets.Medium);
+                else if (i == 2) ApplyLODPreset(LODPresets.High);
             }
         }
     }
@@ -1248,7 +757,7 @@ public class StaticMeshEditor
     /// <summary>
     /// Render collision tab with visual type indicators.
     /// </summary>
-    private void RenderCollisionTabModern(NotBSUI ui, float x, float y, float width, float height)
+    private void RenderCollisionTabModern(EditorUI ui, float x, float y, float width, float height)
     {
         float rowY = y;
         
@@ -1338,7 +847,7 @@ public class StaticMeshEditor
     /// <summary>
     /// Render info tab with comprehensive mesh statistics.
     /// </summary>
-    private void RenderInfoTabModern(NotBSUI ui, float x, float y, float width, float height)
+    private void RenderInfoTabModern(EditorUI ui, float x, float y, float width, float height)
     {
         float rowY = y;
         
@@ -1359,9 +868,6 @@ public class StaticMeshEditor
         
         ui.SetCursor(x + 15, rowY + 60);
         ui.Text($"Triangles: {_triangleCount:N0}", new Vector4(0.9f, 0.9f, 0.9f, 1.0f));
-        
-        ui.SetCursor(x + 15, rowY + 82);
-        ui.Text($"Material Slots: {_materialSlotCount}", new Vector4(0.9f, 0.9f, 0.9f, 1.0f));
         
         // Optimization suggestion
         if (_triangleCount > 100000)
@@ -1414,7 +920,7 @@ public class StaticMeshEditor
     /// <summary>
     /// Render preview panel with advanced 3D viewport controls.
     /// </summary>
-    private void RenderPreviewPanelModern(NotBSUI ui, float x, float y, float width, float height)
+    private void RenderPreviewPanelModern(EditorUI ui, float x, float y, float width, float height)
     {
         // Main preview card
         ui.RoundedGradientPanel(x, y, width, height,
@@ -1516,14 +1022,6 @@ public class StaticMeshEditor
         ui.SetCursor(x + cardW + 20, statsY + 28);
         ui.Text($"{_triangleCount:N0}", new Vector4(0.9f, 0.9f, 0.9f, 1.0f));
         
-        // Materials card
-        ui.RoundedPanel(x + cardW * 2 + 15, statsY, cardW, 50,
-            new Vector4(0.16f, 0.26f, 0.20f, 0.9f), 6f);
-        ui.SetCursor(x + cardW * 2 + 25, statsY + 10);
-        ui.Text("Materials", new Vector4(0.6f, 0.8f, 0.7f, 1.0f));
-        ui.SetCursor(x + cardW * 2 + 25, statsY + 28);
-        ui.Text($"{_declaredMaterialSlotCount}", new Vector4(0.9f, 0.9f, 0.9f, 1.0f));
-        
         // Camera controls hint
         float hintY = statsY + 60;
         ui.SetCursor(x + 10, hintY);
@@ -1539,7 +1037,7 @@ public class StaticMeshEditor
     /// <summary>
     /// Render action bar with save/revert buttons.
     /// </summary>
-    private void RenderActionBar(NotBSUI ui, float x, float y, float width, float height)
+    private void RenderActionBar(EditorUI ui, float x, float y, float width, float height)
     {
         // Background bar
         ui.RoundedGradientPanel(x, y, width, height,
@@ -1594,7 +1092,7 @@ public class StaticMeshEditor
         ui.Text(System.IO.Path.GetFileName(_assetPath), new Vector4(0.5f, 0.5f, 0.5f, 0.8f));
     }
     
-    private void RenderLODsTab(NotBSUI ui, float x, float y, float width, float height)
+    private void RenderLODsTab(EditorUI ui, float x, float y, float width, float height)
     {
         float rowY = y;
         
@@ -1606,18 +1104,33 @@ public class StaticMeshEditor
         ui.Text($"LOD Count: {_lodSettings.LODCount}", new Vector4(0.8f, 0.8f, 0.8f, 1));
         rowY += 25;
         
-        // LOD distance sliders (simplified - would need proper slider UI)
+        float sliderWidth = Math.Max(120, Math.Min(260, width - 24));
         ui.SetCursor(x, rowY);
         ui.Text($"LOD 0 Distance: {_lodSettings.LOD0Distance:F1}m", new Vector4(0.7f, 0.7f, 0.7f, 1));
-        rowY += 25;
-        
+        ui.SetCursor(x, rowY + 17);
+        if (ui.Slider(ref _lodSettings.LOD0Distance, 1f, 150f, sliderWidth, 14f))
+            _isDirty = true;
+        float priorLod1 = _lodSettings.LOD1Distance;
+        _lodSettings.LOD1Distance = Math.Max(_lodSettings.LOD1Distance, _lodSettings.LOD0Distance + 1f);
+        if (_lodSettings.LOD1Distance != priorLod1) _isDirty = true;
+        rowY += 48;
+
         ui.SetCursor(x, rowY);
         ui.Text($"LOD 1 Distance: {_lodSettings.LOD1Distance:F1}m", new Vector4(0.7f, 0.7f, 0.7f, 1));
-        rowY += 25;
-        
+        ui.SetCursor(x, rowY + 17);
+        if (ui.Slider(ref _lodSettings.LOD1Distance, _lodSettings.LOD0Distance + 1f, 300f, sliderWidth, 14f))
+            _isDirty = true;
+        float priorLod2 = _lodSettings.LOD2Distance;
+        _lodSettings.LOD2Distance = Math.Max(_lodSettings.LOD2Distance, _lodSettings.LOD1Distance + 1f);
+        if (_lodSettings.LOD2Distance != priorLod2) _isDirty = true;
+        rowY += 48;
+
         ui.SetCursor(x, rowY);
         ui.Text($"LOD 2 Distance: {_lodSettings.LOD2Distance:F1}m", new Vector4(0.7f, 0.7f, 0.7f, 1));
-        rowY += 30;
+        ui.SetCursor(x, rowY + 17);
+        if (ui.Slider(ref _lodSettings.LOD2Distance, _lodSettings.LOD1Distance + 1f, 500f, sliderWidth, 14f))
+            _isDirty = true;
+        rowY += 48;
         
         // Preset buttons
         ui.SetCursor(x, rowY);
@@ -1631,7 +1144,7 @@ public class StaticMeshEditor
             new Vector4(0, 0, 0, 0.3f),
             new Vector4(0.9f, 0.9f, 0.9f, 1)))
         {
-            ApplyLODPreset(LODSystem.LODPresets.Low);
+            ApplyLODPreset(LODPresets.Low);
         }
         
         if (ui.ButtonEx(x + 90, rowY, 80, 30, "Medium",
@@ -1641,7 +1154,7 @@ public class StaticMeshEditor
             new Vector4(0, 0, 0, 0.3f),
             new Vector4(0.9f, 0.9f, 0.9f, 1)))
         {
-            ApplyLODPreset(LODSystem.LODPresets.Medium);
+            ApplyLODPreset(LODPresets.Medium);
         }
         
         if (ui.ButtonEx(x + 180, rowY, 80, 30, "High",
@@ -1651,11 +1164,11 @@ public class StaticMeshEditor
             new Vector4(0, 0, 0, 0.3f),
             new Vector4(0.9f, 0.9f, 0.9f, 1)))
         {
-            ApplyLODPreset(LODSystem.LODPresets.High);
+            ApplyLODPreset(LODPresets.High);
         }
     }
     
-    private void RenderCollisionTab(NotBSUI ui, float x, float y, float width, float height)
+    private void RenderCollisionTab(EditorUI ui, float x, float y, float width, float height)
     {
         float rowY = y;
         
@@ -1699,7 +1212,7 @@ public class StaticMeshEditor
         ui.Text($"Complexity: {_collisionComplexity:F2}", new Vector4(0.7f, 0.7f, 0.7f, 1));
     }
     
-    private void RenderInfoTab(NotBSUI ui, float x, float y, float width, float height)
+    private void RenderInfoTab(EditorUI ui, float x, float y, float width, float height)
     {
         float rowY = y;
         
@@ -1714,10 +1227,6 @@ public class StaticMeshEditor
         ui.SetCursor(x, rowY);
         ui.Text($"Triangles: {_triangleCount:N0}", new Vector4(0.8f, 0.8f, 0.8f, 1));
         rowY += 25;
-        
-        ui.SetCursor(x, rowY);
-        ui.Text($"Material Slots: {_materialSlotCount}", new Vector4(0.8f, 0.8f, 0.8f, 1));
-        rowY += 30;
         
         ui.SetCursor(x, rowY);
         ui.Text("Bounding Box:", new Vector4(0.9f, 0.9f, 0.9f, 1));
@@ -1744,7 +1253,7 @@ public class StaticMeshEditor
         ui.Text(System.IO.Path.GetFileName(_assetPath), new Vector4(0.6f, 0.6f, 0.6f, 1));
     }
     
-    private void RenderPreviewPanel(NotBSUI ui, float x, float y, float width, float height)
+    private void RenderPreviewPanel(EditorUI ui, float x, float y, float width, float height)
     {
         ui.RoundedPanel(x, y, width, height, new Vector4(0.1f, 0.1f, 0.12f, 1), 6f);
         
@@ -1760,7 +1269,7 @@ public class StaticMeshEditor
         
         PreviewRect = new Vector4(previewX, previewY, previewW, previewH);
         
-        // Leave the area empty so Program.cs can composite the UltraRenderer Target here
+        // Leave the area empty so Program.cs can composite the BSR render target here
         ui.Panel(previewX, previewY, previewW, previewH, new Vector4(0.05f, 0.05f, 0.07f, 1));
         
         // Stats below preview
@@ -1799,7 +1308,7 @@ public class StaticMeshEditor
     /// <summary>
     /// Apply LOD preset to current settings.
     /// </summary>
-    private void ApplyLODPreset(LODSystem.LODSettings preset)
+    private void ApplyLODPreset(LODSettings preset)
     {
         _lodSettings.LODCount = preset.LODCount;
         _lodSettings.LOD0Distance = preset.LOD0Distance;
@@ -1824,19 +1333,6 @@ public class StaticMeshEditor
         
         try
         {
-            // Update material slots in metadata
-            for (int i = 0; i < 8; i++)
-            {
-                if (i < _materialSlotCount && !string.IsNullOrEmpty(_materialSlots[i]))
-                {
-                    _currentAsset.Metadata[$"materialSlot{i}"] = _materialSlots[i];
-                }
-                else
-                {
-                    _currentAsset.Metadata.Remove($"materialSlot{i}");
-                }
-            }
-            
             // Update LOD settings
             _currentAsset.Metadata["lodCount"] = _lodSettings.LODCount.ToString();
             _currentAsset.Metadata["lod0Distance"] = _lodSettings.LOD0Distance.ToString();
@@ -1857,7 +1353,7 @@ public class StaticMeshEditor
             if (_currentAsset.Save(_assetPath))
             {
                 _isDirty = false;
-                Console.WriteLine($"[StaticMeshEditor] ✓ Saved: {_currentAsset.AssetName}");
+                Console.WriteLine($"[StaticMeshEditor] ✓ Saved: {_currentAsset!.AssetName}");
                 
                 // Remove backup on success
                 if (System.IO.File.Exists(backupPath))
@@ -1883,184 +1379,7 @@ public class StaticMeshEditor
         }
     }
     
-    /// <summary>
-    /// Load all available .blueskyasset materials from project
-    /// </summary>
-    private void LoadAvailableMaterials()
-    {
-        try
-        {
-            string projectDir = ProjectManager.CurrentProjectDir ?? "";
-            string materialsDir = System.IO.Path.Combine(projectDir, "Assets", "Materials");
-            
-            if (System.IO.Directory.Exists(materialsDir))
-            {
-                _availableMaterials = System.IO.Directory.GetFiles(materialsDir, "*.blueskyasset", System.IO.SearchOption.AllDirectories);
-                Console.WriteLine($"[StaticMeshEditor] Found {_availableMaterials.Length} materials");
-            }
-            else
-            {
-                _availableMaterials = Array.Empty<string>();
-                Console.WriteLine("[StaticMeshEditor] Materials directory not found");
-            }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[StaticMeshEditor] Error loading materials: {ex.Message}");
-            _availableMaterials = Array.Empty<string>();
-        }
-    }
     
-    /// <summary>
-    /// Draw material picker overlay
-    /// </summary>
-    private void DrawMaterialPicker(NotBSUI ui, float x, float y, float width, float height)
-    {
-        // Semi-transparent overlay
-        ui.Panel(x, y, width, height, new Vector4(0, 0, 0, 0.7f));
-        
-        // Dialog box
-        float dialogW = 600;
-        float dialogH = 500;
-        float dialogX = x + (width - dialogW) / 2;
-        float dialogY = y + (height - dialogH) / 2;
-        
-        ui.RoundedPanel(dialogX, dialogY, dialogW, dialogH, new Vector4(0.2f, 0.3f, 0.4f, 1), 10f);
-        
-        // Title bar
-        ui.SetCursor(dialogX + 15, dialogY + 12);
-        ui.Text(_assetPickerTitle, Vector4.One);
-        
-        // Close button
-        if (ui.ButtonEx(dialogX + dialogW - 40, dialogY + 8, 30, 24, "X",
-            new Vector4(0.8f, 0.3f, 0.3f, 1),
-            new Vector4(0.9f, 0.4f, 0.4f, 1),
-            new Vector4(0.7f, 0.2f, 0.2f, 1),
-            new Vector4(0, 0, 0, 0.3f),
-            Vector4.One))
-        {
-            _showAssetPicker = false;
-            _assetPickerCallback = null;
-        }
-        
-        // Filter text input
-        ui.SetCursor(dialogX + 15, dialogY + 45);
-        ui.Text("Filter:", new Vector4(0.8f, 0.8f, 0.8f, 1));
-        
-        ui.SetCursor(dialogX + 60, dialogY + 42);
-        var filterResult = ui.TextField(ref _filterText, dialogW - 75, 24);
-        if (filterResult)
-        {
-            // Text changed - filter will be applied below
-        }
-        
-        // Content area with scroll
-        float contentY = dialogY + 75;
-        float contentHeight = dialogH - 90;
-        
-        ui.BeginScrollArea("MaterialPicker", dialogX + 15, contentY, dialogW - 30, contentHeight, _availableMaterials.Length * 35);
-        
-        float itemY = contentY;
-        int itemIndex = 0;
-        
-        foreach (string materialPath in _availableMaterials)
-        {
-            string fileName = System.IO.Path.GetFileNameWithoutExtension(materialPath);
-            
-            // Apply filter
-            if (!string.IsNullOrEmpty(_filterText) && !fileName.Contains(_filterText, StringComparison.OrdinalIgnoreCase))
-            {
-                itemIndex++;
-                continue;
-            }
-            
-            float drawY = itemY + (itemIndex * 35);
-            
-            // Material item
-            if (ui.ButtonEx(dialogX + 15, drawY, dialogW - 30, 30, fileName,
-                new Vector4(0.25f, 0.35f, 0.45f, 1),
-                new Vector4(0.3f, 0.4f, 0.5f, 1),
-                new Vector4(0.2f, 0.3f, 0.4f, 1),
-                new Vector4(0, 0, 0, 0.3f),
-                new Vector4(0.9f, 0.9f, 0.9f, 1)))
-            {
-                _assetPickerCallback?.Invoke(materialPath);
-                _showAssetPicker = false;
-                _assetPickerCallback = null;
-                _filterText = "";
-            }
-            
-            itemIndex++;
-        }
-        
-        ui.EndScrollArea("MaterialPicker");
-    }
-    
-    
-    /// <summary>
-    /// Auto-generate colored materials for all slots in the mesh.
-    /// Creates vibrant distinct colors for easy visualization.
-    /// </summary>
-    private void AutoColorAllSlots(Core.Assets.BlueAsset asset)
-    {
-        if (asset == null || !asset.Metadata.TryGetValue("materialSlots", out var slotsStr)) return;
-        
-        var slotNames = slotsStr.Split(',');
-        
-        // Vibrant color palette
-        var colorPalette = new[]
-        {
-            (1.0f, 0.2f, 0.2f, "Red"),       // Slot 0: Red
-            (0.2f, 0.8f, 0.2f, "Green"),     // Slot 1: Green
-            (0.2f, 0.4f, 1.0f, "Blue"),      // Slot 2: Blue
-            (1.0f, 0.8f, 0.0f, "Yellow"),    // Slot 3: Yellow
-            (1.0f, 0.4f, 0.0f, "Orange"),    // Slot 4: Orange
-            (0.8f, 0.2f, 0.8f, "Magenta"),   // Slot 5: Magenta
-            (0.0f, 0.8f, 0.8f, "Cyan"),      // Slot 6: Cyan
-            (0.9f, 0.9f, 0.9f, "White")      // Slot 7: White
-        };
-        
-        string meshDir = System.IO.Path.GetDirectoryName(_assetPath) ?? "";
-        string materialsDir = System.IO.Path.Combine(meshDir, "Materials");
-        if (!System.IO.Directory.Exists(materialsDir))
-            System.IO.Directory.CreateDirectory(materialsDir);
-        
-        int assignedCount = 0;
-        for (int i = 0; i < slotNames.Length; i++)
-        {
-            var (r, g, b, colorName) = colorPalette[i % colorPalette.Length];
-            
-            string matName = $"AutoColor_{colorName}_Slot{i}";
-            string matPath = System.IO.Path.Combine(materialsDir, $"{matName}.blueskyasset");
-            
-            // Create colored material
-            var coloredMat = new Core.Assets.MaterialAsset
-            {
-                MaterialName = matName,
-                MaterialId = Guid.NewGuid(),
-                Albedo = new Core.Assets.Vector3Data(r, g, b),
-                Metallic = 0.1f,
-                Roughness = 0.6f,
-                AO = 1.0f
-            };
-            
-            if (coloredMat.Save(matPath))
-            {
-                asset.Metadata[$"materialSlot{i}"] = matPath;
-                // Only write to fixed array if within bounds
-                if (i < _materialSlots.Length)
-                    _materialSlots[i] = matPath;
-                assignedCount++;
-            }
-        }
-        
-        asset.Save(_assetPath);
-        _isDirty = true;
-        
-        RefreshPreviewMaterials();
-        
-        Console.WriteLine($"[StaticMeshEditor] ✓ Auto-assigned {assignedCount} colored materials");
-    }
     
     /// <summary>
     /// Update preview rotation and animations (called from main loop).

@@ -2,7 +2,7 @@ using System;
 using System.Runtime.InteropServices;
 using BlueSky.Platform;
 
-namespace NotBSRenderer.Vulkan;
+namespace BlueSky.Rendering.RHI.Vulkan;
 
 /// <summary>
 /// Vulkan swapchain implementation — manages VkSwapchainKHR, swapchain images,

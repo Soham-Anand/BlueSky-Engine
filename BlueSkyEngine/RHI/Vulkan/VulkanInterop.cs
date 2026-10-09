@@ -1,7 +1,7 @@
 using System;
 using System.Runtime.InteropServices;
 
-namespace NotBSRenderer.Vulkan;
+namespace BlueSky.Rendering.RHI.Vulkan;
 
 /// <summary>
 /// Vulkan P/Invoke declarations and function pointer loader.
@@ -125,7 +125,6 @@ internal static unsafe class VulkanInterop
     public const uint VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR = 1000001000;
     public const uint VK_STRUCTURE_TYPE_PRESENT_INFO_KHR = 1000001001;
     public const uint VK_STRUCTURE_TYPE_XLIB_SURFACE_CREATE_INFO_KHR = 1000004000;
-    public const uint VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR = 1000006000;
     public const uint VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR = 1000009000;
     public const uint VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT = 1000217000;
     public const uint VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 = 1000059000;
@@ -395,22 +394,22 @@ internal static unsafe class VulkanInterop
         public IntPtr pEnabledFeatures;
     }
 
-    [StructLayout(LayoutKind.Sequential)]
-    public struct VkPhysicalDeviceProperties
+    // Vulkan's 64-bit VkPhysicalDeviceProperties ABI. We only read the fixed
+    // header and device name, but the complete native size must be present for
+    // vkGetPhysicalDeviceProperties to write safely into this output struct.
+    [StructLayout(LayoutKind.Explicit, Size = 824)]
+    public unsafe struct VkPhysicalDeviceProperties
     {
-        public uint apiVersion;
-        public uint driverVersion;
-        public uint vendorID;
-        public uint deviceID;
-        public uint deviceType; // VkPhysicalDeviceType
-        public fixed byte deviceName[256];
-        public fixed byte pipelineCacheUUID[16];
-        public VkPhysicalDeviceLimits limits;
-        public VkPhysicalDeviceSparseProperties sparseProperties;
+        [FieldOffset(0)] public uint apiVersion;
+        [FieldOffset(4)] public uint driverVersion;
+        [FieldOffset(8)] public uint vendorID;
+        [FieldOffset(12)] public uint deviceID;
+        [FieldOffset(16)] public uint deviceType; // VkPhysicalDeviceType
+        [FieldOffset(20)] public fixed byte deviceName[256];
+        [FieldOffset(276)] public fixed byte pipelineCacheUUID[16];
+        [FieldOffset(296)] public fixed byte limits[504];
+        [FieldOffset(800)] public VkPhysicalDeviceSparseProperties sparseProperties;
     }
-
-    [StructLayout(LayoutKind.Sequential, Size = 504)]
-    public struct VkPhysicalDeviceLimits { }
 
     [StructLayout(LayoutKind.Sequential)]
     public struct VkPhysicalDeviceSparseProperties
@@ -1187,16 +1186,6 @@ internal static unsafe class VulkanInterop
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    public struct VkWaylandSurfaceCreateInfoKHR
-    {
-        public uint sType;
-        public IntPtr pNext;
-        public uint flags;
-        public IntPtr display;
-        public IntPtr surface;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
     public struct VkWin32SurfaceCreateInfoKHR
     {
         public uint sType;
@@ -1568,9 +1557,6 @@ internal static unsafe class VulkanInterop
     public delegate int PFN_vkCreateXlibSurfaceKHR(IntPtr instance, ref VkXlibSurfaceCreateInfoKHR pCreateInfo, IntPtr pAllocator, out IntPtr pSurface);
 
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
-    public delegate int PFN_vkCreateWaylandSurfaceKHR(IntPtr instance, ref VkWaylandSurfaceCreateInfoKHR pCreateInfo, IntPtr pAllocator, out IntPtr pSurface);
-
-    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     public delegate int PFN_vkCreateWin32SurfaceKHR(IntPtr instance, ref VkWin32SurfaceCreateInfoKHR pCreateInfo, IntPtr pAllocator, out IntPtr pSurface);
 
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
@@ -1604,7 +1590,6 @@ internal static unsafe class VulkanInterop
 
     // Platform surface (loaded from instance)
     public static PFN_vkCreateXlibSurfaceKHR? vkCreateXlibSurfaceKHR;
-    public static PFN_vkCreateWaylandSurfaceKHR? vkCreateWaylandSurfaceKHR;
     public static PFN_vkCreateWin32SurfaceKHR? vkCreateWin32SurfaceKHR;
     public static PFN_vkCreateMetalSurfaceEXT? vkCreateMetalSurfaceEXT;
 
@@ -1718,7 +1703,6 @@ internal static unsafe class VulkanInterop
 
         // Platform surface extensions (null if not available)
         vkCreateXlibSurfaceKHR = LoadInstanceFunc<PFN_vkCreateXlibSurfaceKHR>(instance, "vkCreateXlibSurfaceKHR");
-        vkCreateWaylandSurfaceKHR = LoadInstanceFunc<PFN_vkCreateWaylandSurfaceKHR>(instance, "vkCreateWaylandSurfaceKHR");
         vkCreateWin32SurfaceKHR = LoadInstanceFunc<PFN_vkCreateWin32SurfaceKHR>(instance, "vkCreateWin32SurfaceKHR");
         vkCreateMetalSurfaceEXT = LoadInstanceFunc<PFN_vkCreateMetalSurfaceEXT>(instance, "vkCreateMetalSurfaceEXT");
 

@@ -2,7 +2,7 @@ using BlueSky.Core.ECS;
 using BlueSky.Editor.UI;
 using BlueSky.Platform;
 using BlueSky.Platform.Input;
-using NotBSRenderer;
+using BlueSky.Rendering.RHI;
 
 namespace BlueSky.Editor.Services;
 
@@ -16,8 +16,8 @@ public sealed class EditorContext
     public IInputContext? Input { get; internal set; }
     public IRHIDevice? Rhi { get; internal set; }
     public IRHISwapchain? Swapchain { get; internal set; }
-    public NotBSUI? Ui { get; internal set; }
-    public NotBSUIRenderer? UiRenderer { get; internal set; }
+    public EditorUI? Ui { get; internal set; }
+    public EditorUIRenderer? UiRenderer { get; internal set; }
 
     public World? World { get; internal set; }
 

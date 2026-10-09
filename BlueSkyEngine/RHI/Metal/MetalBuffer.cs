@@ -1,6 +1,6 @@
-using static NotBSRenderer.Metal.MetalInterop;
+using static BlueSky.Rendering.RHI.Metal.MetalInterop;
 
-namespace NotBSRenderer.Metal;
+namespace BlueSky.Rendering.RHI.Metal;
 
 internal class MetalBuffer : IRHIBuffer
 {

@@ -135,6 +135,7 @@ public class BlueAsset
             // '{' implies legacy plain JSON asset format
             if (firstByte == '{')
             {
+                if (fs.Length > 100L * 1024 * 1024) return null;
                 var json = File.ReadAllText(path);
                 return JsonSerializer.Deserialize<BlueAsset>(json);
             }
@@ -148,24 +149,28 @@ public class BlueAsset
             }
 
             int formatVersion = reader.ReadInt32(); // Version 1
+            if (formatVersion != 1) return null;
 
             int jsonLen = reader.ReadInt32();
-            if (jsonLen <= 0 || jsonLen > 100 * 1024 * 1024) // Sanity check 100MB string limit
+            if (jsonLen <= 0 || jsonLen > 100 * 1024 * 1024 || jsonLen > fs.Length - fs.Position) // Sanity check 100MB string limit
             {
                 Console.WriteLine($"[BlueAsset] ✗ Invalid JSON metadata size in: {path}");
                 return null;
             }
 
             byte[] jsonBytes = reader.ReadBytes(jsonLen);
+            if (jsonBytes.Length != jsonLen) return null;
             string jsonString = System.Text.Encoding.UTF8.GetString(jsonBytes);
             
             var asset = JsonSerializer.Deserialize<BlueAsset>(jsonString);
             if (asset == null) return null;
 
             int payloadLen = reader.ReadInt32();
+            if (payloadLen < 0 || payloadLen > fs.Length - fs.Position) return null;
             if (payloadLen > 0)
             {
                 asset.PayloadData = reader.ReadBytes(payloadLen);
+                if (asset.PayloadData.Length != payloadLen) return null;
             }
 
             return asset;
@@ -198,6 +203,7 @@ public class BlueAsset
             // '{' implies legacy plain JSON asset format
             if (firstByte == '{')
             {
+                if (fs.Length > 10L * 1024 * 1024) return null;
                 var json = File.ReadAllText(path);
                 return JsonSerializer.Deserialize<BlueAsset>(json);
             }
@@ -208,12 +214,14 @@ public class BlueAsset
                 return null;
 
             int formatVersion = reader.ReadInt32(); // Version 1
+            if (formatVersion != 1) return null;
             int jsonLen = reader.ReadInt32();
             
-            if (jsonLen <= 0 || jsonLen > 10 * 1024 * 1024)
+            if (jsonLen <= 0 || jsonLen > 10 * 1024 * 1024 || jsonLen > fs.Length - fs.Position)
                 return null;
 
             byte[] jsonBytes = reader.ReadBytes(jsonLen);
+            if (jsonBytes.Length != jsonLen) return null;
             string jsonString = System.Text.Encoding.UTF8.GetString(jsonBytes);
             
             return JsonSerializer.Deserialize<BlueAsset>(jsonString);
@@ -255,93 +263,4 @@ public class BlueAsset
             return "";
         }
     }
-}
-
-/// <summary>
-/// Mesh asset data (stored separately from .blueasset metadata).
-/// </summary>
-public class MeshAssetData
-{
-    public List<MeshLOD> LODs { get; set; } = new();
-    public BoundingBox Bounds { get; set; } = new();
-    public int VertexCount { get; set; }
-    public int TriangleCount { get; set; }
-}
-
-public class MeshLOD
-{
-    public int Level { get; set; }
-    public byte[] VertexData { get; set; } = Array.Empty<byte>();
-    public byte[] IndexData { get; set; } = Array.Empty<byte>();
-    public int VertexCount { get; set; }
-    public int IndexCount { get; set; }
-}
-
-public class BoundingBox
-{
-    public float MinX { get; set; }
-    public float MinY { get; set; }
-    public float MinZ { get; set; }
-    public float MaxX { get; set; }
-    public float MaxY { get; set; }
-    public float MaxZ { get; set; }
-}
-
-/// <summary>
-/// Texture asset data.
-/// </summary>
-public class TextureAssetData
-{
-    public int Width { get; set; }
-    public int Height { get; set; }
-    public TextureFormat Format { get; set; }
-    public List<MipLevel> MipLevels { get; set; } = new();
-    public bool HasAlpha { get; set; }
-    public bool IsSRGB { get; set; }
-}
-
-public class MipLevel
-{
-    public int Level { get; set; }
-    public int Width { get; set; }
-    public int Height { get; set; }
-    public byte[] Data { get; set; } = Array.Empty<byte>();
-}
-
-public enum TextureFormat
-{
-    RGBA8,
-    RGB8,
-    RGBA16F,
-    RGBA32F,
-    DXT1,
-    DXT5,
-    BC7
-}
-
-/// <summary>
-/// Material asset data.
-/// </summary>
-public class MaterialAssetData
-{
-    public string ShaderName { get; set; } = "Standard";
-    public Dictionary<string, MaterialParameter> Parameters { get; set; } = new();
-    public Dictionary<string, Guid> Textures { get; set; } = new(); // Texture slot -> Asset ID
-}
-
-public class MaterialParameter
-{
-    public string Name { get; set; } = "";
-    public MaterialParameterType Type { get; set; }
-    public object? Value { get; set; }
-}
-
-public enum MaterialParameterType
-{
-    Float,
-    Vector2,
-    Vector3,
-    Vector4,
-    Color,
-    Texture
 }

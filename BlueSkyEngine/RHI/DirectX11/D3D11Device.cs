@@ -1,20 +1,11 @@
 using BlueSky.Platform;
 using System.Runtime.InteropServices;
 
-namespace NotBSRenderer.DirectX11;
+namespace BlueSky.Rendering.RHI.DirectX11;
 
 /// <summary>
-/// DirectX 11 device implementation with adaptive feature level support.
-/// 
-/// FEATURE LEVEL STRATEGY:
-/// Attempts creation in descending order: 11.1 → 11.0 → 10.1 → 10.0
-/// Each level enables different engine capabilities:
-///   FL 10.0 — Geometry shaders, basic rendering (GeForce 8/Radeon HD 2000, ~2007)
-///   FL 10.1 — Cubemap arrays, extended formats (GeForce GTX 200/Radeon HD 4000, ~2008)  
-///   FL 11.0 — Compute shaders, tessellation, UAVs (GeForce GTX 400/Radeon HD 5000, ~2010)
-///   FL 11.1 — UAVs at all stages, logical blend ops (GeForce GTX 600/Radeon HD 7000, ~2012)
-///
-/// The detected feature level drives ShaderCompatibility and UltraRenderer path selection.
+/// Direct3D 11 raster backend. The native feature level is retained for
+/// diagnostics; engine capabilities only include operations implemented here.
 /// </summary>
 internal class D3D11Device : IRHIDevice
 {
@@ -26,7 +17,6 @@ internal class D3D11Device : IRHIDevice
     
     public RHIBackend Backend => RHIBackend.DirectX11;
     public RHICapabilities Capabilities => _capabilities;
-    public DescriptorBindingMode BindingMode => DescriptorBindingMode.SlotBased;
     
     /// <summary>The hardware feature level detected during device creation.</summary>
     public D3D11FeatureLevel FeatureLevel => _featureLevel;
@@ -39,12 +29,7 @@ internal class D3D11Device : IRHIDevice
 
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
-            Console.WriteLine("[DX11] Not on Windows — device created in placeholder mode");
-            Console.WriteLine("[DX11] All DX11 operations will be no-ops until running on Windows");
-            _featureLevel = D3D11FeatureLevel.Level_11_0;
-            _capabilities = BuildCapabilities(_featureLevel);
-            PrintCapabilityReport();
-            return;
+            throw new PlatformNotSupportedException("Direct3D 11 is available only on Windows.");
         }
 
         InitializeDevice();
@@ -147,17 +132,11 @@ internal class D3D11Device : IRHIDevice
 
     /// <summary>
     /// Build capability flags based on detected feature level.
-    /// This drives adaptive rendering path selection in UltraRenderer.
+    /// This drives adaptive rendering path selection in BSR.
     /// </summary>
     private static RHICapabilities BuildCapabilities(D3D11FeatureLevel level)
     {
-        var caps = RHICapabilities.GeometryShaders | RHICapabilities.IndirectDrawing;
-
-        if (level >= D3D11FeatureLevel.Level_10_1)
-            caps |= RHICapabilities.TessellationShaders;
-
-        if (level >= D3D11FeatureLevel.Level_11_0)
-            caps |= RHICapabilities.ComputeShaders;
+        var caps = RHICapabilities.IndirectDrawing;
 
         return caps;
     }
@@ -166,24 +145,11 @@ internal class D3D11Device : IRHIDevice
     {
         Console.WriteLine("┌──────────────────────────────────────────────┐");
         Console.WriteLine($"│  Feature Level: {_featureLevel,-30}│");
-        Console.WriteLine($"│  Shader Model:  {D3D11ShaderCompatibility.GetShaderModel(_featureLevel),-30}│");
-        Console.WriteLine($"│  Compute Shaders:   {(_capabilities.HasFlag(RHICapabilities.ComputeShaders) ? "✓" : "✗  (CPU fallback)"),-25}│");
-        Console.WriteLine($"│  Tessellation:      {(_capabilities.HasFlag(RHICapabilities.TessellationShaders) ? "✓" : "✗"),-25}│");
-        Console.WriteLine($"│  Geometry Shaders:  {(_capabilities.HasFlag(RHICapabilities.GeometryShaders) ? "✓" : "✗"),-25}│");
+        Console.WriteLine("│  Raster pipeline:   Vertex + pixel shaders      │");
+        Console.WriteLine("│  Compute pipeline:  Not implemented             │");
+        Console.WriteLine("│  Geometry/tessellation stages: Not implemented  │");
         Console.WriteLine($"│  Indirect Drawing:  {(_capabilities.HasFlag(RHICapabilities.IndirectDrawing) ? "✓" : "✗"),-25}│");
-        
-        string path = _featureLevel switch
-        {
-            D3D11FeatureLevel.Level_11_1 => "GPU Compute + Full DX11",
-            D3D11FeatureLevel.Level_11_0 => "GPU Compute Culling",
-            D3D11FeatureLevel.Level_10_1 => "CPU Culling (SM 4.1)",
-            _ => "CPU Culling (Legacy)"
-        };
-        Console.WriteLine($"│  Render Path:       {path,-25}│");
         Console.WriteLine("└──────────────────────────────────────────────┘");
-
-        // Print detailed shader model compatibility
-        D3D11ShaderCompatibility.PrintReport(_featureLevel);
     }
 
     // ── Resource creation ────────────────────────────────────────────────
@@ -215,27 +181,30 @@ internal class D3D11Device : IRHIDevice
 
     public IRHIPipeline CreateGraphicsPipeline(GraphicsPipelineDesc desc)
     {
-        var pipeline = new D3D11Pipeline(desc.DebugName ?? "Pipeline");
+        Console.WriteLine($"[DX11:DEV] CreateGraphicsPipeline '{desc.DebugName}' VS={desc.VertexShader.Bytecode?.Length ?? 0}b PS={desc.FragmentShader.Bytecode?.Length ?? 0}b attrs={desc.VertexLayout.Attributes?.Length ?? 0} bindings={desc.VertexLayout.Bindings?.Length ?? 0} topo={desc.Topology}");
 
         if (_device == IntPtr.Zero)
-        {
-            pipeline.Topology = D3D11Interop.ToD3D11PrimitiveTopology(desc.Topology);
-            return pipeline;
-        }
+            throw new InvalidOperationException("Cannot create a D3D11 pipeline without a valid device.");
+
+        var pipeline = new D3D11Pipeline(desc.DebugName ?? "Pipeline");
 
         // Create vertex shader
         if (desc.VertexShader.Bytecode != null && desc.VertexShader.Bytecode.Length > 0)
         {
             pipeline.VertexShader = CreateVertexShader(desc.VertexShader.Bytecode);
 
-            // Create input layout from vertex shader bytecode + layout desc
-            if (desc.VertexLayout.Attributes != null && desc.VertexLayout.Attributes.Length > 0)
+            // Create input layout only if vertex shader was created successfully
+            if (pipeline.VertexShader != IntPtr.Zero && desc.VertexLayout.Attributes != null && desc.VertexLayout.Attributes.Length > 0)
+            {
                 pipeline.InputLayout = CreateInputLayout(desc.VertexShader.Bytecode, desc.VertexLayout);
+            }
         }
 
         // Create pixel shader
         if (desc.FragmentShader.Bytecode != null && desc.FragmentShader.Bytecode.Length > 0)
+        {
             pipeline.PixelShader = CreatePixelShader(desc.FragmentShader.Bytecode);
+        }
 
         // Create state objects
         pipeline.BlendState = CreateBlendStateObj(desc.BlendState);
@@ -250,15 +219,17 @@ internal class D3D11Device : IRHIDevice
                 pipeline.VertexStrides[i] = desc.VertexLayout.Bindings[i].Stride;
         }
 
+        if (pipeline.VertexShader == IntPtr.Zero || pipeline.PixelShader == IntPtr.Zero)
+        {
+            pipeline.Dispose();
+            throw new InvalidOperationException($"[DX11] Pipeline '{desc.DebugName}' requires valid vertex and pixel shaders.");
+        }
         return pipeline;
     }
 
     public IRHIPipeline CreateComputePipeline(ComputePipelineDesc desc)
     {
-        if (_featureLevel < D3D11FeatureLevel.Level_11_0)
-            throw new NotSupportedException($"[DX11] Compute pipelines require Feature Level 11.0+, current: {_featureLevel}");
-
-        return new D3D11Pipeline(desc.DebugName ?? "ComputePipeline");
+        throw new NotSupportedException("[DX11] Compute pipeline creation is not implemented by this backend.");
     }
 
     // ── Commands ─────────────────────────────────────────────────────────
@@ -275,7 +246,7 @@ internal class D3D11Device : IRHIDevice
 
     public void Submit(IRHICommandBuffer commandBuffer, IRHISwapchain swapchain)
     {
-        swapchain.Present();
+        // Presentation is a separate IRHISwapchain operation for all backends.
     }
 
     public void WaitIdle()
@@ -284,9 +255,11 @@ internal class D3D11Device : IRHIDevice
         if (_deviceContext == IntPtr.Zero) return;
         unsafe
         {
-            // ID3D11DeviceContext::Flush — vtable slot 47
+            // ID3D11DeviceContext::Flush — vtable slot 111
+            // (IUnknown:0-2, ID3D11DeviceChild:3-6, ID3D11DeviceContext starts at 7)
+            // ... ClearState=110, Flush=111, GetType=112, GetContextFlags=113, FinishCommandList=114
             IntPtr vtable = *(IntPtr*)_deviceContext;
-            IntPtr fnPtr = *((IntPtr*)vtable + 47);
+            IntPtr fnPtr = *((IntPtr*)vtable + 111);
             var fn = (delegate* unmanaged[Stdcall]<IntPtr, void>)fnPtr;
             fn(_deviceContext);
         }
@@ -311,12 +284,6 @@ internal class D3D11Device : IRHIDevice
         if (texture is D3D11Texture dx11Tex)
             dx11Tex.UploadData(_deviceContext, data);
     }
-
-    // ── Bindless (not supported on DX11) ─────────────────────────────────
-
-    public BindlessResourceHandle RegisterBindlessTexture(IRHITexture texture) => BindlessResourceHandle.Invalid;
-    public BindlessResourceHandle RegisterBindlessBuffer(IRHIBuffer buffer) => BindlessResourceHandle.Invalid;
-    public void UnregisterBindlessResource(BindlessResourceHandle handle) { }
 
     // ── Internal helpers ─────────────────────────────────────────────────
 
@@ -395,6 +362,14 @@ internal class D3D11Device : IRHIDevice
     private IntPtr CreateVertexShader(byte[] bytecode)
     {
         IntPtr shader = IntPtr.Zero;
+
+        // Validate DXBC magic before calling D3D11
+        if (bytecode.Length < 4 || bytecode[0] != 'D' || bytecode[1] != 'X' || bytecode[2] != 'B' || bytecode[3] != 'C')
+        {
+            Console.WriteLine($"[DX11] CreateVertexShader REJECTED: bytecode is NOT valid DXBC (size={bytecode.Length}, first4=[{bytecode[0]:X2},{bytecode[1]:X2},{bytecode[2]:X2},{bytecode[3]:X2}])");
+            return IntPtr.Zero;
+        }
+
         // ID3D11Device::CreateVertexShader — vtable slot 12
         unsafe
         {
@@ -403,7 +378,12 @@ internal class D3D11Device : IRHIDevice
                 IntPtr vtable = *(IntPtr*)_device;
                 IntPtr fnPtr = *((IntPtr*)vtable + 12);
                 var fn = (delegate* unmanaged[Stdcall]<IntPtr, IntPtr, nuint, IntPtr, out IntPtr, int>)fnPtr;
-                fn(_device, (IntPtr)pCode, (nuint)bytecode.Length, IntPtr.Zero, out shader);
+                int hr = fn(_device, (IntPtr)pCode, (nuint)bytecode.Length, IntPtr.Zero, out shader);
+                if (hr < 0)
+                {
+                    Console.WriteLine($"[DX11] CreateVertexShader failed: HRESULT 0x{hr:X8} (bytecode {bytecode.Length} bytes)");
+                    shader = IntPtr.Zero;
+                }
             }
         }
         return shader;
@@ -412,6 +392,14 @@ internal class D3D11Device : IRHIDevice
     private IntPtr CreatePixelShader(byte[] bytecode)
     {
         IntPtr shader = IntPtr.Zero;
+
+        // Validate DXBC magic before calling D3D11
+        if (bytecode.Length < 4 || bytecode[0] != 'D' || bytecode[1] != 'X' || bytecode[2] != 'B' || bytecode[3] != 'C')
+        {
+            Console.WriteLine($"[DX11] CreatePixelShader REJECTED: bytecode is NOT valid DXBC (size={bytecode.Length}, first4=[{bytecode[0]:X2},{bytecode[1]:X2},{bytecode[2]:X2},{bytecode[3]:X2}])");
+            return IntPtr.Zero;
+        }
+
         // ID3D11Device::CreatePixelShader — vtable slot 15
         unsafe
         {
@@ -420,7 +408,12 @@ internal class D3D11Device : IRHIDevice
                 IntPtr vtable = *(IntPtr*)_device;
                 IntPtr fnPtr = *((IntPtr*)vtable + 15);
                 var fn = (delegate* unmanaged[Stdcall]<IntPtr, IntPtr, nuint, IntPtr, out IntPtr, int>)fnPtr;
-                fn(_device, (IntPtr)pCode, (nuint)bytecode.Length, IntPtr.Zero, out shader);
+                int hr = fn(_device, (IntPtr)pCode, (nuint)bytecode.Length, IntPtr.Zero, out shader);
+                if (hr < 0)
+                {
+                    Console.WriteLine($"[DX11] CreatePixelShader failed: HRESULT 0x{hr:X8} (bytecode {bytecode.Length} bytes)");
+                    shader = IntPtr.Zero;
+                }
             }
         }
         return shader;
@@ -668,16 +661,4 @@ internal class D3D11Device : IRHIDevice
         public uint Flags;
     }
 
-    [StructLayout(LayoutKind.Sequential)]
-    private struct D3D11_INPUT_ELEMENT_DESC
-    {
-        [MarshalAs(UnmanagedType.LPStr)]
-        public string SemanticName;
-        public uint SemanticIndex;
-        public uint Format;
-        public uint InputSlot;
-        public uint AlignedByteOffset;
-        public uint InputSlotClass;
-        public uint InstanceDataStepRate;
-    }
 }

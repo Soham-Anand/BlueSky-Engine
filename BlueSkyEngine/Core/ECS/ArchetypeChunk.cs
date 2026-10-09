@@ -73,10 +73,16 @@ namespace BlueSky.Core.ECS
         {
             if (IsFull)
                 throw new InvalidOperationException("Chunk is full");
-            
-            int row = _count++;
-            _entities[row] = entity;
+
+            if (entity.Id <= 0)
+                throw new ArgumentOutOfRangeException(nameof(entity), "Entity IDs must be positive.");
+
             EnsureEntityToRowCapacity(entity.Id);
+            if (_entityToRow[entity.Id] >= 0)
+                throw new InvalidOperationException($"Entity {entity} is already in this chunk.");
+
+            int row = _count;
+            _entities[row] = entity;
             _entityToRow[entity.Id] = row;
             
             // Zero-initialize components for this row across all arrays
@@ -85,21 +91,24 @@ namespace BlueSky.Core.ECS
                 int offset = _componentOffsets[i] + (row * _componentSizes[i]);
                 _data.AsSpan(offset, _componentSizes[i]).Clear();
             }
-            
+
+            _count++;
             return row;
         }
 
         /// <summary>
         /// Removes an entity from this chunk. The last entity swaps into its place.
+        /// Returns the swapped entity (if any), or default if the removed entity was last.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public void RemoveEntity(Entity entity)
+        public Entity RemoveEntity(Entity entity)
         {
             int row = GetRow(entity);
             if (row < 0 || row >= _count)
                 throw new InvalidOperationException("Entity not in chunk");
             
             int lastRow = --_count;
+            Entity swappedEntity = default;
             
             // If not the last row, swap the last entity into this slot
             if (row != lastRow)
@@ -107,6 +116,7 @@ namespace BlueSky.Core.ECS
                 var lastEntity = _entities[lastRow];
                 _entities[row] = lastEntity;
                 _entityToRow[lastEntity.Id] = row;
+                swappedEntity = lastEntity; // Return the swapped entity so World can update its row index
                 
                 // Copy component data for each type (swap last into current)
                 for (int i = 0; i < _componentSizes.Length; i++)
@@ -119,6 +129,7 @@ namespace BlueSky.Core.ECS
             }
             
             _entityToRow[entity.Id] = -1;
+            return swappedEntity;
         }
 
         /// <summary>
@@ -127,9 +138,11 @@ namespace BlueSky.Core.ECS
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public int GetRow(Entity entity)
         {
-            if (entity.Id >= _entityToRow.Length)
+            if (entity.Id <= 0 || entity.Id >= _entityToRow.Length)
                 return -1;
-            return _entityToRow[entity.Id];
+
+            int row = _entityToRow[entity.Id];
+            return (uint)row < (uint)_count && _entities[row] == entity ? row : -1;
         }
 
         /// <summary>
@@ -141,26 +154,20 @@ namespace BlueSky.Core.ECS
         /// Gets a reference to a component at a specific row.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public unsafe ref T GetComponent<T>(int row, int componentIndex) where T : unmanaged
+        public ref T GetComponent<T>(int row, int componentIndex) where T : unmanaged
         {
             int offset = _componentOffsets[componentIndex] + (row * _componentSizes[componentIndex]);
-            fixed (byte* ptr = &_data[offset])
-            {
-                return ref *(T*)ptr;
-            }
+            return ref Unsafe.As<byte, T>(ref _data[offset]);
         }
 
         /// <summary>
         /// Sets a component value at a specific row.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public unsafe void SetComponent<T>(int row, int componentIndex, T value) where T : unmanaged
+        public void SetComponent<T>(int row, int componentIndex, T value) where T : unmanaged
         {
             int offset = _componentOffsets[componentIndex] + (row * _componentSizes[componentIndex]);
-            fixed (byte* ptr = &_data[offset])
-            {
-                *(T*)ptr = value;
-            }
+            Unsafe.As<byte, T>(ref _data[offset]) = value;
         }
 
         /// <summary>
@@ -187,13 +194,11 @@ namespace BlueSky.Core.ECS
         /// Returns a span of all components of a specific type in this chunk.
         /// Provides cache-friendly contiguous iteration for SIMD.
         /// </summary>
-        public unsafe Span<T> GetComponentSpan<T>(int componentIndex) where T : unmanaged
+        public Span<T> GetComponentSpan<T>(int componentIndex) where T : unmanaged
         {
             int offset = _componentOffsets[componentIndex];
-            fixed (byte* ptr = _data)
-            {
-                return new Span<T>(ptr + offset, _count);
-            }
+            int sizeInBytes = _componentSizes[componentIndex] * _count;
+            return MemoryMarshal.Cast<byte, T>(_data.AsSpan(offset, sizeInBytes));
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
@@ -201,10 +206,10 @@ namespace BlueSky.Core.ECS
         {
             if (entityId >= _entityToRow.Length)
             {
+                int oldSize = _entityToRow.Length;
                 int newSize = System.Math.Max(entityId + 1, _entityToRow.Length * 2);
                 Array.Resize(ref _entityToRow, newSize);
-                for (int i = _entityToRow.Length / 2; i < _entityToRow.Length; i++)
-                    _entityToRow[i] = -1;
+                Array.Fill(_entityToRow, -1, oldSize, newSize - oldSize);
             }
         }
     }

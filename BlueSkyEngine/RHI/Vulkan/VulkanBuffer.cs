@@ -1,6 +1,6 @@
 using System;
 
-namespace NotBSRenderer.Vulkan;
+namespace BlueSky.Rendering.RHI.Vulkan;
 
 /// <summary>
 /// Vulkan buffer implementation wrapping VkBuffer + VkDeviceMemory.

@@ -1,4 +1,4 @@
-namespace NotBSRenderer;
+namespace BlueSky.Rendering.RHI;
 
 internal sealed class ValidationTexture : IRHITexture, IRHIWrapped<IRHITexture>
 {

@@ -1,6 +1,6 @@
 using System.Numerics;
 
-namespace NotBSRenderer;
+namespace BlueSky.Rendering.RHI;
 
 public struct BufferDesc
 {
@@ -74,6 +74,28 @@ public struct BlendState
         ColorOp = BlendOp.Add,
         SrcAlphaFactor = BlendFactor.One,
         DstAlphaFactor = BlendFactor.OneMinusSrcAlpha,
+        AlphaOp = BlendOp.Add
+    };
+    
+    public static BlendState Additive => new()
+    {
+        BlendEnabled = true,
+        SrcColorFactor = BlendFactor.SrcAlpha,
+        DstColorFactor = BlendFactor.One,
+        ColorOp = BlendOp.Add,
+        SrcAlphaFactor = BlendFactor.SrcAlpha,
+        DstAlphaFactor = BlendFactor.One,
+        AlphaOp = BlendOp.Add
+    };
+    
+    public static BlendState Multiply => new()
+    {
+        BlendEnabled = true,
+        SrcColorFactor = BlendFactor.Zero,
+        DstColorFactor = BlendFactor.SrcColor,
+        ColorOp = BlendOp.Add,
+        SrcAlphaFactor = BlendFactor.Zero,
+        DstAlphaFactor = BlendFactor.One,
         AlphaOp = BlendOp.Add
     };
 }
@@ -180,29 +202,6 @@ public struct ClearValue
     {
         LoadInsteadOfClear = true
     };
-}
-
-/// <summary>
-/// Descriptor for bindless resource handle
-/// </summary>
-public struct BindlessResourceHandle
-{
-    public uint Index;
-    public uint Generation;
-    
-    public bool IsValid => Index != uint.MaxValue;
-    
-    public static BindlessResourceHandle Invalid => new() { Index = uint.MaxValue, Generation = 0 };
-}
-
-/// <summary>
-/// Dispatch parameters for compute shaders
-/// </summary>
-public struct ComputeDispatchDesc
-{
-    public uint GroupCountX;
-    public uint GroupCountY;
-    public uint GroupCountZ;
 }
 
 /// <summary>

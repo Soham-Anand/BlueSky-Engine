@@ -1,6 +1,6 @@
 using System.Runtime.InteropServices;
 
-namespace NotBSRenderer.DirectX11;
+namespace BlueSky.Rendering.RHI.DirectX11;
 
 /// <summary>
 /// DirectX 11 swapchain wrapping IDXGISwapChain.

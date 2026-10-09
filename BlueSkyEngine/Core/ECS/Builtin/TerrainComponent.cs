@@ -25,7 +25,7 @@ public unsafe struct TerrainComponent
     public uint MeshHandle;     // Handle to generated mesh (0 = none)
     public int ChunkSize;       // Quads per chunk edge. 32 is the HD 3000 default.
     public int LodCount;        // 1-3. Default: full, half, quarter.
-    public int MaterialMode;    // 0=simple 2-layer, 1=4-layer data stored for later high quality.
+    public int SurfaceMode;    // 0=simple 2-layer, 1=4-layer data stored for later high quality.
     public bool CollisionEnabled;
 
     public string TerrainAssetPath
@@ -45,7 +45,7 @@ public unsafe struct TerrainComponent
         MeshHandle = 0;
         ChunkSize = 32;
         LodCount = 3;
-        MaterialMode = 0;
+        SurfaceMode = 0;
         CollisionEnabled = true;
     }
 
@@ -80,7 +80,7 @@ public enum BrushMode
     Erase
 }
 
-public enum TerrainMaterialMode
+public enum TerrainSurfaceMode
 {
     SimpleTwoLayer = 0,
     FourLayer = 1

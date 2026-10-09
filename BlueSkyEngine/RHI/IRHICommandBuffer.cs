@@ -1,6 +1,6 @@
 using System.Numerics;
 
-namespace NotBSRenderer;
+namespace BlueSky.Rendering.RHI;
 
 public interface IRHICommandBuffer : IDisposable
 {
@@ -21,9 +21,6 @@ public interface IRHICommandBuffer : IDisposable
     void SetTexture(IRHITexture texture, uint binding, uint set = 0);
     void SetStorageBuffer(IRHIBuffer buffer, uint binding, uint set = 0);
     void SetStorageTexture(IRHITexture texture, uint binding, uint set = 0);
-    
-    // Bindless resource binding (only available if device supports bindless)
-    void SetBindlessResourceTable(uint set, ReadOnlySpan<BindlessResourceHandle> handles);
     
     // Uniforms (Direct constants for DX9 / Small buffers for Metal)
     void SetVertexUniforms(uint binding, ReadOnlySpan<byte> data);

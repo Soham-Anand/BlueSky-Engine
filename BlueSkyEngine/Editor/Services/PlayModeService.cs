@@ -2,7 +2,7 @@ using System;
 using BlueSky.Core.ECS;
 using BlueSky.Core.ECS.Builtin;
 using BlueSky.Core.Scene;
-using BlueSky.Physics;
+using BlueSky.Airborne;
 using BlueSky.Rendering;
 
 namespace BlueSky.Editor.Services;
@@ -24,6 +24,10 @@ public sealed class PlayModeService
         if (IsPlaying)
             return;
 
+        // The visualizer is opt-in for each play session. Otherwise a stale
+        // editor toggle can draw projected labels over the viewport.
+        BlueSky.Runtime.PhysicsDebugVisualizer.SetEnabled(false);
+
         Snapshot = new SceneSnapshot();
         Snapshot.Capture(world);
 
@@ -32,22 +36,9 @@ public sealed class PlayModeService
 
         if (PhysicsWorld == null)
         {
-            try
-            {
-                log("Attempting to initialize Jolt Physics...");
-                var jolt = new JoltPhysicsWorld();
-                jolt.Initialize();
-                PhysicsWorld = jolt;
-                log("Using Jolt Physics");
-            }
-            catch (Exception ex)
-            {
-                log($"Jolt Physics initialization failed: {ex.Message}. Falling back to Builtin Physics.");
-                var builtin = new BuiltinPhysicsWorld();
-                builtin.Initialize();
-                PhysicsWorld = builtin;
-                log("Using Builtin Physics");
-            }
+            var modularWorld = new VehicleWorldPhysics(preferJolt: true);
+            PhysicsWorld = modularWorld;
+            log(modularWorld.UsingJolt ? "Using Jolt Physics" : "Using Builtin Physics fallback");
         }
 
         PhysicsTeaScriptBridge.Initialize(PhysicsWorld);
@@ -55,8 +46,7 @@ public sealed class PlayModeService
         RegisterTerrains(world, terrainSystem);
         // Populate physics bodies from ECS
         var physicsQuery = world.CreateQuery()
-            .All<RigidbodyComponent>()
-            .All<ColliderComponent>()
+            .All<PhysicsComponent>()
             .All<TransformComponent>()
             .Build();
 
@@ -64,21 +54,44 @@ public sealed class PlayModeService
         foreach (var chunk in chunks)
         {
             var entities = chunk.GetEntities();
-            int rbIdx = chunk.GetComponentIndex(typeof(RigidbodyComponent));
-            int colIdx = chunk.GetComponentIndex(typeof(ColliderComponent));
+            int physIdx = chunk.GetComponentIndex(typeof(PhysicsComponent));
             int transIdx = chunk.GetComponentIndex(typeof(TransformComponent));
 
             for (int i = 0; i < chunk.Count; i++)
             {
                 var entity = entities[i];
-                var rb = chunk.GetComponent<RigidbodyComponent>(i, rbIdx);
-                var col = chunk.GetComponent<ColliderComponent>(i, colIdx);
+                var phys = chunk.GetComponent<PhysicsComponent>(i, physIdx);
                 var trans = chunk.GetComponent<TransformComponent>(i, transIdx);
 
-                var pos = new System.Numerics.Vector3(trans.Position.X, trans.Position.Y, trans.Position.Z);
-                var rot = new System.Numerics.Quaternion(trans.Rotation.X, trans.Rotation.Y, trans.Rotation.Z, trans.Rotation.W);
+                // NaN guard: if transform has NaN values, use safe defaults
+                var pos = new System.Numerics.Vector3(
+                    float.IsNaN(trans.Position.X) || float.IsInfinity(trans.Position.X) ? 0f : trans.Position.X,
+                    float.IsNaN(trans.Position.Y) || float.IsInfinity(trans.Position.Y) ? 0f : trans.Position.Y,
+                    float.IsNaN(trans.Position.Z) || float.IsInfinity(trans.Position.Z) ? 0f : trans.Position.Z);
+                var rot = new System.Numerics.Quaternion(
+                    float.IsNaN(trans.Rotation.X) || float.IsInfinity(trans.Rotation.X) ? 0f : trans.Rotation.X,
+                    float.IsNaN(trans.Rotation.Y) || float.IsInfinity(trans.Rotation.Y) ? 0f : trans.Rotation.Y,
+                    float.IsNaN(trans.Rotation.Z) || float.IsInfinity(trans.Rotation.Z) ? 0f : trans.Rotation.Z,
+                    float.IsNaN(trans.Rotation.W) || float.IsInfinity(trans.Rotation.W) ? 1f : trans.Rotation.W);
 
-                PhysicsWorld.AddBody(entity, rb, col, pos, rot);
+                if (pos != new System.Numerics.Vector3(trans.Position.X, trans.Position.Y, trans.Position.Z))
+                    Console.WriteLine($"[PlayMode] WARNING: Entity {entity.Id} had NaN position, reset to origin");
+
+                // Mass guard: ensure mass is never zero (would cause InverseMass = Infinity → NaN)
+                if (phys.Mass < 0.001f)
+                {
+                    phys.Mass = 1.0f;
+                    Console.WriteLine($"[PlayMode] WARNING: Entity {entity.Id} had zero mass, reset to 1.0");
+                }
+
+                try
+                {
+                    PhysicsWorld.AddBody(entity, phys, pos, rot);
+                }
+                catch (Exception ex)
+                {
+                    log($"Physics body registration failed for entity {entity.Id}: {ex.Message}");
+                }
             }
         }
 
@@ -144,6 +157,7 @@ public sealed class PlayModeService
 
         IsPlaying = false;
         IsPaused = false;
+        BlueSky.Runtime.PhysicsDebugVisualizer.SetEnabled(false);
 
         // ── Clean up car controller system (resets IsInitialized, clears state) ──
         log("Cleaning up car controller system...");

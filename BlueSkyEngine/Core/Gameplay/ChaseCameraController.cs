@@ -90,9 +90,9 @@ namespace BlueSky.Core.Gameplay
             }
 
             // Elastic tracking using a smooth spring-like Lerp. 
-            // 7.5f for position and 10f for target gives that perfect elastic NFS feel without jarring jitter.
-            _smoothPosition = Vector3.Lerp(_smoothPosition, idealPosition, deltaTime * 7.5f);
-            _smoothTarget = Vector3.Lerp(_smoothTarget, targetLookAt, deltaTime * 10.0f);
+            // 12f for position and 15f for target — snappy response, still smooth.
+            _smoothPosition = Vector3.Lerp(_smoothPosition, idealPosition, deltaTime * 12f);
+            _smoothTarget = Vector3.Lerp(_smoothTarget, targetLookAt, deltaTime * 15f);
 
             // Impact camera shake (retained and tuned)
             Vector3 velocityChange = carVelocity - _lastVelocity;

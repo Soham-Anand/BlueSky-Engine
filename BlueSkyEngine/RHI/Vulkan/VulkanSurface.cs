@@ -3,11 +3,11 @@ using BlueSky.Platform;
 using BlueSky.Platform.Linux;
 using BlueSky.Platform.Windows;
 
-namespace NotBSRenderer.Vulkan;
+namespace BlueSky.Rendering.RHI.Vulkan;
 
 /// <summary>
 /// Creates a VkSurfaceKHR from a platform-specific window handle.
-/// Supports X11, Wayland, Win32, and Metal (MoltenVK) surfaces.
+/// Supports X11, Win32, and Metal (MoltenVK) surfaces.
 /// </summary>
 internal static class VulkanSurface
 {
@@ -15,9 +15,6 @@ internal static class VulkanSurface
     {
         if (window is X11Window x11)
             return CreateX11Surface(instance, x11);
-
-        if (window is WaylandWindow wayland)
-            return CreateWaylandSurface(instance, wayland);
 
         if (window is Win32Window win32)
             return CreateWin32Surface(instance, win32);
@@ -47,26 +44,6 @@ internal static class VulkanSurface
             "vkCreateXlibSurfaceKHR");
 
         Console.WriteLine("[Vulkan] X11 surface created");
-        return surface;
-    }
-
-    private static IntPtr CreateWaylandSurface(IntPtr instance, WaylandWindow window)
-    {
-        if (VulkanInterop.vkCreateWaylandSurfaceKHR == null)
-            throw new InvalidOperationException("VK_KHR_wayland_surface extension not available");
-
-        var createInfo = new VulkanInterop.VkWaylandSurfaceCreateInfoKHR
-        {
-            sType = VulkanInterop.VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR,
-            display = window.GetWaylandDisplay(),
-            surface = window.GetNativeHandle()
-        };
-
-        VulkanInterop.VkCheck(
-            VulkanInterop.vkCreateWaylandSurfaceKHR(instance, ref createInfo, IntPtr.Zero, out var surface),
-            "vkCreateWaylandSurfaceKHR");
-
-        Console.WriteLine("[Vulkan] Wayland surface created");
         return surface;
     }
 
@@ -120,19 +97,8 @@ internal static class VulkanSurface
 
         if (OperatingSystem.IsLinux())
         {
-            // Request both — we'll use whichever matches the window type
-            if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WAYLAND_DISPLAY")))
-                extensions.Add("VK_KHR_wayland_surface");
-
             if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("DISPLAY")))
                 extensions.Add("VK_KHR_xlib_surface");
-
-            // If neither is detected yet, add both as a safety net
-            if (extensions.Count == 1)
-            {
-                extensions.Add("VK_KHR_xlib_surface");
-                extensions.Add("VK_KHR_wayland_surface");
-            }
         }
         else if (OperatingSystem.IsWindows())
         {

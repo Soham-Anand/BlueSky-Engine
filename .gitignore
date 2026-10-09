@@ -1,7 +1,51 @@
-.aider*
-graphify/
+# ==========================================
+# BlueSky Engine .gitignore
+# ==========================================
+
+# .NET & Build Directories
 bin/
 obj/
 *.user
 *.suo
 .vs/
+.vscode/
+*.cache
+*.deps.json
+*.runtimeconfig.json
+
+# Compiled Assemblies & Executables
+*.dll
+*.exe
+*.pdb
+*.nupkg
+
+# Compiled Shaders (Metal, Vulkan, DirectX, GLSL)
+*.metallib
+*.air
+*.spv
+*.cso
+*.fxc
+*.dxc
+*.glsl.bin
+
+# Native Libraries & Object Files
+*.dylib
+*.so
+*.a
+*.lib
+*.o
+*.obj
+
+# Logs, Diagnostics & Temp Files
+*.log
+.DS_Store
+Thumbs.db
+.aider*
+graphify/
+
+# Third-party SDKs (Epic Online Services SDK - Do Not Redistribute)
+ThirdParty/
+ThirdParty/EOSSDK/
+
+# Oversize car pack (121MB, over the 100MB host limit) - kept locally, not versioned
+Porsche.stratapack

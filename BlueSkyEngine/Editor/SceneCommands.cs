@@ -11,7 +11,7 @@ using BlueSky.Core.Math;
 using BlueSky.Rendering;
 using BlueSky.Core.Scripting;
 using BlueSky.Core.Scene;
-using NotBSRenderer;
+using BlueSky.Rendering.RHI;
 
 namespace BlueSky.Editor;
 
@@ -50,7 +50,7 @@ partial class Program
             {
                 // Fallback: use cross-platform NativeFilePicker
                 var file = NativeFilePicker.OpenFile("Import Asset", 
-                    "3D Models|*.obj;*.fbx;*.gltf;*.glb|Images|*.png;*.jpg;*.jpeg;*.bmp;*.tga|All Files|*.*");
+                    "StrataPack|*.stratapack|3D Models|*.obj;*.fbx;*.gltf;*.glb|Images|*.png;*.jpg;*.jpeg;*.bmp;*.tga|All Files|*.*");
                 if (!string.IsNullOrEmpty(file))
                 {
                     HandleFilesDropped(new[] { file });
@@ -75,7 +75,7 @@ partial class Program
             }
 
             // Filter for mesh files that need import dialog
-            string[] meshExtensions = { ".obj", ".fbx", ".gltf", ".glb" };
+            string[] meshExtensions = { ".obj", ".fbx", ".gltf", ".glb", ".stratapack" };
             var meshFiles = files.Where(f => meshExtensions.Contains(Path.GetExtension(f).ToLower())).ToArray();
             
             if (meshFiles.Length > 0)
@@ -134,7 +134,8 @@ partial class Program
             f.EndsWith(".obj", StringComparison.OrdinalIgnoreCase) ||
             f.EndsWith(".fbx", StringComparison.OrdinalIgnoreCase) ||
             f.EndsWith(".gltf", StringComparison.OrdinalIgnoreCase) ||
-            f.EndsWith(".glb", StringComparison.OrdinalIgnoreCase)).ToArray();
+            f.EndsWith(".glb", StringComparison.OrdinalIgnoreCase) ||
+            f.EndsWith(".stratapack", StringComparison.OrdinalIgnoreCase)).ToArray();
 
         if (_pendingImportFiles.Length == 0)
         {
@@ -142,17 +143,16 @@ partial class Program
             return;
         }
 
-        _importMeshPreviewNames = _pendingImportFiles.Select(Path.GetFileNameWithoutExtension).ToArray();
+        _importMeshPreviewNames = _pendingImportFiles.Select(p => Path.GetFileNameWithoutExtension(p) ?? "").ToArray();
         _importSelectedMeshIndex = 0;
         _importScale = 1.0f;
         _importGenerateCollider = true;
-        _importImportMaterials = true;
         _showImportDialog = true;
 
         Log($"Import dialog opened for {_pendingImportFiles.Length} file(s)");
     }
 
-    private static void DrawImportDialog(NotBSUI ui, float windowW, float windowH)
+    private static void DrawImportDialog(EditorUI ui, float windowW, float windowH)
     {
         if (!_showImportDialog || _pendingImportFiles.Length == 0) return;
 
@@ -267,21 +267,6 @@ partial class Program
         ui.Text("Generate Collider", textNormal);
         contentY += 32;
 
-        // Import Materials
-        uint matCheckId = 10005;
-        var matCheckBg = _importImportMaterials ? accentBlue : new System.Numerics.Vector4(0.15f, 0.16f, 0.18f, 1f);
-        if (ui.ButtonEx(dx + 16, contentY, 22, 22, _importImportMaterials ? "✓" : "",
-            matCheckBg,
-            new System.Numerics.Vector4(0.30f, 0.60f, 1.0f, 1f),
-            new System.Numerics.Vector4(0.20f, 0.50f, 0.90f, 1f),
-            new System.Numerics.Vector4(0, 0, 0, 0.3f),
-            textTitle, matCheckId))
-        {
-            _importImportMaterials = !_importImportMaterials;
-        }
-        ui.SetCursor(dx + 44, contentY + 3);
-        ui.Text("Import Materials", textNormal);
-
         // Action buttons at bottom
         float btnY = dy + dialogH - 45;
 
@@ -315,7 +300,7 @@ partial class Program
 
     private static string FindProjectRoot(string path)
     {
-        string dir = Path.GetDirectoryName(path);
+        string? dir = Path.GetDirectoryName(path);
         while (!string.IsNullOrEmpty(dir))
         {
             // Check for .BlueSkyProj project files (the actual engine project format)
@@ -352,8 +337,7 @@ partial class Program
                 Settings = new Dictionary<string, object>
                 {
                     ["scale"] = _importScale,
-                    ["generateCollider"] = _importGenerateCollider,
-                    ["importMaterials"] = _importImportMaterials
+                    ["generateCollider"] = _importGenerateCollider
                 }
             };
 
@@ -367,7 +351,6 @@ partial class Program
                     {
                         string options = "";
                         if (_importGenerateCollider) options += " +Collider";
-                        if (_importImportMaterials) options += " +Materials";
 
                         Log($"✓ Imported: {asset.AssetName} → {asset.AssetName}.blueskyasset (scale: {_importScale:F2}x{options})");
                         
@@ -397,7 +380,7 @@ partial class Program
         _pendingImportFiles = Array.Empty<string>();
     }
 
-    private static void SpawnDraggedAsset(string assetPath)
+    internal static void SpawnDraggedAsset(string assetPath)
     {
         if (_world == null) return;
         
@@ -512,6 +495,8 @@ partial class Program
                 ScriptAssetId = assetPath,
                 IsEnabled = true,
                 IsInitialized = false,
+                AllowRuntimeUI = false,
+                BlockRuntimeInput = false,
                 RuntimeInstance = 0
             };
             
@@ -519,6 +504,8 @@ partial class Program
             {
                 // Update existing
                 ref var existing = ref _world.GetComponent<TeaScriptComponent>(targetEntity);
+                scriptComponent.AllowRuntimeUI = existing.AllowRuntimeUI;
+                scriptComponent.BlockRuntimeInput = existing.BlockRuntimeInput;
                 existing = scriptComponent;
                 Log($"✓ Updated TeaScript on Entity_{targetEntity.Id}: {Path.GetFileName(assetPath)}");
             }
@@ -532,25 +519,7 @@ partial class Program
             return;
         }
         
-        // Handle material assets — assign to selected entity
-        if (ext == ".blueskyasset")
-        {
-            var matHeader = BlueSky.Core.Assets.BlueAsset.LoadHeader(assetPath);
-            if (matHeader != null && matHeader.Type == BlueSky.Core.Assets.AssetType.Material)
-            {
-                if (_selectedEntityId > 0 && _selectedEntityId < 200)
-                {
-                    AssignMaterialToSelected(assetPath);
-                }
-                else
-                {
-                    Log("⚠ Select an entity first to assign a material");
-                }
-                return;
-            }
-        }
-
-        // Handle mesh assets
+        // Handle mesh assets (geometry only — material system removed)
         var header = BlueSky.Core.Assets.BlueAsset.LoadHeader(assetPath);
         if (header != null && (header.Type == BlueSky.Core.Assets.AssetType.StaticMesh || header.Type == BlueSky.Core.Assets.AssetType.SkeletalMesh))
         {
@@ -564,78 +533,24 @@ partial class Program
             };
             _world.AddComponent(entity, transform);
 
-            // Auto-assign materials from metadata (critical for multi-material meshes)
-            int assignedSlots = 0;
-            // Scan for ALL material slots — GLTF indices can be sparse (0, 1, 12, 46...)
-            // and often exceed the total number of submeshes.
-            int maxSlotToScan = 64; // Fallback
-            if (header.Metadata.TryGetValue("materialSlotCount", out var slotCountStr)
-                && int.TryParse(slotCountStr, out int declaredCount))
-            {
-                maxSlotToScan = Math.Max(maxSlotToScan, declaredCount);
-            }
-
+            // Spawn meshes without materials (geometry only)
             if (header.Type == BlueSky.Core.Assets.AssetType.SkeletalMesh)
             {
                 var skeletalMesh = new BlueSky.Core.ECS.Builtin.SkeletalMeshComponent(assetPath);
-                var renderFallbackMesh = new BlueSky.Core.ECS.Builtin.StaticMeshComponent
-                {
-                    MeshAssetId = assetPath,
-                    MaterialAssetId = ""
-                };
-
-                for (int i = 0; i < maxSlotToScan; i++)
-                {
-                    if (header.Metadata.TryGetValue($"materialSlot{i}", out var matPath)
-                        && !string.IsNullOrEmpty(matPath))
-                    {
-                        // Inline slots are capped; higher slots remain in asset metadata.
-                        if (i < 8)
-                            skeletalMesh.SetMaterialSlot(i, matPath);
-                        if (i < 8)
-                            renderFallbackMesh.SetMaterialSlot(i, matPath);
-                        assignedSlots++;
-                    }
-                }
 
                 _world.AddComponent(entity, skeletalMesh);
-                if (header.Metadata.TryGetValue("format", out var format) && format == "Packed32")
-                {
-                    _world.AddComponent(entity, renderFallbackMesh);
-                    Log($"  → Added StaticMesh render fallback until skeletal rendering is wired");
-                }
                 Log($"  → Added SkeletalMesh component for {Path.GetFileName(assetPath)}");
             }
             else
             {
                 var staticMesh = new BlueSky.Core.ECS.Builtin.StaticMeshComponent
                 {
-                    MeshAssetId = assetPath,
-                    MaterialAssetId = ""
+                    MeshAssetId = assetPath
                 };
-
-                for (int i = 0; i < maxSlotToScan; i++)
-                {
-                    if (header.Metadata.TryGetValue($"materialSlot{i}", out var matPath)
-                        && !string.IsNullOrEmpty(matPath))
-                    {
-                        // StaticMeshComponent only stores 8 slots in fixed arrays.
-                        // For slots >= 8 the path is stored in the asset metadata and
-                        // resolved at render time via the asset file directly.
-                        if (i < 8)
-                            staticMesh.SetMaterialSlot(i, matPath);
-                        assignedSlots++;
-                    }
-                }
 
                 _world.AddComponent(entity, staticMesh);
             }
 
-            if (assignedSlots > 0)
-            {
-                Log($"  → Auto-assigned {assignedSlots} material slot(s) from asset metadata");
-            }
-            
             Log($"✓ Spawned {header.AssetName} at {transform.Position.X},{transform.Position.Y},{transform.Position.Z}");
         }
         else
@@ -644,129 +559,110 @@ partial class Program
         }
     }
     
-    private static void AssignMaterialToSelected(string materialPath)
-    {
-        if (_world == null || _selectedEntityId == 0 || _selectedEntityId >= 200) return;
-
-        var entity = _world.GetAllEntities().FirstOrDefault(e => e.Id == _selectedEntityId);
-        if (entity.Id == 0) return;
-
-        if (!_world.TryGetComponent<BlueSky.Core.ECS.Builtin.StaticMeshComponent>(entity, out _))
-        {
-            // Auto-add a StaticMeshComponent if the entity doesn't have one yet
-            var newMesh = new BlueSky.Core.ECS.Builtin.StaticMeshComponent { MaterialAssetId = materialPath };
-            _world.AddComponent(entity, newMesh);
-        }
-        else
-        {
-            ref var mesh = ref _world.GetComponent<BlueSky.Core.ECS.Builtin.StaticMeshComponent>(entity);
-            mesh.MaterialAssetId = materialPath;
-        }
-
-        if (string.IsNullOrEmpty(materialPath))
-            Log($"✓ Cleared material on Entity_{entity.Id}");
-        else
-            Log($"✓ Assigned {Path.GetFileNameWithoutExtension(materialPath)} → Entity_{entity.Id}");
-    }
-    
-    /// <summary>
-    /// Auto-generate colored materials for each slot of the selected entity's mesh.
-    /// Useful for visualizing multi-material meshes (like cars with body/glass/interior).
-    /// </summary>
-    private static void AutoColorMaterialSlots()
-    {
-        if (_world == null || _selectedEntityId == 0 || _selectedEntityId >= 200)
-        {
-            Log("⚠ Select an entity with a mesh first");
-            return;
-        }
-
-        var entity = _world.GetAllEntities().FirstOrDefault(e => e.Id == _selectedEntityId);
-        if (entity.Id == 0 || !_world.TryGetComponent<BlueSky.Core.ECS.Builtin.StaticMeshComponent>(entity, out var meshComp))
-        {
-            Log("⚠ Selected entity has no mesh component");
-            return;
-        }
-
-        if (string.IsNullOrEmpty(meshComp.MeshAssetId))
-        {
-            Log("⚠ No mesh assigned to entity");
-            return;
-        }
-
-        // Load mesh asset to get submesh count
-        var meshAsset = BlueSky.Core.Assets.BlueAsset.Load(meshComp.MeshAssetId);
-        if (meshAsset == null || !meshAsset.Metadata.TryGetValue("submeshCount", out var submeshCountStr))
-        {
-            Log("⚠ Could not read submesh count from mesh asset");
-            return;
-        }
-
-        if (!int.TryParse(submeshCountStr, out int submeshCount) || submeshCount == 0)
-        {
-            Log("⚠ Mesh has no submeshes");
-            return;
-        }
-
-        // Predefined color palette for material slots (vibrant colors for easy distinction)
-        var colorPalette = new[]
-        {
-            (1.0f, 0.2f, 0.2f, "Red"),       // Slot 0: Red
-            (0.2f, 0.8f, 0.2f, "Green"),     // Slot 1: Green
-            (0.2f, 0.4f, 1.0f, "Blue"),      // Slot 2: Blue
-            (1.0f, 0.8f, 0.0f, "Yellow"),    // Slot 3: Yellow
-            (1.0f, 0.4f, 0.0f, "Orange"),    // Slot 4: Orange
-            (0.8f, 0.2f, 0.8f, "Magenta"),   // Slot 5: Magenta
-            (0.0f, 0.8f, 0.8f, "Cyan"),      // Slot 6: Cyan
-            (0.9f, 0.9f, 0.9f, "White")      // Slot 7: White
-        };
-
-        string meshDir = Path.GetDirectoryName(meshComp.MeshAssetId) ?? "";
-        string materialsDir = Path.Combine(meshDir, "Materials");
-        if (!Directory.Exists(materialsDir))
-            Directory.CreateDirectory(materialsDir);
-
-        int assignedCount = 0;
-        for (int i = 0; i < Math.Min(submeshCount, 8); i++)
-        {
-            var (r, g, b, colorName) = colorPalette[i % colorPalette.Length];
-            
-            string matName = $"AutoColor_{colorName}_Slot{i}";
-            string matPath = Path.Combine(materialsDir, $"{matName}.blueskyasset");
-
-            // Create colored material
-            var coloredMat = new BlueSky.Core.Assets.MaterialAsset
-            {
-                MaterialName = matName,
-                MaterialId = Guid.NewGuid(),
-                Albedo = new BlueSky.Core.Assets.Vector3Data(r, g, b),
-                Metallic = 0.1f,
-                Roughness = 0.6f,
-                AO = 1.0f
-            };
-
-            if (coloredMat.Save(matPath))
-            {
-                meshComp.SetMaterialSlot(i, matPath);
-                assignedCount++;
-            }
-        }
-
-        // Update component in ECS
-        _world.AddComponent(entity, meshComp);
-
-        Log($"✓ Auto-assigned {assignedCount} colored materials to Entity_{entity.Id}");
-        Log($"  → Materials saved to: {materialsDir}");
-    }
-
     // ═══════════════════════════════════════════════════════════════════════
     //  CONTEXT MENU
     // ═══════════════════════════════════════════════════════════════════════
     
-    private static void DrawContextMenu(NotBSUI ui, float x, float y)
+    // ── Outliner Context Menu State ─────────────────────────────────────
+    private static bool _showOutlinerContextMenu;
+    private static float _outlinerContextMenuX;
+    private static float _outlinerContextMenuY;
+
+    private static void DrawOutlinerContextMenu(EditorUI ui, float x, float y)
+    {
+        float menuW = 200;
+        float menuH = 60; // One item: Pack to Prefab
+        float itemH = 28;
+
+        // Background
+        ui.Shadow(x, y, menuW, menuH, 4, 6, 0.4f);
+        ui.Panel(x, y, menuW, menuH, EditorTheme.Bg2);
+        ui.Panel(x, y, menuW, 1, EditorTheme.Border1);
+        ui.Panel(x, y + menuH - 1, menuW, 1, EditorTheme.Border1);
+        ui.Panel(x, y, 1, menuH, EditorTheme.Border1);
+        ui.Panel(x + menuW - 1, y, 1, menuH, EditorTheme.Border1);
+
+        float itemY = y + 4;
+
+        // Pack to Prefab
+        uint menuId = 9200;
+        bool hasSelection = _selectedEntityId > 0 && _selectedEntityId < 200;
+        var itemBg = hasSelection ? EditorTheme.Bg2 : EditorTheme.Bg3;
+        var itemText = hasSelection ? EditorTheme.TextPrimary : EditorTheme.TextDisabled;
+
+        if (ui.ClickableCard(x + 4, itemY, menuW - 8, itemH, menuId,
+            itemBg,
+            hasSelection ? EditorTheme.HoverBg : itemBg,
+            hasSelection ? EditorTheme.SelectionBg : itemBg))
+        {
+            if (hasSelection)
+            {
+                PackEntityToPrefab();
+            }
+            _showOutlinerContextMenu = false;
+        }
+        ui.SetCursor(x + 12, itemY + 8);
+        ui.Text("📦 Pack to Prefab", itemText);
+
+        // Close menu if clicked outside
+        if (_input!.IsMouseButtonDown(MouseButton.Left))
+        {
+            if (!ui.IsHovering(x, y, menuW, menuH))
+            {
+                _showOutlinerContextMenu = false;
+            }
+        }
+    }
+
+    private static void PackEntityToPrefab()
+    {
+        if (_world == null || _selectedEntityId == 0 || _selectedEntityId >= 200) return;
+
+        if (!_world.TryResolveEntity(_selectedEntityId, out var entity))
+        {
+            Log($"⚠️ Entity_{_selectedEntityId} not found");
+            return;
+        }
+
+        // Create a single-entity scene data from this entity
+        var sceneData = SceneConverter.WorldToSceneDataForEntity(_world, entity, "Prefab");
+        if (sceneData == null)
+        {
+            Log($"⚠️ Failed to create prefab data for Entity_{entity.Id}");
+            return;
+        }
+
+        // Auto-generate prefab path in Assets directory
+        // (Native save dialog can't work while the editor window captures the macOS event loop)
+        string assetsDir = ProjectManager.AssetsDir ?? Path.Combine(ProjectManager.CurrentProjectDir ?? "", "Assets");
+        string baseName = $"Entity_{entity.Id}_Prefab";
+        string fileName = baseName;
+        int counter = 1;
+        string savePath = Path.Combine(assetsDir, $"{fileName}.bseprefab");
+
+        // Find a unique filename
+        while (File.Exists(savePath))
+        {
+            fileName = $"{baseName}_{counter}";
+            savePath = Path.Combine(assetsDir, $"{fileName}.bseprefab");
+            counter++;
+        }
+
+        try
+        {
+            SceneSerializer.SaveScene(sceneData, savePath);
+            Log($"✓ Prefab saved: {Path.GetFileName(savePath)} (in Assets/)");
+        }
+        catch (Exception ex)
+        {
+            Log($"❌ Failed to save prefab: {ex.Message}");
+        }
+    }
+
+    private static void DrawContextMenu(EditorUI ui, float x, float y)
     {
         float menuW = 180;
-        float menuH = 160;
+        float menuH = 190;
         float itemH = 28;
         
         // Background
@@ -821,8 +717,9 @@ partial class Program
                 EditorTheme.SelectionBg))
             {
                 // Find selected file/folder
-                var dirs = Directory.GetDirectories(_currentBrowserDir);
-                var files = Directory.GetFiles(_currentBrowserDir);
+                var listing = Assets.GetContentBrowserListing(_currentBrowserDir);
+                var dirs = listing?.Directories ?? Array.Empty<string>();
+                var files = listing?.Files ?? Array.Empty<string>();
                 
                 int folderCount = dirs.Length;
                 if (_selectedAssetIndex >= 5000 && _selectedAssetIndex < 5000 + folderCount)
@@ -871,6 +768,7 @@ partial class Program
             EditorTheme.HoverBg,
             EditorTheme.SelectionBg))
         {
+            Assets.RefreshContentBrowserListing();
             Log("Refreshed content browser");
             _showContextMenu = false;
         }
@@ -947,11 +845,6 @@ partial class Program
         Log($"Opened script: {_editingScriptName}");
     }
 
-    public static void OpenMaterialEditor(string materialPath)
-    {
-        _materialEditor.Open(materialPath);
-    }
-    
     public static BlueSky.Editor.ViewportRenderer? GetMainViewport()
     {
         return _editorViewportRenderer;
@@ -976,58 +869,45 @@ partial class Program
             Log("✗ Viewport not initialized");
             return;
         }
+
+        if (_rhi is null)
+        {
+            Log("✗ RHI not initialized");
+            return;
+        }
         
         _staticMeshEditor.Open(assetPath, _world, _viewport, _rhi);
         Log($"Opened static mesh editor: {Path.GetFileName(assetPath)}");
     }
 
-    private static void CreateNewMaterial()
+    private static void OpenSkeletalMeshEditor(string assetPath)
     {
-        // Create a new MaterialAsset with default values
-        var newMaterial = new Core.Assets.MaterialAsset
+        if (_skeletalMeshEditor == null)
         {
-            MaterialId = Guid.NewGuid(),
-            MaterialName = "NewMaterial",
-            MaterialType = Core.Assets.MaterialType.PBR,
-            Shader = "pbr_optimized",
-            Albedo = new Core.Assets.Vector3Data(1.0f, 1.0f, 1.0f),
-            Metallic = 0.0f,
-            Roughness = 0.5f,
-            Emission = new Core.Assets.Vector3Data(0.0f, 0.0f, 0.0f),
-            Opacity = 1.0f,
-            NormalStrength = 1.0f
-        };
-
-        // Generate a unique filename
-        string assetsDir = ProjectManager.AssetsDir ?? "Assets";
-        string baseName = "NewMaterial";
-        string fileName = baseName;
-        int counter = 1;
-
-        while (File.Exists(Path.Combine(assetsDir, fileName + ".blueskyasset")))
+            Log("✗ Skeletal Mesh Editor not initialized");
+            return;
+        }
+        if (_world == null)
         {
-            fileName = $"{baseName}_{counter}";
-            counter++;
+            Log("✗ World not initialized");
+            return;
+        }
+        if (_viewport == null)
+        {
+            Log("✗ Viewport not initialized");
+            return;
+        }
+        if (_rhi is null)
+        {
+            Log("✗ RHI not initialized");
+            return;
         }
 
-        string filePath = Path.Combine(assetsDir, fileName + ".blueskyasset");
-        newMaterial.MaterialName = fileName;
-
-        try
-        {
-            newMaterial.Save(filePath);
-            Log($"✓ Created new material: {fileName}");
-            
-            // Open it in the Material Editor
-            OpenMaterialEditor(filePath);
-        }
-        catch (Exception ex)
-        {
-            Log($"✗ Failed to create material: {ex.Message}");
-        }
+        _skeletalMeshEditor.Open(assetPath, _world, _viewport, _rhi);
+        Log($"Opened skeletal mesh editor: {Path.GetFileName(assetPath)}");
     }
 
-    private static void DrawScriptEditor(NotBSUI ui, float screenW, float screenH)
+    private static void DrawScriptEditor(EditorUI ui, float screenW, float screenH)
     {
         float editorW = 800;
         float editorH = 600;
@@ -1265,7 +1145,7 @@ partial class Program
     //  RENAME DIALOG
     // ═══════════════════════════════════════════════════════════════════════
     
-    private static void DrawRenameDialog(NotBSUI ui, float screenW, float screenH)
+    private static void DrawRenameDialog(EditorUI ui, float screenW, float screenH)
     {
         float dialogW = 400;
         float dialogH = 150;
@@ -1370,8 +1250,9 @@ partial class Program
         
         try
         {
-            var dirs = Directory.GetDirectories(_currentBrowserDir);
-            var files = Directory.GetFiles(_currentBrowserDir);
+            var listing = Assets.GetContentBrowserListing(_currentBrowserDir);
+            var dirs = listing?.Directories ?? Array.Empty<string>();
+            var files = listing?.Files ?? Array.Empty<string>();
             
             int folderCount = dirs.Length;
             
@@ -1425,17 +1306,63 @@ partial class Program
 
         try
         {
+            // Auto-save terrain assets before scene serialization
+            AutoSaveTerrainAssets();
+            
             _terrainSystem?.SaveAllTerrainAssets();
             var sceneData = BlueSky.Core.Scene.SceneConverter.WorldToSceneData(_world, Path.GetFileNameWithoutExtension(_currentScenePath));
             BlueSky.Core.Scene.SceneSerializer.SaveScene(sceneData, _currentScenePath);
             _sceneDirty = false;
-            Console.WriteLine($"[Editor] Scene saved: {_currentScenePath}");
-            _notificationSystem?.ShowSuccess("Scene saved!");
+            
+            var fileName = Path.GetFileName(_currentScenePath);
+            Console.WriteLine($"[Editor] ✓ Scene saved: {fileName}");
+            _notificationSystem?.ShowSuccess($"Saved: {fileName}");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[Editor] Failed to save scene: {ex.Message}");
-            _notificationSystem?.ShowError($"Failed to save: {ex.Message}");
+            Console.WriteLine($"[Editor] ❌ Failed to save scene: {ex.Message}");
+            _notificationSystem?.ShowError($"Save failed: {ex.Message}");
+        }
+    }
+
+    private static void AutoSaveTerrainAssets()
+    {
+        if (_world == null) return;
+
+        // Query all terrain entities
+        var terrainQuery = _world.CreateQuery()
+            .All<TerrainComponent>()
+            .Build();
+
+        var chunks = _world.GetQueryChunks(terrainQuery);
+
+        foreach (var chunk in chunks)
+        {
+            var entities = chunk.GetEntities();
+            int terrainIndex = chunk.GetComponentIndex(typeof(TerrainComponent));
+
+            for (int i = 0; i < chunk.Count; i++)
+            {
+                ref var terrain = ref chunk.GetComponent<TerrainComponent>(i, terrainIndex);
+                
+                // If TerrainAssetPath is empty, auto-generate one
+                if (string.IsNullOrEmpty(terrain.TerrainAssetPath))
+                {
+                    var projectPath = ProjectManager.CurrentProjectDir;
+                    if (string.IsNullOrEmpty(projectPath))
+                        continue;
+
+                    var terrainsDir = Path.Combine(projectPath, "Terrains");
+                    Directory.CreateDirectory(terrainsDir);
+
+                    var terrainName = $"Terrain_{entities[i].Id}_{DateTime.Now:yyyyMMdd_HHmmss}";
+                    var terrainPath = Path.Combine(terrainsDir, $"{terrainName}.bsterrain");
+                    
+                    terrain.TerrainAssetPath = terrainPath;
+                    
+                    Console.WriteLine($"[Editor] Auto-generated terrain path: {terrainPath}");
+                }
+            }
         }
     }
 
@@ -1443,16 +1370,22 @@ partial class Program
     {
         if (_world == null) return;
 
-        // For now, save to a default location in the project
         var projectPath = ProjectManager.CurrentProjectDir;
-        if (string.IsNullOrEmpty(projectPath)) return;
+        if (string.IsNullOrEmpty(projectPath))
+        {
+            _notificationSystem?.ShowError("No project loaded");
+            return;
+        }
 
         var scenesDir = Path.Combine(projectPath, "Scenes");
         Directory.CreateDirectory(scenesDir);
 
-        var sceneName = $"Scene_{DateTime.Now:yyyyMMdd_HHmmss}.blueskyscene";
-        _currentScenePath = Path.Combine(scenesDir, sceneName);
+        var selectedPath = NativeFilePicker.SaveFile(
+            "Save BlueSky Scene", scenesDir, "blueskyscene", "BlueSky Scene");
+        if (string.IsNullOrWhiteSpace(selectedPath))
+            return;
 
+        _currentScenePath = Path.GetFullPath(selectedPath);
         SaveScene();
     }
 
@@ -1460,32 +1393,72 @@ partial class Program
     {
         if (_world == null) return;
 
-        // For now, load the most recent scene from the Scenes directory
+        if (_sceneDirty)
+        {
+            SaveScene();
+            if (_sceneDirty) return;
+        }
+
         var projectPath = ProjectManager.CurrentProjectDir;
-        if (string.IsNullOrEmpty(projectPath)) return;
+        if (string.IsNullOrEmpty(projectPath))
+        {
+            _notificationSystem?.ShowError("No project loaded");
+            return;
+        }
 
         var scenesDir = Path.Combine(projectPath, "Scenes");
         if (!Directory.Exists(scenesDir))
         {
-            _notificationSystem?.ShowWarning("No scenes found");
+            _notificationSystem?.ShowWarning("No Scenes folder found");
+            Directory.CreateDirectory(scenesDir);
             return;
         }
 
         var sceneFiles = Directory.GetFiles(scenesDir, "*.blueskyscene");
         if (sceneFiles.Length == 0)
         {
-            _notificationSystem?.ShowWarning("No scenes found");
+            _notificationSystem?.ShowInfo("No scenes found - create one first!");
             return;
         }
 
-        // Load the most recent scene
-        var mostRecent = sceneFiles.OrderByDescending(File.GetLastWriteTime).First();
-        LoadSceneFromPath(mostRecent);
+        // Use CocoaWindow's native file dialog if available
+        if (_window is BlueSky.Platform.macOS.CocoaWindow cocoaWindow)
+        {
+            var selectedFiles = cocoaWindow.ShowOpenFileDialog();
+            if (selectedFiles != null && selectedFiles.Length > 0)
+            {
+                var selectedPath = selectedFiles[0];
+                
+                // Verify it's a .blueskyscene file
+                if (selectedPath.EndsWith(".blueskyscene", StringComparison.OrdinalIgnoreCase))
+                {
+                    LoadSceneFromPath(selectedPath);
+                }
+                else
+                {
+                    _notificationSystem?.ShowError("Invalid file type - must be .blueskyscene");
+                }
+            }
+        }
+        else
+        {
+            // Fallback: Load most recent scene
+            var mostRecent = sceneFiles.OrderByDescending(File.GetLastWriteTime).First();
+            var fileName = Path.GetFileName(mostRecent);
+            LoadSceneFromPath(mostRecent);
+            _notificationSystem?.ShowInfo($"Loaded most recent: {fileName}");
+        }
     }
 
     private static void LoadSceneFromPath(string path)
     {
         if (_world == null) return;
+
+        if (_sceneDirty)
+        {
+            SaveScene();
+            if (_sceneDirty) return;
+        }
 
         try
         {
@@ -1520,7 +1493,11 @@ partial class Program
     {
         if (_world == null) return;
 
-        // TODO: Prompt to save if dirty
+        if (_sceneDirty)
+        {
+            SaveScene();
+            if (_sceneDirty) return;
+        }
 
         // Clear the world
         var allQuery = _world.CreateQuery().Build();

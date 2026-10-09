@@ -1,61 +1,37 @@
-// BlueSky Engine - RHI Enumerations
-// 
-// ARCHITECTURAL DECISION: DirectX 11 Feature Levels (No DX9/DX10)
-// ================================================================
-// BlueSky Engine uses DX11 with feature levels as the minimum DirectX requirement.
-// This provides modern rendering capabilities while maintaining broad hardware compatibility.
-//
-// Feature Level Support:
-// - Level 10.0: Minimum (Shader Model 4.0, Geometry Shaders, Indirect Drawing)
-// - Level 10.1: Enhanced (Tessellation, Cubemap Arrays)
-// - Level 11.0: Full DX11 (Compute Shaders, UAVs, Multi-Draw Indirect)
-// - Level 11.1: Enhanced DX11 (UAVs at all stages, Logical Blend Ops)
-//
-// Rendering Path Selection:
-// - DX11 FL 10.x → CPU-based light culling, reduced clusters
-// - DX11 FL 11.0+ → GPU compute-based light culling, full clusters
-// - DX12/Vulkan/Metal → Bindless resources, async compute, full modern features
-//
-// This approach eliminates legacy DX9 complexity while ensuring compatibility with
-// hardware from ~2008 onwards (GeForce 8/9 series, Radeon HD 2000/3000 series).
+// RHI backend and resource format enumerations.
 
-namespace NotBSRenderer;
+namespace BlueSky.Rendering.RHI;
 
 public enum RHIBackend
 {
     Metal,
     DirectX11,
-    DirectX12,
-    Vulkan,
-    OpenGL
+    Vulkan
 }
 
-/// <summary>
-/// DirectX 11 feature levels for hardware capability detection
-/// Replaces legacy DX9/DX10 with modern feature-level based approach
-/// </summary>
+/// <summary>Direct3D feature levels reported by the native device.</summary>
 public enum D3D11FeatureLevel
 {
     /// <summary>
-    /// Feature Level 10.0 - Minimum for BlueSky Engine
+    /// Feature Level 10.0
     /// Shader Model 4.0, Geometry Shaders, Stream Output
     /// </summary>
     Level_10_0,
     
     /// <summary>
-    /// Feature Level 10.1 - Enhanced DX10
+    /// Feature Level 10.1
     /// Cubemap arrays, extended formats
     /// </summary>
     Level_10_1,
     
     /// <summary>
-    /// Feature Level 11.0 - Full DX11
+    /// Feature Level 11.0
     /// Shader Model 5.0, Compute Shaders, Tessellation, UAVs
     /// </summary>
     Level_11_0,
     
     /// <summary>
-    /// Feature Level 11.1 - Enhanced DX11
+    /// Feature Level 11.1
     /// Logical blend operations, UAVs at all stages
     /// </summary>
     Level_11_1
@@ -199,7 +175,6 @@ public enum RHICapabilities
 {
     None = 0,
     ComputeShaders = 1 << 0,
-    BindlessResources = 1 << 1,
     RayTracing = 1 << 2,
     MeshShaders = 1 << 3,
     VariableRateShading = 1 << 4,
@@ -208,20 +183,4 @@ public enum RHICapabilities
     MultiDrawIndirect = 1 << 7,
     GeometryShaders = 1 << 8,
     TessellationShaders = 1 << 9
-}
-
-/// <summary>
-/// Descriptor binding mode for resource management
-/// </summary>
-public enum DescriptorBindingMode
-{
-    /// <summary>
-    /// Traditional slot-based binding (DX11 Feature Level 10.x/11.0)
-    /// </summary>
-    SlotBased,
-    
-    /// <summary>
-    /// Bindless resources via descriptor indexing (Vulkan/Metal/DX12)
-    /// </summary>
-    Bindless
 }

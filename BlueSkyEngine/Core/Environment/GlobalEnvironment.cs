@@ -13,5 +13,7 @@ namespace BlueSky.Core.WorldEnvironment
         
         public static Vector3 SunDirection = Vector3.Normalize(new Vector3(0.5f, 0.6f, 0.3f));
         public static Vector3 SunColor = new Vector3(1.0f, 0.95f, 0.8f);
+        // Sky preset: 0 = day, 1 = studio. Lerped palettes, recaptured SH.
+        public static float SkyPreset;
     }
 }

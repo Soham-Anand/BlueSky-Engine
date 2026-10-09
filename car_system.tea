@@ -1,0 +1,46 @@
+// BlueSky Engine - Simple Car System (FRESH START)
+// Let's get the basics working first, then add features
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STATE
+// ═══════════════════════════════════════════════════════════════════════════
+
+let elapsedTime = 0.0
+
+// ═══════════════════════════════════════════════════════════════════════════
+// UPDATE (Called every frame)
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn update() {
+    let dt = getDeltaTime()
+    elapsedTime = elapsedTime + dt
+    
+    // Get car position and velocity
+    let posX = getPositionX()
+    let posY = getPositionY()
+    let posZ = getPositionZ()
+    let velX = getVelocityX()
+    let velY = getVelocityY()
+    let velZ = getVelocityZ()
+    
+    // Calculate speed
+    let speedMPS = sqrt(velX * velX + velY * velY + velZ * velZ)
+    let speedKMH = speedMPS * 3.6
+    
+    // Check wheel grounding every second
+    if (elapsedTime > 1.0) {
+        let w0 = getWheelGrounded(0)
+        let w1 = getWheelGrounded(1)
+        let w2 = getWheelGrounded(2)
+        let w3 = getWheelGrounded(3)
+        log("Wheels: FL=" + w0 + " FR=" + w1 + " RL=" + w2 + " RR=" + w3 + " | Speed=" + speedKMH + " km/h | Y=" + posY)
+        elapsedTime = 0.0
+    }
+    
+    // Simple HUD
+    uiPanel(10.0, 10.0, 280.0, 120.0, "TopLeft", 0.05, 0.05, 0.08, 0.8)
+    uiText("BlueSky Sports Car", 20.0, 20.0, "TopLeft", 1.0, 0.75, 0.0, 1.0)
+    uiText("Speed: " + speedKMH + " km/h", 20.0, 45.0, "TopLeft", 1.0, 1.0, 1.0, 1.0)
+    uiText("Position Y: " + posY, 20.0, 70.0, "TopLeft", 0.7, 0.7, 0.7, 1.0)
+    uiText("Press WASD to drive", 20.0, 95.0, "TopLeft", 0.5, 0.8, 1.0, 1.0)
+}

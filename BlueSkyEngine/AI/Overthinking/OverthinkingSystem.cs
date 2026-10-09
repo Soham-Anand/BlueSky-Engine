@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using BlueSky.Core.ECS;
-using BlueSky.Core.ECS.Builtin;
 
 namespace BlueSky.AI.Overthinking;
 
@@ -42,21 +41,4 @@ public class OverthinkingSystem : SystemBase
     }
     
     public IEnumerable<AIBrain> GetAllBrains() => _brains.Values;
-}
-
-/// <summary>
-/// Component to mark entities as AI-controlled
-/// </summary>
-public struct AIComponent
-{
-    public bool IsEnabled;
-    public float ThinkInterval; // How often to update (0 = every frame)
-    public float TimeSinceLastThink;
-    
-    public AIComponent()
-    {
-        IsEnabled = true;
-        ThinkInterval = 0f;
-        TimeSinceLastThink = 0f;
-    }
 }

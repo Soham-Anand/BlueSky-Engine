@@ -66,32 +66,6 @@ public class TeaScriptAsset
     }
     
     /// <summary>
-    /// Load from asset ID (stub for now - would integrate with asset database).
-    /// </summary>
-    public static TeaScriptAsset LoadFromAsset(string assetId)
-    {
-        // TODO: Integrate with actual asset database
-        // For now, return a simple test script
-        return new TeaScriptAsset
-        {
-            AssetId = assetId,
-            AssetName = "TestScript",
-            SourceCode = @"
-let counter = 0
-
-fn start() {
-    log(""Script started!"")
-}
-
-fn update() {
-    counter = counter + 1
-}
-",
-            LastModified = DateTime.UtcNow
-        };
-    }
-    
-    /// <summary>
     /// Generate a default script template.
     /// </summary>
     private static string GenerateDefaultScript(string name)

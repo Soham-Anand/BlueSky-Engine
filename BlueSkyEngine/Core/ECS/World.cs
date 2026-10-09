@@ -24,7 +24,6 @@ namespace BlueSky.Core.ECS
         private readonly Dictionary<ArchetypeId, Archetype> _archetypesById = new();
         
         // Query caching
-        private int _nextQueryId = 1;
         private readonly Dictionary<QueryDescription, Query> _queries = new();
         private readonly Dictionary<int, Query> _queriesById = new();
         
@@ -38,7 +37,7 @@ namespace BlueSky.Core.ECS
         internal class Archetype
         {
             public ArchetypeId Id;
-            public ArchetypeType Type;
+            public ArchetypeType Type = new();
             public List<ArchetypeChunk> Chunks = new();
             public ArchetypeChunk? LastChunk => Chunks.Count > 0 ? Chunks[^1] : null;
         }
@@ -103,7 +102,14 @@ namespace BlueSky.Core.ECS
             // Remove from current archetype
             if (_entityLocations.TryGetValue(entity, out var chunk))
             {
-                chunk.RemoveEntity(entity);
+                int removedRow = chunk.GetRow(entity);
+                Entity swappedEntity = chunk.RemoveEntity(entity);
+                
+                // CRITICAL FIX: Update World's row index for the swapped entity
+                if (swappedEntity.Id != 0) // default Entity has Id = 0
+                {
+                    _entityRowIndices[swappedEntity] = removedRow;
+                }
                 
                 // Remove empty chunks
                 if (chunk.IsEmpty && chunk.Archetype.ComponentCount > 0)
@@ -121,16 +127,40 @@ namespace BlueSky.Core.ECS
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public bool IsEntityValid(Entity entity)
         {
-            return _entityGenerations.TryGetValue(entity.Id, out var gen) && gen == entity.Generation;
+            return entity.Id > 0 &&
+                   _entityGenerations.TryGetValue(entity.Id, out var gen) &&
+                   gen == entity.Generation &&
+                   _entityLocations.ContainsKey(entity);
         }
 
         public IEnumerable<Entity> GetAllEntities()
         {
-            foreach (var kvp in _entityLocations)
+            // Callers often destroy or move entities while processing this list.
+            // Snapshot the keys so structural changes cannot invalidate a live
+            // Dictionary enumerator.
+            var snapshot = _entityLocations.Keys.ToArray();
+            return snapshot.Where(IsEntityValid);
+        }
+
+        /// <summary>
+        /// Allocation-free resolve of an entity by numeric id (editor selection path).
+        /// Iterates live keys without ToArray; returns false when missing/invalid.
+        /// Callers that need per-frame selection must use this instead of
+        /// GetAllEntities().FirstOrDefault(e => e.Id == id), which allocates
+        /// a full snapshot + LINQ closure on every call.
+        /// </summary>
+        public bool TryResolveEntity(uint id, out Entity entity)
+        {
+            foreach (var key in _entityLocations.Keys)
             {
-                if (IsEntityValid(kvp.Key))
-                    yield return kvp.Key;
+                if (key.Id == (int)id && IsEntityValid(key))
+                {
+                    entity = key;
+                    return true;
+                }
             }
+            entity = default;
+            return false;
         }
 
         #endregion
@@ -304,18 +334,10 @@ namespace BlueSky.Core.ECS
         public void ForEach<T>(Action<Entity, T> action) where T : unmanaged
         {
             var query = new QueryBuilder().All<T>().Build();
-            var chunks = GetQueryChunks(query);
-            
-            foreach (var chunk in chunks)
+            foreach (var entity in SnapshotQueryEntities(query))
             {
-                int compIndex = chunk.GetComponentIndex(typeof(T));
-                var entities = chunk.GetEntities();
-                
-                for (int i = 0; i < chunk.Count; i++)
-                {
-                    T comp = chunk.GetComponent<T>(i, compIndex);
-                    action(entities[i], comp);
-                }
+                if (TryGetComponent<T>(entity, out var component))
+                    action(entity, component);
             }
         }
 
@@ -329,20 +351,11 @@ namespace BlueSky.Core.ECS
             queryBuilder.All<T1>();
             queryBuilder.All<T2>();
             var query = queryBuilder.Build();
-            var chunks = GetQueryChunks(query);
-            
-            foreach (var chunk in chunks)
+            foreach (var entity in SnapshotQueryEntities(query))
             {
-                int c1 = chunk.GetComponentIndex(typeof(T1));
-                int c2 = chunk.GetComponentIndex(typeof(T2));
-                var entities = chunk.GetEntities();
-                
-                for (int i = 0; i < chunk.Count; i++)
-                {
-                    T1 comp1 = chunk.GetComponent<T1>(i, c1);
-                    T2 comp2 = chunk.GetComponent<T2>(i, c2);
-                    action(entities[i], comp1, comp2);
-                }
+                if (TryGetComponent<T1>(entity, out var component1) &&
+                    TryGetComponent<T2>(entity, out var component2))
+                    action(entity, component1, component2);
             }
         }
 
@@ -357,23 +370,21 @@ namespace BlueSky.Core.ECS
             queryBuilder.All<T2>();
             queryBuilder.All<T3>();
             var query = queryBuilder.Build();
-            var chunks = GetQueryChunks(query);
-            
-            foreach (var chunk in chunks)
+            foreach (var entity in SnapshotQueryEntities(query))
             {
-                int c1 = chunk.GetComponentIndex(typeof(T1));
-                int c2 = chunk.GetComponentIndex(typeof(T2));
-                int c3 = chunk.GetComponentIndex(typeof(T3));
-                var entities = chunk.GetEntities();
-                
-                for (int i = 0; i < chunk.Count; i++)
-                {
-                    T1 comp1 = chunk.GetComponent<T1>(i, c1);
-                    T2 comp2 = chunk.GetComponent<T2>(i, c2);
-                    T3 comp3 = chunk.GetComponent<T3>(i, c3);
-                    action(entities[i], comp1, comp2, comp3);
-                }
+                if (TryGetComponent<T1>(entity, out var component1) &&
+                    TryGetComponent<T2>(entity, out var component2) &&
+                    TryGetComponent<T3>(entity, out var component3))
+                    action(entity, component1, component2, component3);
             }
+        }
+
+        private Entity[] SnapshotQueryEntities(QueryDescription query)
+        {
+            var entities = new List<Entity>();
+            foreach (var chunk in GetQueryChunks(query))
+                entities.AddRange(chunk.GetEntities().ToArray());
+            return entities.ToArray();
         }
 
         #endregion
@@ -382,6 +393,9 @@ namespace BlueSky.Core.ECS
 
         public void AddSystem(SystemBase system)
         {
+            if (_systems.Contains(system))
+                return;
+
             system.Initialize(this);
             _systems.Add(system);
         }
@@ -393,9 +407,12 @@ namespace BlueSky.Core.ECS
 
         public void Update(float deltaTime)
         {
-            foreach (var system in _systems)
+            // Systems can add or remove systems while updating. Iterate a copy
+            // so lifecycle changes do not invalidate the active enumeration.
+            foreach (var system in _systems.ToArray())
             {
-                system.Update(deltaTime);
+                if (_systems.Contains(system))
+                    system.Update(deltaTime);
             }
         }
 
@@ -464,8 +481,15 @@ namespace BlueSky.Core.ECS
                 }
             }
             
-            // Remove from source
-            sourceChunk.RemoveEntity(entity);
+            // Remove from source and handle swapped entity
+            Entity swappedEntity = sourceChunk.RemoveEntity(entity);
+            
+            // CRITICAL FIX: Update World's row index for the swapped entity
+            if (swappedEntity.Id != 0) // default Entity has Id = 0
+            {
+                _entityRowIndices[swappedEntity] = sourceRow;
+            }
+            
             if (sourceChunk.IsEmpty && source.Type.ComponentCount > 0)
             {
                 source.Chunks.Remove(sourceChunk);

@@ -1,0 +1,61 @@
+// BlueSky Engine - NFS-style car setup
+// FIXED: Setup runs ONCE in start(), not every frame
+
+let logTimer = 0.0
+
+fn start() {
+    // ═══════════════════════════════════════════════════════════════════
+    // ONE-TIME SETUP (runs once when entity spawns)
+    // ═══════════════════════════════════════════════════════════════════
+    
+    setWheelPosition(0, -0.86, -0.34, 1.48)
+    setWheelPosition(1, 0.86, -0.34, 1.48)
+    setWheelPosition(2, -0.86, -0.34, -1.42)
+    setWheelPosition(3, 0.86, -0.34, -1.42)
+
+    setDriveWheels(false, false, true, true)
+    setSteerWheels(true, true, false, false)
+
+    setWheelBone(0, "FR_mesh")
+    setWheelBone(1, "FL_mesh")
+    setWheelBone(2, "RL_mesh")
+    setWheelBone(3, "RR_mesh")
+    setBodyBone("Main")
+    refreshBones()
+
+    log("✓ NFS car setup complete")
+}
+
+fn update() {
+    let dt = getDeltaTime()
+    logTimer = logTimer + dt
+
+    let vx = getVelocityX()
+    let vy = getVelocityY()
+    let vz = getVelocityZ()
+    let speed = sqrt(vx * vx + vy * vy + vz * vz) * 3.6
+
+    uiPanel(10.0, 10.0, 300.0, 118.0, "TopLeft", 0.04, 0.05, 0.07, 0.82)
+    uiText("BlueSky Drive", 20.0, 20.0, "TopLeft", 0.2, 0.65, 1.0, 1.0)
+    uiText("Speed: " + speed + " km/h", 20.0, 46.0, "TopLeft", 1.0, 1.0, 1.0, 1.0)
+    uiText("WASD / Arrows", 20.0, 72.0, "TopLeft", 0.58, 0.72, 0.95, 1.0)
+    uiText("Wheels: " + wheelMask(), 20.0, 96.0, "TopLeft", 0.7, 0.7, 0.7, 1.0)
+
+    if (logTimer >= 1.0) {
+        log("Speed=" + speed + " km/h wheels=" + wheelMask())
+        debugWheelAnimation()
+        logTimer = 0.0
+    }
+}
+
+fn wheelMask() {
+    let a = "0"
+    let b = "0"
+    let c = "0"
+    let d = "0"
+    if (getWheelGrounded(0)) { a = "1" }
+    if (getWheelGrounded(1)) { b = "1" }
+    if (getWheelGrounded(2)) { c = "1" }
+    if (getWheelGrounded(3)) { d = "1" }
+    return a + b + c + d
+}

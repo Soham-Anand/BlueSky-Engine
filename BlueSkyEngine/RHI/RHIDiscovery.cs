@@ -1,73 +1,53 @@
 using System;
 using System.Runtime.InteropServices;
-using BlueSky.Platform;
 
-namespace NotBSRenderer;
+namespace BlueSky.Rendering.RHI;
 
 public static class RHIDiscovery
 {
-    public static RHIBackend DiscoverBestBackend(string[]? cliArgs, bool forceCompatibility = false)
+    public static RHIBackend DiscoverBestBackend(string[]? cliArgs)
     {
-        bool wantsVulkan = HasFlag(cliArgs, "--vulkan");
-        bool wantsOpenGL = HasFlag(cliArgs, "--opengl");
+        if (HasFlag(cliArgs, "--opengl"))
+            throw new PlatformNotSupportedException("OpenGL is not an available RHI backend. Available backends: DirectX 11, Vulkan, and Metal on macOS.");
 
-        if (OperatingSystem.IsWindows())
+        if (HasFlag(cliArgs, "--vulkan"))
         {
-            if (wantsVulkan)
-            {
-                if (IsVulkanSupported()) return RHIBackend.Vulkan;
-                Console.WriteLine("[RHI] --vulkan requested, but Vulkan was not found. Falling back to DirectX 11.");
-            }
-
-            if (IsDirectX11Supported()) return RHIBackend.DirectX11;
-
             if (IsVulkanSupported()) return RHIBackend.Vulkan;
-            if (wantsOpenGL && IsOpenGLSupported()) return RHIBackend.OpenGL;
-            return RHIBackend.DirectX11;
+            throw new PlatformNotSupportedException("--vulkan was requested, but the Vulkan loader is not available.");
         }
 
-        if (OperatingSystem.IsLinux())
-        {
-            if (!wantsOpenGL && IsVulkanSupported()) return RHIBackend.Vulkan;
-            return RHIBackend.OpenGL;
-        }
-
-        return DiscoverBestBackend(forceCompatibility);
+        return DiscoverBestBackend();
     }
 
-    public static RHIBackend DiscoverBestBackend(bool forceCompatibility = false)
+    public static RHIBackend DiscoverBestBackend()
     {
         if (OperatingSystem.IsMacOS())
         {
             if (IsMetalSupported()) return RHIBackend.Metal;
-            throw new PlatformNotSupportedException("Metal is required on macOS.");
+            throw new PlatformNotSupportedException("A Metal device is required on macOS.");
         }
 
         if (OperatingSystem.IsWindows())
         {
-            // Windows defaults to DirectX 11. Vulkan is opt-in through --vulkan.
             if (IsDirectX11Supported()) return RHIBackend.DirectX11;
             if (IsVulkanSupported()) return RHIBackend.Vulkan;
-            return RHIBackend.OpenGL;
+            throw new PlatformNotSupportedException("Neither DirectX 11 nor Vulkan is available.");
         }
 
         if (OperatingSystem.IsLinux())
         {
             if (IsVulkanSupported()) return RHIBackend.Vulkan;
-            return RHIBackend.OpenGL;
+            throw new PlatformNotSupportedException("Vulkan is unavailable on this Linux system.");
         }
 
-        return RHIBackend.OpenGL;
+        throw new PlatformNotSupportedException($"No RHI backend is available for {RuntimeInformation.OSDescription}.");
     }
 
     private static bool HasFlag(string[]? args, string flag)
     {
         if (args == null) return false;
         foreach (var arg in args)
-        {
-            if (arg.Equals(flag, StringComparison.OrdinalIgnoreCase))
-                return true;
-        }
+            if (arg.Equals(flag, StringComparison.OrdinalIgnoreCase)) return true;
         return false;
     }
 
@@ -77,82 +57,41 @@ public static class RHIDiscovery
         try
         {
             var device = MTLCreateSystemDefaultDevice();
-            if (device != IntPtr.Zero)
-            {
-                // We don't need to hold onto it, just check if it exists
-                // Note: On macOS, we don't have a simple Release for Metal pointers here 
-                // but since this is a one-time check at startup, a tiny leak is acceptable 
-                // if we can't easily release it without full ObjC interop.
-                return true;
-            }
+            if (device == IntPtr.Zero) return false;
+            ObjCRelease(device);
+            return true;
         }
-        catch { }
-        return false;
+        catch { return false; }
     }
 
-    public static bool IsDirectX12Supported()
-    {
-        if (!OperatingSystem.IsWindows()) return false;
-        try
-        {
-            IntPtr lib = NativeLibrary.Load("d3d12.dll");
-            if (lib == IntPtr.Zero) return false;
-            IntPtr proc = NativeLibrary.GetExport(lib, "D3D12CreateDevice");
-            NativeLibrary.Free(lib);
-            return proc != IntPtr.Zero;
-        }
-        catch { }
-        return false;
-    }
-
-    public static bool IsDirectX11Supported()
-    {
-        if (!OperatingSystem.IsWindows()) return false;
-        try
-        {
-            IntPtr lib = NativeLibrary.Load("d3d11.dll");
-            if (lib == IntPtr.Zero) return false;
-            IntPtr proc = NativeLibrary.GetExport(lib, "D3D11CreateDevice");
-            NativeLibrary.Free(lib);
-            return proc != IntPtr.Zero;
-        }
-        catch { }
-        return false;
-    }
-
-    public static bool IsOpenGLSupported()
-    {
-        // Simple heuristic: if we are on any modern OS, OpenGL is usually supported via a fallback
-        // To be strictly correct, we'd need to create a dummy WGL/GLX/CGL context.
-        // For now, we'll assume true if nothing else works.
-        return true;
-    }
+    public static bool IsDirectX11Supported() =>
+        OperatingSystem.IsWindows() && HasNativeExport("d3d11.dll", "D3D11CreateDevice");
 
     public static bool IsVulkanSupported()
     {
-        // Headless Vulkan check: try to load the library
-        string libName = OperatingSystem.IsWindows() ? "vulkan-1.dll" : 
+        string library = OperatingSystem.IsWindows() ? "vulkan-1.dll" :
                          OperatingSystem.IsMacOS() ? "libvulkan.dylib" : "libvulkan.so.1";
-        
-        IntPtr lib = NativeLibrary.Load(libName, typeof(RHIDiscovery).Assembly, null);
-        if (lib == IntPtr.Zero) return false;
-        
+        return HasNativeExport(library, "vkCreateInstance");
+    }
+
+    private static bool HasNativeExport(string libraryName, string exportName)
+    {
+        IntPtr library = IntPtr.Zero;
         try
         {
-            // If we can load the library, it's a good sign, but let's try to get vkCreateInstance
-            IntPtr proc = NativeLibrary.GetExport(lib, "vkCreateInstance");
-            return proc != IntPtr.Zero;
+            if (!NativeLibrary.TryLoad(libraryName, out library)) return false;
+            return NativeLibrary.TryGetExport(library, exportName, out _);
         }
-        catch
-        {
-            return false;
-        }
+        catch { return false; }
         finally
         {
-            NativeLibrary.Free(lib);
+            if (library != IntPtr.Zero) NativeLibrary.Free(library);
         }
     }
 
     [DllImport("/System/Library/Frameworks/Metal.framework/Metal")]
     private static extern IntPtr MTLCreateSystemDefaultDevice();
+
+    [DllImport("/usr/lib/libobjc.A.dylib", EntryPoint = "objc_release")]
+    private static extern void ObjCRelease(IntPtr value);
 }

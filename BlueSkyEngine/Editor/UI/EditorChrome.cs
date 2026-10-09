@@ -1,6 +1,6 @@
 using System;
 using System.Numerics;
-using NotBSRenderer;
+using BlueSky.Rendering.RHI;
 
 namespace BlueSky.Editor.UI;
 
@@ -10,7 +10,7 @@ namespace BlueSky.Editor.UI;
 /// </summary>
 public static class EditorChrome
 {
-    public static void Surface(NotBSUI ui, float x, float y, float w, float h, Vector4? bg = null, bool elevated = false)
+    public static void Surface(EditorUI ui, float x, float y, float w, float h, Vector4? bg = null, bool elevated = false)
     {
         if (elevated)
             ui.Shadow(x + 1, y + 1, w, h, 2, 4, 0.22f);
@@ -20,7 +20,7 @@ public static class EditorChrome
         ui.Panel(x + 1, y + 1, MathF.Max(0, w - 2), 1, EditorTheme.Highlight);
     }
 
-    public static void Header(NotBSUI ui, float x, float y, float w, float h, string title, string? meta = null, Vector4? accent = null)
+    public static void Header(EditorUI ui, float x, float y, float w, float h, string title, string? meta = null, Vector4? accent = null)
     {
         var a = accent ?? EditorTheme.Accent;
         ui.RoundedGradientPanel(x, y, w, h, EditorTheme.Bg3, EditorTheme.Bg2, EditorTheme.SmallRadius);
@@ -37,7 +37,7 @@ public static class EditorChrome
         }
     }
 
-    public static void Pill(NotBSUI ui, float x, float y, float w, float h, string text, Vector4 accent, bool filled = false)
+    public static void Pill(EditorUI ui, float x, float y, float w, float h, string text, Vector4 accent, bool filled = false)
     {
         var bg = filled ? EditorTheme.WithAlpha(accent, 0.22f) : EditorTheme.Bg2;
         ui.RoundedPanel(x, y, w, h, bg, EditorTheme.PillRadius);
@@ -46,7 +46,7 @@ public static class EditorChrome
         ui.TextCentered(x + 20, y, MathF.Max(0, w - 26), h, text, filled ? EditorTheme.TextPrimary : EditorTheme.TextSecondary);
     }
 
-    public static void SectionTitle(NotBSUI ui, float x, float y, float w, string title, Vector4 accent)
+    public static void SectionTitle(EditorUI ui, float x, float y, float w, string title, Vector4 accent)
     {
         ui.Panel(x, y + 10, w, 1, EditorTheme.Border1);
         ui.Panel(x, y + 10, 28, 1, accent);
@@ -54,7 +54,7 @@ public static class EditorChrome
         ui.Text(title, EditorTheme.TextMuted);
     }
 
-    public static void Stroke(NotBSUI ui, float x, float y, float w, float h, Vector4 color)
+    public static void Stroke(EditorUI ui, float x, float y, float w, float h, Vector4 color)
     {
         ui.Panel(x, y, w, 1, color);
         ui.Panel(x, y + h - 1, w, 1, color);

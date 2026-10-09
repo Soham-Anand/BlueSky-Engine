@@ -11,7 +11,7 @@ using BlueSky.Core.Math;
 using BlueSky.Rendering;
 using BlueSky.Core.Scripting;
 using BlueSky.Core.Scene;
-using NotBSRenderer;
+using BlueSky.Rendering.RHI;
 
 namespace BlueSky.Editor;
 
@@ -23,7 +23,7 @@ partial class Program
 
         // Query all entities with rigidbody + transform
         var physicsQuery = _world.CreateQuery()
-            .All<BlueSky.Core.ECS.Builtin.RigidbodyComponent>()
+            .All<BlueSky.Core.ECS.Builtin.PhysicsComponent>()
             .All<BlueSky.Core.ECS.Builtin.TransformComponent>()
             .Build();
 
@@ -39,14 +39,54 @@ partial class Program
                 if (!_physicsWorld.HasBody(entity))
                     continue;
                 
-                // Get physics position/rotation
-                var physPos = _physicsWorld.GetPosition(entity);
-                var physRot = _physicsWorld.GetRotation(entity);
+                // Interpolate between fixed ticks for a stable render pose.
+                if (!_currentEditorPhysicsState.TryGetValue(entity.Id, out var current))
+                {
+                    var initialPos = _physicsWorld.GetPosition(entity);
+                    var initialRot = _physicsWorld.GetRotation(entity);
+                    current = (initialPos, initialRot);
+                    _prevEditorPhysicsState[entity.Id] = current;
+                    _currentEditorPhysicsState[entity.Id] = current;
+                }
+
+                var previous = _prevEditorPhysicsState.TryGetValue(entity.Id, out var previousState)
+                    ? previousState
+                    : current;
+                float alpha = Math.Clamp((float)(_physicsAccumulator / FixedTimeStep), 0.0f, 1.0f);
+                var physPos = System.Numerics.Vector3.Lerp(previous.pos, current.pos, alpha);
+                var physRot = System.Numerics.Quaternion.Slerp(previous.rot, current.rot, alpha);
 
                 // Update transform
                 ref var transform = ref chunk.GetComponent<BlueSky.Core.ECS.Builtin.TransformComponent>(i, transIdx);
                 transform.Position = new BlueSky.Core.Math.Vector3(physPos.X, physPos.Y, physPos.Z);
                 transform.Rotation = new BlueSky.Core.Math.Quaternion(physRot.X, physRot.Y, physRot.Z, physRot.W);
+            }
+        }
+    }
+
+    private static void CaptureEditorPhysicsState()
+    {
+        if (_world == null || _physicsWorld == null) return;
+
+        var query = _world.CreateQuery()
+            .All<PhysicsComponent>()
+            .All<TransformComponent>()
+            .Build();
+
+        foreach (var chunk in _world.GetQueryChunks(query))
+        {
+            var entities = chunk.GetEntities();
+            for (int i = 0; i < chunk.Count; i++)
+            {
+                var entity = entities[i];
+                if (!_physicsWorld.HasBody(entity)) continue;
+
+                var state = (_physicsWorld.GetPosition(entity), _physicsWorld.GetRotation(entity));
+                if (_currentEditorPhysicsState.TryGetValue(entity.Id, out var previous))
+                    _prevEditorPhysicsState[entity.Id] = previous;
+                else
+                    _prevEditorPhysicsState[entity.Id] = state;
+                _currentEditorPhysicsState[entity.Id] = state;
             }
         }
     }
@@ -77,8 +117,7 @@ partial class Program
             return;
         }
 
-        var entity = _world.GetAllEntities().FirstOrDefault(e => e.Id == _selectedEntityId);
-        if (entity.Id == 0 || !_world.TryGetComponent<TerrainComponent>(entity, out var terrain))
+        if (!_world.TryResolveEntity(_selectedEntityId, out var entity) || !_world.TryGetComponent<TerrainComponent>(entity, out var terrain))
         {
             _editorViewportRenderer?.SetTerrainBrushPreview(false, default, default, _terrainBrushRadius, _terrainBrushMode);
             return;
@@ -153,18 +192,22 @@ partial class Program
             MaxElevation = 20.0f,
             ChunkSize = 32,
             LodCount = 3,
-            MaterialMode = (int)TerrainMaterialMode.SimpleTwoLayer,
+            SurfaceMode = (int)TerrainSurfaceMode.SimpleTwoLayer,
             CollisionEnabled = true,
-            NeedsRebuild = true,
+            NeedsRebuild = false, // Changed: Don't force rebuild on creation - let TerrainSystem handle it
             MeshHandle = 0
         };
         terrain.TerrainAssetPath = terrainAssetPath;
         _world.AddComponent(entity, terrain);
 
-        // Initialize heightmap in terrain system
+        // Initialize heightmap in terrain system FIRST before any rendering
         _terrainSystem.InitializeTerrain((uint)entity.Id, terrain);
         if (!string.IsNullOrEmpty(terrainAssetPath))
             _terrainSystem.SaveTerrainAsset((uint)entity.Id, terrainAssetPath);
+        
+        // Now set NeedsRebuild to trigger mesh generation
+        terrain.NeedsRebuild = true;
+        _world.AddComponent(entity, terrain);
 
         // Add name
         var name = new NameComponent();

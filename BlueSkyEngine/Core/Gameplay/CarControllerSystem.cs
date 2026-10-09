@@ -7,7 +7,7 @@ using BlueSky.Core.ECS.Builtin;
 using BlueSky.Platform;
 using BlueSky.Platform.Input;
 using BlueSky.Rendering;
-using BlueSky.Animation;
+using BlueSky.Motif;
 using BVec3 = BlueSky.Core.Math.Vector3;
 
 namespace BlueSky.Core.Gameplay;
@@ -15,6 +15,7 @@ namespace BlueSky.Core.Gameplay;
 public class CarControllerSystem
 {
     private static Dictionary<uint, CarController> s_allControllers = new();
+    private static CarController? _possessedController;
 
     public static CarController? GetController(uint entityId)
     {
@@ -22,37 +23,38 @@ public class CarControllerSystem
         return controller;
     }
 
+    /// <summary>
+    /// The client's possessed car controller (set by GameRuntime when car is possessed).
+    /// Bridge functions fall back to this when the requesting entity has no valid data.
+    /// </summary>
+    public static CarController? PossessedController
+    {
+        get => _possessedController;
+        set => _possessedController = value;
+    }
+
     private World? _world;
     private IInputContext? _input;
     private Viewport? _viewport;
     private PlayerController? _playerController;
-    private WheelVisualSystem _wheelVisualSystem;
 
     private Dictionary<uint, CarController> _runtimeControllers = new();
 
     /// <summary>Loaded skeletal meshes keyed by entity ID</summary>
     private Dictionary<uint, SkeletalMesh> _loadedMeshes = new();
 
-    /// <summary>Animation controllers keyed by entity ID</summary>
-    private Dictionary<uint, AnimationController> _animControllers = new();
-
-    public void Initialize(World world, IInputContext input, Viewport viewport)
+    public void Initialize(World world, IInputContext input, Viewport? viewport)
     {
         _world = world;
         _input = input;
         _viewport = viewport;
         _playerController = PlayerController.Instance;
-        _wheelVisualSystem = new WheelVisualSystem();
         _playerController.Initialize(input, viewport);
-
-        Console.WriteLine("[CarControllerSystem] ✅ Initialized - Cars will auto-possess when added");
     }
 
     public void Update(float deltaTime)
     {
         if (_world == null || _input == null) return;
-
-        _playerController?.Update(deltaTime);
 
         InitializeCarControllers();
 
@@ -60,24 +62,39 @@ public class CarControllerSystem
         {
             controller.Update(deltaTime);
         }
-
-        UpdateWheelVisuals();
     }
 
-    private void UpdateWheelVisuals()
+    /// <summary>
+    /// Samples possession and player input. This must run before the fixed
+    /// physics loop; visual animation is intentionally kept in Update so it
+    /// runs after the newest physics state has been produced.
+    /// </summary>
+    public void ProcessInput(float deltaTime)
+    {
+        if (_world == null || _input == null) return;
+
+        InitializeCarControllers();
+        _playerController?.Update(deltaTime);
+    }
+
+    /// <summary>
+    /// Ensures newly spawned car entities have controllers before an input
+    /// sample or fixed step tries to access them.
+    /// </summary>
+    public void EnsureInitialized()
+    {
+        InitializeCarControllers();
+    }
+
+    public void FixedUpdate(float fixedDeltaTime)
     {
         if (_world == null) return;
 
-        foreach (var kvp in _runtimeControllers)
-        {
-            Entity carEntity = new Entity((int)kvp.Key, 1);
-            if (!_world.IsEntityValid(carEntity)) continue;
+        InitializeCarControllers();
 
-            CarController controller = kvp.Value;
-            if (controller._wheelStates != null)
-            {
-                _wheelVisualSystem.Update(_world, carEntity, controller._wheelStates);
-            }
+        foreach (var controller in _runtimeControllers.Values)
+        {
+            controller.FixedUpdate(fixedDeltaTime);
         }
     }
 
@@ -93,7 +110,6 @@ public class CarControllerSystem
             {
                 if (!carComp.IsInitialized && !_runtimeControllers.ContainsKey((uint)entity.Id))
                 {
-                    Console.WriteLine($"[CarControllerSystem] 🔧 Initializing runtime controller for Entity_{entity.Id}...");
 
                     var controller = new CarController
                     {
@@ -105,73 +121,47 @@ public class CarControllerSystem
                         SuspensionRestLength = carComp.SuspensionRestLength,
                         SuspensionStiffness = carComp.SuspensionStiffness,
                         SuspensionDamping = carComp.SuspensionDamping,
-                        WheelRadius = carComp.WheelRadius
+                        WheelRadius = carComp.WheelRadius,
+                        // Keep the chassis on the stable rigid-body vehicle path.
+                        // The internal wheel-body solver is experimental and
+                        // makes the chassis kinematic; wheel visuals remain
+                        // independent through CarController's wheel states.
+                        UsePerWheelPhysics = false
                     };
 
                     // ── Load skeletal mesh if the entity has a SkeletalMeshComponent ──
                     SkeletalMesh? skeletalMesh = null;
-                    AnimationController? animController = null;
 
                     if (_world.TryGetComponent<SkeletalMeshComponent>(entity, out var skelComp) && !string.IsNullOrEmpty(skelComp.MeshAssetPath))
                     {
-                        Console.WriteLine($"[CarControllerSystem] 🦴 Entity_{entity.Id} has SkeletalMeshComponent: {skelComp.MeshAssetPath}");
                         skeletalMesh = LoadAndValidateSkeletalMesh(entity, skelComp.MeshAssetPath);
 
                         if (skeletalMesh != null)
                         {
-                            // Create an animation controller for bone transform driving
-                            animController = new AnimationController(skeletalMesh);
-                            _animControllers[(uint)entity.Id] = animController;
-
                             // Mark the component as loaded
                             skelComp.IsLoaded = true;
                             _world.AddComponent(entity, skelComp);
-                            
-                            Console.WriteLine($"[CarControllerSystem] ✅ AnimationController created for Entity_{entity.Id} with {skeletalMesh.Bones.Length} bones");
                         }
-                        else
-                        {
-                            Console.WriteLine($"[CarControllerSystem] ❌ Failed to load skeletal mesh for Entity_{entity.Id}");
-                        }
-                    }
-                    else
-                    {
-                        Console.WriteLine($"[CarControllerSystem] ⚠️ Entity_{entity.Id} has NO SkeletalMeshComponent!");
-                        Console.WriteLine($"[CarControllerSystem] 💡 WHEEL ANIMATION DISABLED - Add a SkeletalMeshComponent to enable bone-driven wheel animation!");
-                        Console.WriteLine($"[CarControllerSystem] 💡 To fix: Right-click entity → Add Component → Skeletal Mesh → Select your car's .glb file");
                     }
 
-                    controller.Initialize(entity, _world, skeletalMesh, animController);
+                    controller.Initialize(entity, _world, skeletalMesh);
                     
-                    // Write comprehensive diagnostic to file
                     string diagFile = "/tmp/bluesky_car_init.txt";
                     var diag = new System.Text.StringBuilder();
                     diag.AppendLine($"\n═══ CAR INITIALIZATION DIAGNOSTIC ═══");
                     diag.AppendLine($"Entity ID: {entity.Id}");
                     diag.AppendLine($"Has SkeletalMeshComponent: {_world.HasComponent<SkeletalMeshComponent>(entity)}");
                     diag.AppendLine($"SkeletalMesh loaded: {skeletalMesh != null}");
-                    diag.AppendLine($"AnimationController created: {animController != null}");
                     
                     if (skeletalMesh != null)
                     {
                         diag.AppendLine($"Bone count: {skeletalMesh.Bones.Length}");
                         diag.AppendLine($"Vertices: {skeletalMesh.Vertices?.Length ?? 0}");
-                        diag.AppendLine($"Materials: {skeletalMesh.Materials?.Length ?? 0}");
                     }
                     
-                    if (animController != null)
-                    {
-                        diag.AppendLine($"✅ ANIMATION CONTROLLER ACTIVE - Wheels SHOULD animate!");
-                    }
-                    else
-                    {
-                        diag.AppendLine($"❌ NO ANIMATION CONTROLLER - Wheels will NOT animate!");
-                        diag.AppendLine($"Fix: Add SkeletalMeshComponent to entity pointing to .glb file");
-                    }
+                    diag.AppendLine($"Bone animation driven by TeaScript (BoneTransformOverrides)");
                     
                     System.IO.File.AppendAllText(diagFile, diag.ToString());
-                    Console.WriteLine($"[CarControllerSystem] 🎯 Entity_{entity.Id}: SkeletalMesh={skeletalMesh != null}, AnimController={animController != null}");
-                    Console.WriteLine($"[CarControllerSystem] 📄 Full diagnostic written to {diagFile}");
                     _runtimeControllers[(uint)entity.Id] = controller;
                     s_allControllers[(uint)entity.Id] = controller;
 
@@ -179,10 +169,6 @@ public class CarControllerSystem
                     carComp.EntityId = (uint)entity.Id;
                     _world.AddComponent(entity, carComp);
 
-                    Console.WriteLine($"[CarControllerSystem] ✅ Runtime controller initialized for Entity_{entity.Id}");
-                    Console.WriteLine($"[CarControllerSystem] 🎮 Total cars available: {_runtimeControllers.Count}");
-
-                    Console.WriteLine($"[CarControllerSystem] 📢 Auto-advertising car for possession...");
                     controller.AdvertisePossession("Player1");
                 }
             }
@@ -202,11 +188,6 @@ public class CarControllerSystem
             return cached;
 
         string importPath = ResolveSkeletalImportPath(assetPath);
-        Console.WriteLine($"[CarControllerSystem] 🦴 Loading skeletal mesh: {assetPath}");
-        if (!string.Equals(importPath, assetPath, StringComparison.Ordinal))
-        {
-            Console.WriteLine($"[CarControllerSystem] 🦴 Resolved imported asset to source file: {importPath}");
-        }
 
         try
         {
@@ -214,13 +195,10 @@ public class CarControllerSystem
 
             if (!isSkeletal || meshObj is not SkeletalMesh skeletalMesh)
             {
-                Console.WriteLine($"[CarControllerSystem] ❌ Entity_{entityId}: '{importPath}' is NOT a skeletal mesh! " +
-                    "Car controller requires a skeletal mesh with wheel bones.");
                 return null;
             }
 
             // Validate required bones
-            Console.WriteLine($"[CarControllerSystem] 🦴 Skeletal mesh has {skeletalMesh.Bones.Length} bones. Validating required vehicle bones...");
             DumpSkeletalMeshBones(skeletalMesh);
 
             // Check which default bones are present (or if TeaScript overrides exist)
@@ -233,11 +211,9 @@ public class CarControllerSystem
                     string aliasText = string.Equals(requiredBone, resolvedBone, StringComparison.Ordinal)
                         ? ""
                         : $" via alias '{resolvedBone}'";
-                    Console.WriteLine($"[CarControllerSystem]   ✅ '{requiredBone}' found{aliasText} (index {boneIdx})");
                 }
                 else
                 {
-                    Console.WriteLine($"[CarControllerSystem]   ❌ '{requiredBone}' MISSING!");
                     LogSimilarBoneNames(skeletalMesh, requiredBone);
                     allBonesPresent = false;
                 }
@@ -245,14 +221,7 @@ public class CarControllerSystem
 
             if (!allBonesPresent)
             {
-                Console.WriteLine($"[CarControllerSystem] ⚠️ Entity_{entityId}: Skeletal mesh is MISSING required bones! " +
-                    "Car will use fallback wheel positions. Required bones: " +
-                    string.Join(", ", CarController.DefaultBoneNames));
                 // Still return the mesh - CarController will fall back to hardcoded positions for missing bones
-            }
-            else
-            {
-                Console.WriteLine($"[CarControllerSystem] ✅ All required vehicle bones present in '{assetPath}'");
             }
 
             _loadedMeshes[entityId] = skeletalMesh;
@@ -260,7 +229,7 @@ public class CarControllerSystem
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[CarControllerSystem] ❌ Failed to load skeletal mesh '{assetPath}': {ex.Message}");
+            Console.Error.WriteLine($"[CarControllerSystem] Skeletal mesh import failed for '{importPath}': {ex.Message}");
             return null;
         }
     }
@@ -269,11 +238,9 @@ public class CarControllerSystem
     {
         if (mesh.Bones == null || mesh.Bones.Length == 0)
         {
-            Console.WriteLine("[CarControllerSystem] 🦴 Imported bone list: <none>");
             return;
         }
 
-        Console.WriteLine("[CarControllerSystem] 🦴 Imported bone list:");
         for (int i = 0; i < mesh.Bones.Length; i++)
         {
             var bone = mesh.Bones[i];
@@ -281,10 +248,6 @@ public class CarControllerSystem
             var inverse = bone.InverseBindPose;
             string children = bone.Children.Count > 0 ? string.Join(",", bone.Children) : "-";
 
-            Console.WriteLine(
-                $"[CarControllerSystem]   [{i:00}] '{bone.Name}' parent={bone.ParentIndex} children={children} " +
-                $"localT=({local.M41:F3}, {local.M42:F3}, {local.M43:F3}) " +
-                $"inverseT=({inverse.M41:F3}, {inverse.M42:F3}, {inverse.M43:F3})");
         }
 
         var duplicateNames = mesh.Bones
@@ -293,10 +256,6 @@ public class CarControllerSystem
             .Select(g => g.Key)
             .ToArray();
 
-        if (duplicateNames.Length > 0)
-        {
-            Console.WriteLine($"[CarControllerSystem] ⚠️ Duplicate bone names detected: {string.Join(", ", duplicateNames)}");
-        }
     }
 
     private static void LogSimilarBoneNames(SkeletalMesh mesh, string requiredBone)
@@ -315,10 +274,6 @@ public class CarControllerSystem
             .Take(4)
             .ToArray();
 
-        if (candidates.Length > 0)
-        {
-            Console.WriteLine($"[CarControllerSystem]      closest imported name(s): {string.Join(", ", candidates.Select(n => $"'{n}'"))}");
-        }
     }
 
     private static bool LooksLikeSameVehicleSlot(string requiredKey, string candidateKey)
@@ -363,19 +318,12 @@ public class CarControllerSystem
         var asset = BlueSky.Core.Assets.BlueAsset.LoadHeader(assetPath);
         if (asset == null)
         {
-            Console.WriteLine($"[CarControllerSystem] ⚠️ Could not read skeletal asset header: {assetPath}");
             return assetPath;
-        }
-
-        if (asset.Type != BlueSky.Core.Assets.AssetType.SkeletalMesh)
-        {
-            Console.WriteLine($"[CarControllerSystem] ⚠️ Asset '{assetPath}' is {asset.Type}, not SkeletalMesh.");
         }
 
         if (!string.IsNullOrEmpty(asset.SourceFile) && File.Exists(asset.SourceFile))
             return asset.SourceFile;
 
-        Console.WriteLine($"[CarControllerSystem] ⚠️ Skeletal .blueskyasset has no available source file; runtime importer only supports source mesh formats right now.");
         return assetPath;
     }
 
@@ -383,55 +331,17 @@ public class CarControllerSystem
     {
         if (_world == null)
         {
-            Console.WriteLine("[CarControllerSystem] ❌ ERROR: Cannot add car controller - World is null!");
             return;
         }
 
         bool hasTransform = _world.TryGetComponent<TransformComponent>(entity, out _);
-        bool hasRigidbody = _world.TryGetComponent<RigidbodyComponent>(entity, out _);
-        bool hasCollider = _world.TryGetComponent<ColliderComponent>(entity, out _);
+        bool hasPhysics = _world.TryGetComponent<PhysicsComponent>(entity, out _);
         bool hasSkeletalMesh = _world.TryGetComponent<SkeletalMeshComponent>(entity, out var skeletalMesh);
         bool hasStaticMesh = _world.TryGetComponent<StaticMeshComponent>(entity, out var staticMesh);
-
-        if (!hasTransform)
-        {
-            Console.WriteLine($"[CarControllerSystem] ⚠️ WARNING: Entity_{entity.Id} has no Transform component!");
-        }
-        if (!hasRigidbody)
-        {
-            Console.WriteLine($"[CarControllerSystem] ⚠️ WARNING: Entity_{entity.Id} has no Rigidbody component! Add one for physics.");
-        }
-        if (!hasCollider)
-        {
-            Console.WriteLine($"[CarControllerSystem] ⚠️ WARNING: Entity_{entity.Id} has no Collider component! Add one for physics.");
-        }
-        if (!hasSkeletalMesh)
-        {
-            if (hasStaticMesh)
-            {
-                Console.WriteLine($"[CarControllerSystem] ⚠️ WARNING: Entity_{entity.Id} has StaticMeshComponent ('{staticMesh.MeshAssetId}') but no SkeletalMeshComponent. " +
-                    "Wheel bones cannot be driven from a static mesh; car will use hardcoded fallback positions.");
-            }
-            else
-            {
-                Console.WriteLine($"[CarControllerSystem] ⚠️ WARNING: Entity_{entity.Id} has no SkeletalMesh component! " +
-                    "Add one with a mesh containing these bones: " +
-                    string.Join(", ", CarController.DefaultBoneNames) +
-                    ". Car will use hardcoded fallback positions. " +
-                    "Or use setWheelBone() in TeaScript to configure custom bone names.");
-            }
-        }
-        else if (string.IsNullOrEmpty(skeletalMesh.MeshAssetPath))
-        {
-            Console.WriteLine($"[CarControllerSystem] ⚠️ WARNING: Entity_{entity.Id} has SkeletalMeshComponent but MeshAssetPath is empty. " +
-                "Car will use hardcoded fallback positions until a skeletal mesh asset is assigned.");
-        }
 
         var carComponent = CarControllerComponent.CreateDefault();
         _world.AddComponent(entity, carComponent);
 
-        Console.WriteLine($"[CarControllerSystem] ✅ Car controller component added to Entity_{entity.Id}");
-        Console.WriteLine($"[CarControllerSystem] 💡 The car will auto-initialize and auto-possess on next frame!");
     }
 
     public CarController? GetPossessedCar()
@@ -449,16 +359,6 @@ public class CarControllerSystem
         if (playerCtrl.PossessedEntity != null)
         {
             playerCtrl.Unpossess();
-        }
-
-        // Destroy fallback wheel entities
-        if (_world != null)
-        {
-            foreach (var kvp in _runtimeControllers)
-            {
-                Entity entity = new Entity((int)kvp.Key, 1);
-                _wheelVisualSystem.RemoveWheelEntities(entity, _world);
-            }
         }
 
         // Reset IsInitialized on all CarControllerComponents so they re-initialize on next play
@@ -479,12 +379,8 @@ public class CarControllerSystem
         _runtimeControllers.Clear();
         s_allControllers.Clear();
         _loadedMeshes.Clear();
-        _animControllers.Clear();
-        _wheelVisualSystem.Cleanup();
 
         // Clear bone overrides
         CarController.ClearAllBoneOverrides();
-
-        Console.WriteLine("[CarControllerSystem] 🧹 Full cleanup completed");
     }
 }

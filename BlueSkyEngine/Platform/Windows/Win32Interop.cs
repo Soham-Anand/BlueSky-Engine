@@ -6,12 +6,18 @@ internal static class Win32Interop
 {
     // Window Styles
     public const uint WS_OVERLAPPEDWINDOW = 0x00CF0000;
+    public const uint WS_POPUP = 0x80000000;
+    public const uint WS_THICKFRAME = 0x00040000;
+    public const uint WS_MAXIMIZEBOX = 0x00010000;
     public const uint WS_VISIBLE = 0x10000000;
     public const uint WS_EX_ACCEPTFILES = 0x00000010;
     
     // Window Messages
     public const uint WM_DESTROY = 0x0002;
     public const uint WM_SIZE = 0x0005;
+    public const uint WM_MOVE = 0x0003;
+    public const uint WM_SETFOCUS = 0x0007;
+    public const uint WM_KILLFOCUS = 0x0008;
     public const uint WM_CLOSE = 0x0010;
     public const uint WM_KEYDOWN = 0x0100;
     public const uint WM_KEYUP = 0x0101;
@@ -29,6 +35,9 @@ internal static class Win32Interop
     // ShowWindow commands
     public const int SW_SHOW = 5;
     public const int SW_HIDE = 0;
+    public const uint SWP_NOZORDER = 0x0004;
+    public const uint SWP_NOACTIVATE = 0x0010;
+    public const uint SWP_NOSIZE = 0x0001;
     
     // Open File Dialog flags
     public const uint OFN_FILEMUSTEXIST = 0x00001000;
@@ -51,6 +60,12 @@ internal static class Win32Interop
     
     [DllImport("user32.dll")]
     public static extern bool UpdateWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern bool SetWindowTextW(IntPtr hWnd, string text);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint flags);
     
     [DllImport("user32.dll")]
     public static extern bool DestroyWindow(IntPtr hWnd);
@@ -78,6 +93,87 @@ internal static class Win32Interop
 
     [DllImport("user32.dll")]
     public static extern int ShowCursor(int bShow);
+
+    // ── Cursor Capture ──────────────────────────────────────────────────
+    [DllImport("user32.dll")]
+    public static extern bool ClipCursor(ref RECT lpRect);
+
+    [DllImport("user32.dll")]
+    public static extern bool ClipCursor(IntPtr lpRect); // null to release
+
+    [DllImport("user32.dll")]
+    public static extern bool ClientToScreen(IntPtr hWnd, ref POINT lpPoint);
+
+    [DllImport("user32.dll")]
+    public static extern bool SetCursorPos(int x, int y);
+
+    [DllImport("user32.dll")]
+    public static extern bool GetCursorPos(out POINT lpPoint);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr SetCapture(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern bool ReleaseCapture();
+
+    // ── GDI+ (Splash Screen) ────────────────────────────────────────────
+    [DllImport("gdiplus.dll")]
+    public static extern int GdiplusStartup(out IntPtr token, IntPtr input, IntPtr output);
+
+    [DllImport("gdiplus.dll")]
+    public static extern void GdiplusShutdown(IntPtr token);
+
+    [DllImport("gdiplus.dll", CharSet = CharSet.Unicode)]
+    public static extern int GdipCreateBitmapFromFile(string filename, out IntPtr bitmap);
+
+    [DllImport("gdiplus.dll")]
+    public static extern int GdipGetImageWidth(IntPtr image, out uint width);
+
+    [DllImport("gdiplus.dll")]
+    public static extern int GdipGetImageHeight(IntPtr image, out uint height);
+
+    [DllImport("gdiplus.dll")]
+    public static extern int GdipCreateFromHDC(IntPtr hdc, out IntPtr graphics);
+
+    [DllImport("gdiplus.dll")]
+    public static extern int GdipDrawImageRect(IntPtr graphics, IntPtr image, float x, float y, float w, float h);
+
+    [DllImport("gdiplus.dll")]
+    public static extern int GdipDeleteGraphics(IntPtr graphics);
+
+    [DllImport("gdiplus.dll")]
+    public static extern int GdipDisposeImage(IntPtr image);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetDC(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
+
+    // ── Splash Screen ──────────────────────────────────────────────────
+    [DllImport("user32.dll")]
+    public static extern IntPtr BeginPaint(IntPtr hWnd, out PAINTSTRUCT lpPaint);
+
+    [DllImport("user32.dll")]
+    public static extern bool EndPaint(IntPtr hWnd, ref PAINTSTRUCT lpPaint);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr LoadCursor(IntPtr hInstance, IntPtr lpCursorName);
+
+    [DllImport("user32.dll")]
+    public static extern int GetSystemMetrics(int nIndex);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PAINTSTRUCT
+    {
+        public IntPtr hdc;
+        public bool fErase;
+        public RECT rcPaint;
+        public bool fRestore;
+        public bool fIncUpdate;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 32)]
+        public byte[] rgbReserved;
+    }
 
     // ── File Dialog ──────────────────────────────────────────────────────
     [DllImport("comdlg32.dll", SetLastError = true, CharSet = CharSet.Unicode)]

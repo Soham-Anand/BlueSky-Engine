@@ -2,18 +2,21 @@ using System;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
+using BlueSky.Platform.Windows;
 
 namespace BlueSky.Editor;
 
 public class NativeSplashWindow : IDisposable
 {
     private IntPtr _nsWindow;
-    private IntPtr _nsImageView;
     private bool _isShowing = false;
-    
+
+    private static readonly bool IsWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+    private static readonly bool IsMacOS = RuntimeInformation.IsOSPlatform(OSPlatform.OSX);
+
     private const uint NSWindowStyleMaskBorderless = 0;
     private const uint NSBackingStoreBuffered = 2;
-    
+
     [DllImport("/usr/lib/libobjc.A.dylib", EntryPoint = "objc_getClass")]
     private static extern IntPtr GetClass(string name);
     
@@ -137,13 +140,25 @@ public class NativeSplashWindow : IDisposable
     public void ShowAndWait(int durationMs = 2000)
     {
         string splashPath = GetSplashPath();
-        
+
         if (string.IsNullOrEmpty(splashPath) || !File.Exists(splashPath))
         {
             Console.WriteLine("[NativeSplash] splash.png not found, skipping");
             return;
         }
-        
+
+        if (IsWindows)
+        {
+            ShowAndWaitWin32(splashPath, durationMs);
+            return;
+        }
+
+        if (!IsMacOS)
+        {
+            Console.WriteLine("[NativeSplash] Unsupported platform, skipping");
+            return;
+        }
+
         try
         {
             dlopen("/System/Library/Frameworks/AppKit.framework/AppKit", 2); // RTLD_NOW
@@ -268,6 +283,122 @@ public class NativeSplashWindow : IDisposable
         }
     }
     
+    // ── Windows splash via Win32 borderless window + GDI+ ──────────────────
+    private void ShowAndWaitWin32(string splashPath, int durationMs)
+    {
+        try
+        {
+            // Initialize GDI+
+            Win32Interop.GdiplusStartup(out var gdiToken, IntPtr.Zero, IntPtr.Zero);
+
+            // Load image to get dimensions
+            int loadResult = Win32Interop.GdipCreateBitmapFromFile(splashPath, out var hBitmap);
+            if (loadResult != 0 || hBitmap == IntPtr.Zero)
+            {
+                Console.WriteLine($"[NativeSplash] GDI+ failed to load image: 0x{loadResult:X}");
+                Win32Interop.GdiplusShutdown(gdiToken);
+                return;
+            }
+
+            Win32Interop.GdipGetImageWidth(hBitmap, out uint imgW);
+            Win32Interop.GdipGetImageHeight(hBitmap, out uint imgH);
+            if (imgW == 0) imgW = 800;
+            if (imgH == 0) imgH = 450;
+
+            // Register a minimal window class
+            string className = $"BlueSkySplash_{Guid.NewGuid():N}";
+            var hInstance = Win32Interop.GetModuleHandleW(null);
+
+            var wndClass = new Win32Interop.WNDCLASS
+            {
+                lpfnWndProc = Marshal.GetFunctionPointerForDelegate(new Win32Interop.WndProc((IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam) =>
+                {
+                    if (msg == 0x000F) // WM_PAINT
+                    {
+                        var ps = new Win32Interop.PAINTSTRUCT();
+                        IntPtr hdc = Win32Interop.BeginPaint(hWnd, out ps);
+                        if (hdc != IntPtr.Zero)
+                        {
+                            Win32Interop.GdipCreateFromHDC(hdc, out var gfx);
+                            if (gfx != IntPtr.Zero)
+                            {
+                                Win32Interop.GdipDrawImageRect(gfx, hBitmap, 0, 0, (float)imgW, (float)imgH);
+                                Win32Interop.GdipDeleteGraphics(gfx);
+                            }
+                            Win32Interop.EndPaint(hWnd, ref ps);
+                        }
+                        return IntPtr.Zero;
+                    }
+                    if (msg == 0x0002) // WM_DESTROY
+                    {
+                        Win32Interop.PostQuitMessage(0);
+                        return IntPtr.Zero;
+                    }
+                    return Win32Interop.DefWindowProcW(hWnd, msg, wParam, lParam);
+                })),
+                hInstance = hInstance,
+                lpszClassName = className,
+                hCursor = Win32Interop.LoadCursor(IntPtr.Zero, (IntPtr)0x7F00), // IDC_ARROW
+            };
+
+            Win32Interop.RegisterClassW(ref wndClass);
+
+            // Center on screen
+            int screenW = Win32Interop.GetSystemMetrics(0); // SM_CXSCREEN
+            int screenH = Win32Interop.GetSystemMetrics(1); // SM_CYSCREEN
+            int winX = (screenW - (int)imgW) / 2;
+            int winY = (screenH - (int)imgH) / 2;
+
+            // Create borderless window
+            _hwndWin32 = Win32Interop.CreateWindowExW(
+                0, className, "BlueSky Engine",
+                0x80000000, // WS_POPUP
+                winX, winY, (int)imgW, (int)imgH,
+                IntPtr.Zero, IntPtr.Zero, hInstance, IntPtr.Zero);
+
+            if (_hwndWin32 == IntPtr.Zero)
+            {
+                Console.WriteLine("[NativeSplash] Failed to create Win32 window");
+                Win32Interop.GdipDisposeImage(hBitmap);
+                Win32Interop.GdiplusShutdown(gdiToken);
+                return;
+            }
+
+            Win32Interop.ShowWindow(_hwndWin32, 5); // SW_SHOW
+            Win32Interop.UpdateWindow(_hwndWin32);
+
+            _isShowing = true;
+            Console.WriteLine($"[NativeSplash] Showing Win32 splash for {durationMs}ms");
+
+            // Simple event loop
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var msg = new Win32Interop.MSG();
+            while (sw.ElapsedMilliseconds < durationMs)
+            {
+                while (Win32Interop.PeekMessageW(out msg, IntPtr.Zero, 0, 0, 1)) // PM_REMOVE
+                {
+                    Win32Interop.TranslateMessage(ref msg);
+                    Win32Interop.DispatchMessageW(ref msg);
+                }
+                Thread.Sleep(16);
+            }
+
+            // Cleanup
+            Win32Interop.DestroyWindow(_hwndWin32);
+            _hwndWin32 = IntPtr.Zero;
+            Win32Interop.GdipDisposeImage(hBitmap);
+            Win32Interop.GdiplusShutdown(gdiToken);
+            _isShowing = false;
+            Console.WriteLine("[NativeSplash] Win32 splash closed");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[NativeSplash] Win32 error: {ex.Message}");
+        }
+    }
+
+    private IntPtr _hwndWin32;
+
     public void Dispose()
     {
         if (_nsWindow != IntPtr.Zero && _isShowing)

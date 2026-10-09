@@ -28,6 +28,40 @@ namespace BlueSky.Editor
                     Directory.CreateDirectory(assets);
                 }
 
+                // Create Config folder and EOS.ini template
+                string configDir = Path.Combine(dirPath, "Config");
+                if (!Directory.Exists(configDir))
+                {
+                    Directory.CreateDirectory(configDir);
+                }
+
+                string eosIni = Path.Combine(configDir, "EOS.ini");
+                if (!File.Exists(eosIni))
+                {
+                    File.WriteAllText(eosIni, 
+                        "[EOS]\n" +
+                        "ProductId=\n" +
+                        "SandboxId=\n" +
+                        "DeploymentId=\n" +
+                        "ClientId=\n" +
+                        "ClientSecret=\n" +
+                        "ArtifactId=\n" +
+                        "ProductName=BlueSky Engine\n" +
+                        "ProductVersion=0.1.0\n");
+                }
+
+                string eosGuide = Path.Combine(configDir, "eos_setup_guide.md");
+                if (!File.Exists(eosGuide))
+                {
+                    File.WriteAllText(eosGuide,
+                        "# Epic Online Services (EOS) Authentication Setup Guide\n\n" +
+                        "This guide explains how to set up Epic Online Services (EOS) for BlueSky Engine, configure your application settings in the Epic Games Developer Portal, and enable real browser-based OAuth login.\n\n" +
+                        "1. Navigate to the Epic Games Developer Portal: https://dev.epicgames.com/portal/\n" +
+                        "2. Under Product Settings -> Clients, create a client.\n" +
+                        "3. Add the Redirect URI: http://localhost:8080/\n" +
+                        "4. Copy your credentials into Config/EOS.ini or configure them as environment variables.\n");
+                }
+
                 CurrentProjectDir = dirPath;
                 ProjectConfig.AddOrUpdateProject(dirPath);
                 return true;

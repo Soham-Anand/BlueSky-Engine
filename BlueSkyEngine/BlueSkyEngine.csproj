@@ -16,6 +16,17 @@
     <PackageReference Include="StbImageSharp" Version="2.30.15" />
   </ItemGroup>
 
+  <!-- EOS SDK native libraries -->
+  <ItemGroup Condition="$([MSBuild]::IsOSPlatform('OSX'))">
+    <None Include="../ThirdParty/EOSSDK/SDK/Bin/libEOSSDK-Mac-Shipping.dylib" CopyToOutputDirectory="PreserveNewest" Link="libEOSSDK-Mac-Shipping.dylib" />
+  </ItemGroup>
+  <ItemGroup Condition="$([MSBuild]::IsOSPlatform('Windows'))">
+    <None Include="../ThirdParty/EOSSDK/SDK/Bin/EOSSDK-Win64-Shipping.dll" CopyToOutputDirectory="PreserveNewest" Link="EOSSDK-Win64-Shipping.dll" />
+  </ItemGroup>
+  <ItemGroup Condition="$([MSBuild]::IsOSPlatform('Linux'))">
+    <None Include="../ThirdParty/EOSSDK/SDK/Bin/libEOSSDK-Linux-Shipping.so" CopyToOutputDirectory="PreserveNewest" Link="libEOSSDK-Linux-Shipping.so" />
+  </ItemGroup>
+
   <ItemGroup>
     <ProjectReference Include="..\TeaScript\TeaScript.csproj" />
   </ItemGroup>
@@ -24,7 +35,6 @@
     <None Remove="Shaders\**\*.air" />
     <None Remove="Editor\Shaders\**\*.air" />
     <None Remove="Rendering\Shaders\**\*.air" />
-    <None Remove="Rendering\EasePlus\Shaders\**\*.air" />
     <None Update="Shaders\**\*">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
@@ -53,42 +63,12 @@
     <Exec Command="xcrun -sdk macosx metal -c &quot;$(MSBuildProjectDirectory)/Editor/Shaders/horizon_lighting.metal&quot; -o &quot;$(MSBuildProjectDirectory)/Editor/Shaders/horizon_lighting.air&quot; -std=metal3.0 -O3 -ffast-math -mmacosx-version-min=11.0" />
     <Exec Command="xcrun -sdk macosx metallib &quot;$(MSBuildProjectDirectory)/Editor/Shaders/horizon_lighting.air&quot; -o &quot;$(MSBuildProjectDirectory)/Editor/Shaders/horizon_lighting.metallib&quot;" />
 
-    <!-- PBR Optimized -->
-    <Exec Command="xcrun -sdk macosx metal -c &quot;$(MSBuildProjectDirectory)/Editor/Shaders/pbr_optimized.metal&quot; -o &quot;$(MSBuildProjectDirectory)/Editor/Shaders/pbr_optimized.air&quot; -std=metal3.0 -O3 -ffast-math -mmacosx-version-min=11.0" />
-    <Exec Command="xcrun -sdk macosx metallib &quot;$(MSBuildProjectDirectory)/Editor/Shaders/pbr_optimized.air&quot; -o &quot;$(MSBuildProjectDirectory)/Editor/Shaders/pbr_optimized.metallib&quot;" />
-
     <!-- Polaris Upscale -->
     <Exec Command="xcrun -sdk macosx metal -c &quot;$(MSBuildProjectDirectory)/Rendering/Shaders/PolarisUpscale.metal&quot; -o &quot;$(MSBuildProjectDirectory)/Rendering/Shaders/PolarisUpscale.air&quot; -std=metal3.0 -O3 -ffast-math -mmacosx-version-min=11.0" />
     <Exec Command="xcrun -sdk macosx metallib &quot;$(MSBuildProjectDirectory)/Rendering/Shaders/PolarisUpscale.air&quot; -o &quot;$(MSBuildProjectDirectory)/Editor/Shaders/PolarisUpscale.metallib&quot;" />
 
-    <!-- EasePlus PrePass -->
-    <Exec Command="xcrun -sdk macosx metal -c &quot;$(MSBuildProjectDirectory)/Rendering/EasePlus/Shaders/easeplus_prepass.metal&quot; -o &quot;$(MSBuildProjectDirectory)/Rendering/EasePlus/Shaders/easeplus_prepass.air&quot; -std=metal3.0 -O3 -ffast-math -mmacosx-version-min=11.0" />
-    <Exec Command="xcrun -sdk macosx metallib &quot;$(MSBuildProjectDirectory)/Rendering/EasePlus/Shaders/easeplus_prepass.air&quot; -o &quot;$(MSBuildProjectDirectory)/Editor/Shaders/easeplus_prepass.metallib&quot;" />
-
-    <!-- EasePlus Lighting -->
-    <Exec Command="xcrun -sdk macosx metal -c &quot;$(MSBuildProjectDirectory)/Rendering/EasePlus/Shaders/easeplus_lighting.metal&quot; -o &quot;$(MSBuildProjectDirectory)/Rendering/EasePlus/Shaders/easeplus_lighting.air&quot; -std=metal3.0 -O3 -ffast-math -mmacosx-version-min=11.0" />
-    <Exec Command="xcrun -sdk macosx metallib &quot;$(MSBuildProjectDirectory)/Rendering/EasePlus/Shaders/easeplus_lighting.air&quot; -o &quot;$(MSBuildProjectDirectory)/Editor/Shaders/easeplus_lighting.metallib&quot;" />
-
-    <!-- EasePlus Material -->
-    <Exec Command="xcrun -sdk macosx metal -c &quot;$(MSBuildProjectDirectory)/Rendering/EasePlus/Shaders/easeplus_material.metal&quot; -o &quot;$(MSBuildProjectDirectory)/Rendering/EasePlus/Shaders/easeplus_material.air&quot; -std=metal3.0 -O3 -ffast-math -mmacosx-version-min=11.0" />
-    <Exec Command="xcrun -sdk macosx metallib &quot;$(MSBuildProjectDirectory)/Rendering/EasePlus/Shaders/easeplus_material.air&quot; -o &quot;$(MSBuildProjectDirectory)/Editor/Shaders/easeplus_material.metallib&quot;" />
-
-    <!-- EasePlus Grid -->
-    <Exec Command="xcrun -sdk macosx metal -c &quot;$(MSBuildProjectDirectory)/Rendering/EasePlus/Shaders/easeplus_grid.metal&quot; -o &quot;$(MSBuildProjectDirectory)/Rendering/EasePlus/Shaders/easeplus_grid.air&quot; -std=metal3.0 -O3 -ffast-math -mmacosx-version-min=11.0" />
-    <Exec Command="xcrun -sdk macosx metallib &quot;$(MSBuildProjectDirectory)/Rendering/EasePlus/Shaders/easeplus_grid.air&quot; -o &quot;$(MSBuildProjectDirectory)/Editor/Shaders/easeplus_grid.metallib&quot;" />
-
-    <!-- EasePlus PostFX -->
-    <Exec Command="xcrun -sdk macosx metal -c &quot;$(MSBuildProjectDirectory)/Rendering/EasePlus/Shaders/easeplus_postfx.metal&quot; -o &quot;$(MSBuildProjectDirectory)/Rendering/EasePlus/Shaders/easeplus_postfx.air&quot; -std=metal3.0 -O3 -ffast-math -mmacosx-version-min=11.0" />
-    <Exec Command="xcrun -sdk macosx metallib &quot;$(MSBuildProjectDirectory)/Rendering/EasePlus/Shaders/easeplus_postfx.air&quot; -o &quot;$(MSBuildProjectDirectory)/Editor/Shaders/easeplus_postfx.metallib&quot;" />
-
-    <!-- Copy compiled metallibs to Shaders folder so both copies are kept up-to-date -->
-    <Exec Command="cp &quot;$(MSBuildProjectDirectory)/Editor/Shaders/viewport_3d.metallib&quot; &quot;$(MSBuildProjectDirectory)/Shaders/viewport_3d.metallib&quot;" />
-    <Exec Command="cp &quot;$(MSBuildProjectDirectory)/Editor/Shaders/simple_ui.metallib&quot; &quot;$(MSBuildProjectDirectory)/Shaders/simple_ui.metallib&quot;" />
-    <Exec Command="cp &quot;$(MSBuildProjectDirectory)/Editor/Shaders/horizon_lighting.metallib&quot; &quot;$(MSBuildProjectDirectory)/Shaders/horizon_lighting.metallib&quot;" />
-    <Exec Command="cp &quot;$(MSBuildProjectDirectory)/Editor/Shaders/pbr_optimized.metallib&quot; &quot;$(MSBuildProjectDirectory)/Shaders/pbr_optimized.metallib&quot;" />
-
     <!-- Cleanup air files -->
-    <Exec Command="rm -f &quot;$(MSBuildProjectDirectory)/Editor/Shaders&quot;/*.air &quot;$(MSBuildProjectDirectory)/Rendering/EasePlus/Shaders&quot;/*.air &quot;$(MSBuildProjectDirectory)/Rendering/Shaders&quot;/*.air" />
+    <Exec Command="rm -f &quot;$(MSBuildProjectDirectory)/Editor/Shaders&quot;/*.air &quot;$(MSBuildProjectDirectory)/Rendering/Shaders&quot;/*.air" />
   </Target>
 
 </Project>

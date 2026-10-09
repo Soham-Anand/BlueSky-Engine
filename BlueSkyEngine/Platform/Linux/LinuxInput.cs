@@ -1,29 +1,34 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
+using System.Text;
 using BlueSky.Platform.Input;
 
 namespace BlueSky.Platform.Linux;
 
 /// <summary>
-/// Linux input context for X11 and Wayland windows.
+/// Linux input context for an X11 window.
 /// Handles keyboard (XKB) and pointer event translation.
 /// </summary>
 public sealed class LinuxInput : IInputContext
 {
-    private nint _display;
-    private bool _isWayland;
+    private X11Window? _x11Window;
     
     // Keyboard state
     private nint _xkbContext;
     private nint _xkbKeymap;
     private nint _xkbState;
     private bool[] _keyStates = new bool[256];
+    private bool[] _keysPressed = new bool[256];
+    private bool[] _keysReleased = new bool[256];
     
     // Pointer state
     private Vector2 _mousePosition;
     private Vector2 _mouseDelta;
     private Vector2 _scrollDelta;
+    private bool _hasMousePosition;
     private bool[] _mouseButtonStates = new bool[5];
+    private bool[] _mouseButtonsPressed = new bool[5];
+    private bool[] _mouseButtonsReleased = new bool[5];
     
     // Event queues
     private readonly Queue<KeyEvent> _keyQueue = new();
@@ -41,72 +46,48 @@ public sealed class LinuxInput : IInputContext
     public event Action<Vector2>? MouseMove;
     public event Action<Vector2>? MouseScroll;
 
-    public LinuxInput(nint display, bool isWayland = false)
+    public LinuxInput(X11Window window)
     {
-        _display = display;
-        _isWayland = isWayland;
-        
-        if (!isWayland && display != nint.Zero)
+        _x11Window = window ?? throw new ArgumentNullException(nameof(window));
+        _x11Window.X11Event += ProcessX11Event;
+        try
         {
             InitializeXkb();
         }
-        
-        Console.WriteLine($"[LinuxInput] Initialized for {(isWayland ? "Wayland" : "X11")}");
+        catch (Exception ex)
+        {
+            Dispose();
+            throw new PlatformNotSupportedException(
+                "Linux input requires libxkbcommon and a usable system keymap.", ex);
+        }
+        Console.WriteLine("[LinuxInput] Initialized for X11");
     }
     
     private void InitializeXkb()
     {
-        // XKB common library
-        const string XkbCommon = "libxkbcommon.so.0";
-        
-        try
-        {
-            // Create XKB context
-            _xkbContext = XkbCommonInterop.xkb_context_new(0);
-            if (_xkbContext == nint.Zero)
-            {
-                Console.WriteLine("[LinuxInput] Failed to create XKB context");
-                return;
-            }
-            
-            // Create default keymap
-            _xkbKeymap = XkbCommonInterop.xkb_keymap_new_from_names(
-                _xkbContext, 
-                nint.Zero, 
-                0);
-                
-            if (_xkbKeymap == nint.Zero)
-            {
-                Console.WriteLine("[LinuxInput] Failed to create XKB keymap");
-                XkbCommonInterop.xkb_context_unref(_xkbContext);
-                _xkbContext = nint.Zero;
-                return;
-            }
-            
-            // Create XKB state
-            _xkbState = XkbCommonInterop.xkb_state_new(_xkbKeymap);
-            if (_xkbState == nint.Zero)
-            {
-                Console.WriteLine("[LinuxInput] Failed to create XKB state");
-                XkbCommonInterop.xkb_keymap_unref(_xkbKeymap);
-                XkbCommonInterop.xkb_context_unref(_xkbContext);
-                _xkbContext = nint.Zero;
-                _xkbKeymap = nint.Zero;
-                return;
-            }
-            
-            Console.WriteLine("[LinuxInput] XKB initialized successfully");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[LinuxInput] XKB initialization failed: {ex.Message}");
-        }
+        _xkbContext = XkbCommonInterop.xkb_context_new(0);
+        if (_xkbContext == nint.Zero)
+            throw new InvalidOperationException("xkb_context_new returned null.");
+
+        _xkbKeymap = XkbCommonInterop.xkb_keymap_new_from_names(_xkbContext, nint.Zero, 0);
+        if (_xkbKeymap == nint.Zero)
+            throw new InvalidOperationException("xkb_keymap_new_from_names returned null.");
+
+        _xkbState = XkbCommonInterop.xkb_state_new(_xkbKeymap);
+        if (_xkbState == nint.Zero)
+            throw new InvalidOperationException("xkb_state_new returned null.");
+
+        Console.WriteLine("[LinuxInput] XKB initialized successfully");
     }
 
     public void BeginFrame()
     {
         _mouseDelta = Vector2.Zero;
         _scrollDelta = Vector2.Zero;
+        Array.Clear(_keysPressed);
+        Array.Clear(_keysReleased);
+        Array.Clear(_mouseButtonsPressed);
+        Array.Clear(_mouseButtonsReleased);
         
         // Process queued events
         ProcessKeyQueue();
@@ -120,15 +101,21 @@ public sealed class LinuxInput : IInputContext
             while (_keyQueue.Count > 0)
             {
                 var evt = _keyQueue.Dequeue();
-                if (evt.IsDown)
+                int keyIndex = (int)evt.KeyCode;
+                if (keyIndex <= 0 || keyIndex >= _keyStates.Length)
+                    continue;
+
+                if (evt.IsDown && !_keyStates[keyIndex])
                 {
-                    _keyStates[(int)evt.KeyCode] = true;
-                    KeyDown?.Invoke(evt.KeyCode, GetModifiers());
+                    _keyStates[keyIndex] = true;
+                    _keysPressed[keyIndex] = true;
+                    KeyDown?.Invoke(evt.KeyCode, evt.Modifiers);
                 }
-                else
+                else if (!evt.IsDown && _keyStates[keyIndex])
                 {
-                    _keyStates[(int)evt.KeyCode] = false;
-                    KeyUp?.Invoke(evt.KeyCode, GetModifiers());
+                    _keyStates[keyIndex] = false;
+                    _keysReleased[keyIndex] = true;
+                    KeyUp?.Invoke(evt.KeyCode, evt.Modifiers);
                 }
             }
         }
@@ -144,20 +131,28 @@ public sealed class LinuxInput : IInputContext
                 switch (evt.Type)
                 {
                     case MouseEventTypes.ButtonDown:
+                        if ((uint)evt.Button >= _mouseButtonStates.Length) break;
+                        if (_mouseButtonStates[(int)evt.Button]) break;
                         _mouseButtonStates[(int)evt.Button] = true;
+                        _mouseButtonsPressed[(int)evt.Button] = true;
                         MouseDown?.Invoke(evt.Button);
                         break;
                     case MouseEventTypes.ButtonUp:
+                        if ((uint)evt.Button >= _mouseButtonStates.Length) break;
+                        if (!_mouseButtonStates[(int)evt.Button]) break;
                         _mouseButtonStates[(int)evt.Button] = false;
+                        _mouseButtonsReleased[(int)evt.Button] = true;
                         MouseUp?.Invoke(evt.Button);
                         break;
                     case MouseEventTypes.Move:
-                        _mouseDelta = evt.Position - _mousePosition;
+                        if (_hasMousePosition)
+                            _mouseDelta += evt.Position - _mousePosition;
                         _mousePosition = evt.Position;
+                        _hasMousePosition = true;
                         MouseMove?.Invoke(_mousePosition);
                         break;
                     case MouseEventTypes.Scroll:
-                        _scrollDelta = evt.ScrollDelta;
+                        _scrollDelta += evt.ScrollDelta;
                         MouseScroll?.Invoke(_scrollDelta);
                         break;
                 }
@@ -165,19 +160,9 @@ public sealed class LinuxInput : IInputContext
         }
     }
 
-    public bool IsKeyDown(KeyCode key) => (int)key < 256 && _keyStates[(int)key];
-    
-    public bool IsKeyPressed(KeyCode key)
-    {
-        // Check if key was just pressed this frame
-        return false; // Would need previous frame state
-    }
-    
-    public bool IsKeyReleased(KeyCode key)
-    {
-        // Check if key was just released this frame
-        return false; // Would need previous frame state
-    }
+    public bool IsKeyDown(KeyCode key) => (uint)key < _keyStates.Length && _keyStates[(int)key];
+    public bool IsKeyPressed(KeyCode key) => (uint)key < _keysPressed.Length && _keysPressed[(int)key];
+    public bool IsKeyReleased(KeyCode key) => (uint)key < _keysReleased.Length && _keysReleased[(int)key];
     
     public ModifierKeys GetModifiers()
     {
@@ -210,14 +195,12 @@ public sealed class LinuxInput : IInputContext
         return modifiers;
     }
     
-    public bool IsMouseButtonDown(MouseButton button) 
-        => (int)button < 5 && _mouseButtonStates[(int)button];
-    
-    public bool IsMouseButtonPressed(MouseButton button) => false;
-    public bool IsMouseButtonReleased(MouseButton button) => false;
+    public bool IsMouseButtonDown(MouseButton button) => (uint)button < _mouseButtonStates.Length && _mouseButtonStates[(int)button];
+    public bool IsMouseButtonPressed(MouseButton button) => (uint)button < _mouseButtonsPressed.Length && _mouseButtonsPressed[(int)button];
+    public bool IsMouseButtonReleased(MouseButton button) => (uint)button < _mouseButtonsReleased.Length && _mouseButtonsReleased[(int)button];
 
     // X11 event processing
-    internal void ProcessX11Event(ref X11Interop.XEvent evt)
+    private void ProcessX11Event(X11Interop.XEvent evt)
     {
         switch (evt.Type)
         {
@@ -244,35 +227,28 @@ public sealed class LinuxInput : IInputContext
         if (_xkbState == nint.Zero)
             return;
         
-        // Extract keycode from event
-        var keycode = evt.Type & 0xFF; // Simplified - actual parsing needed
+        uint xkbKeycode = evt.Key.Keycode;
+        if (xkbKeycode == 0) return;
         
-        // Convert X11 keycode to XKB keycode
-        var xkbKeycode = (uint)(keycode - 8); // X11 keycode offset
-        
-        // Get XKB keysym
-        var keysym = XkbCommonInterop.xkb_state_key_get_one_sym(_xkbState, xkbKeycode);
-        
-        // Update XKB state
         XkbCommonInterop.xkb_state_update_key(_xkbState, xkbKeycode, 1); // XKB_KEY_DOWN
+        var keysym = XkbCommonInterop.xkb_state_key_get_one_sym(_xkbState, xkbKeycode);
         
         // Convert keysym to KeyCode
         var keyCode = KeysymToKeyCode(keysym);
         
         lock (_keyQueue)
         {
-            _keyQueue.Enqueue(new KeyEvent(keyCode, true));
+            _keyQueue.Enqueue(new KeyEvent(keyCode, true, GetModifiers()));
         }
         
         // Try to get character input
-        var buffer = new char[16];
+        var buffer = new byte[32];
         var len = XkbCommonInterop.xkb_keysym_to_utf8(keysym, buffer, (uint)buffer.Length);
-        if (len > 0)
+        if (len > 1)
         {
-            foreach (var c in new string(buffer).Take(len))
-            {
+            var text = Encoding.UTF8.GetString(buffer, 0, Math.Min(len - 1, buffer.Length));
+            foreach (var c in text)
                 CharInput?.Invoke(c);
-            }
         }
     }
     
@@ -281,24 +257,21 @@ public sealed class LinuxInput : IInputContext
         if (_xkbState == nint.Zero)
             return;
         
-        var keycode = evt.Type & 0xFF;
-        var xkbKeycode = (uint)(keycode - 8);
-        
-        XkbCommonInterop.xkb_state_update_key(_xkbState, xkbKeycode, 2); // XKB_KEY_UP
-        
+        uint xkbKeycode = evt.Key.Keycode;
+        if (xkbKeycode == 0) return;
         var keysym = XkbCommonInterop.xkb_state_key_get_one_sym(_xkbState, xkbKeycode);
+        XkbCommonInterop.xkb_state_update_key(_xkbState, xkbKeycode, 2); // XKB_KEY_UP
         var keyCode = KeysymToKeyCode(keysym);
         
         lock (_keyQueue)
         {
-            _keyQueue.Enqueue(new KeyEvent(keyCode, false));
+            _keyQueue.Enqueue(new KeyEvent(keyCode, false, GetModifiers()));
         }
     }
     
     private void HandleX11ButtonPress(X11Interop.XEvent evt)
     {
-        // Extract button number from event
-        var button = evt.Type & 0xFF; // Simplified
+        uint button = evt.Button.Button;
         
         MouseButton mouseButton = button switch
         {
@@ -307,28 +280,62 @@ public sealed class LinuxInput : IInputContext
             3 => MouseButton.Right,
             4 => MouseButton.X1, // Scroll up
             5 => MouseButton.X2, // Scroll down
-            _ => MouseButton.Left
+            _ => (MouseButton)(-1)
         };
         
-        // Handle scroll wheel (buttons 4 and 5 are scroll in X11)
-        if (button == 4 || button == 5)
+        // X11 buttons 4–7 are wheel directions; 8 and 9 are side buttons.
+        if (button >= 4 && button <= 7)
         {
-            var scroll = button == 4 ? 1 : -1;
+            var scroll = button switch { 4 => new Vector2(0, 1), 5 => new Vector2(0, -1), 6 => new Vector2(-1, 0), _ => new Vector2(1, 0) };
             lock (_mouseQueue)
             {
                 _mouseQueue.Enqueue(new MouseEvent(
                     MouseEventTypes.Scroll,
                     Vector2.Zero,
-                    new Vector2(0, scroll),
+                    scroll,
                     MouseButton.Left));
             }
         }
         else
         {
+            mouseButton = button switch { 8 => MouseButton.X1, 9 => MouseButton.X2, _ => mouseButton };
+            if ((int)mouseButton >= 0)
+            {
+                lock (_mouseQueue)
+                {
+                    _mouseQueue.Enqueue(new MouseEvent(
+                        MouseEventTypes.ButtonDown,
+                        Vector2.Zero,
+                        Vector2.Zero,
+                        mouseButton));
+                }
+            }
+        }
+    }
+    
+    private void HandleX11ButtonRelease(X11Interop.XEvent evt)
+    {
+        uint button = evt.Button.Button;
+        // X11 reports wheel activity as button press only.
+        if (button >= 4 && button <= 7)
+            return;
+        
+        MouseButton mouseButton = button switch
+        {
+            1 => MouseButton.Left,
+            2 => MouseButton.Middle,
+            3 => MouseButton.Right,
+            8 => MouseButton.X1,
+            9 => MouseButton.X2,
+            _ => (MouseButton)(-1)
+        };
+        
+        if ((int)mouseButton >= 0)
+        {
             lock (_mouseQueue)
             {
                 _mouseQueue.Enqueue(new MouseEvent(
-                    MouseEventTypes.ButtonDown,
+                    MouseEventTypes.ButtonUp,
                     Vector2.Zero,
                     Vector2.Zero,
                     mouseButton));
@@ -336,148 +343,96 @@ public sealed class LinuxInput : IInputContext
         }
     }
     
-    private void HandleX11ButtonRelease(X11Interop.XEvent evt)
-    {
-        var button = evt.Type & 0xFF;
-        
-        MouseButton mouseButton = button switch
-        {
-            1 => MouseButton.Left,
-            2 => MouseButton.Middle,
-            3 => MouseButton.Right,
-            _ => MouseButton.Left
-        };
-        
-        lock (_mouseQueue)
-        {
-            _mouseQueue.Enqueue(new MouseEvent(
-                MouseEventTypes.ButtonUp,
-                Vector2.Zero,
-                Vector2.Zero,
-                mouseButton));
-        }
-    }
-    
     private void HandleX11MotionNotify(X11Interop.XEvent evt)
     {
-        // Extract motion event data
-        // This is simplified - actual XEvent parsing needed
         lock (_mouseQueue)
         {
             _mouseQueue.Enqueue(new MouseEvent(
                 MouseEventTypes.Move,
-                _mousePosition,
+                new Vector2(evt.Motion.X, evt.Motion.Y),
                 Vector2.Zero,
                 MouseButton.Left));
         }
     }
     
-    // Wayland event processing
-    public void ProcessWaylandPointerMotion(float x, float y)
-    {
-        var newPos = new Vector2(x, y);
-        lock (_mouseQueue)
-        {
-            _mouseQueue.Enqueue(new MouseEvent(
-                MouseEventTypes.Move,
-                newPos,
-                Vector2.Zero,
-                MouseButton.Left));
-        }
-    }
-    
-    public void ProcessWaylandPointerButton(uint button, bool pressed)
-    {
-        var mouseButton = button switch
-        {
-            0x110 => MouseButton.Left,   // BTN_LEFT
-            0x111 => MouseButton.Right,  // BTN_RIGHT
-            0x112 => MouseButton.Middle, // BTN_MIDDLE
-            _ => MouseButton.Left
-        };
-        
-        lock (_mouseQueue)
-        {
-            _mouseQueue.Enqueue(new MouseEvent(
-                pressed ? MouseEventTypes.ButtonDown : MouseEventTypes.ButtonUp,
-                _mousePosition,
-                Vector2.Zero,
-                mouseButton));
-        }
-    }
-    
-    public void ProcessWaylandPointerAxis(float dx, float dy)
-    {
-        lock (_mouseQueue)
-        {
-            _mouseQueue.Enqueue(new MouseEvent(
-                MouseEventTypes.Scroll,
-                Vector2.Zero,
-                new Vector2(dx, dy),
-                MouseButton.Left));
-        }
-    }
-    
-    public void ProcessWaylandKey(uint keycode, bool pressed)
-    {
-        // Wayland sends evdev keycodes directly
-        var xkbKeycode = keycode + 8; // Convert to XKB keycode
-        
-        if (_xkbState != nint.Zero)
-        {
-            var keysym = XkbCommonInterop.xkb_state_key_get_one_sym(_xkbState, xkbKeycode);
-            XkbCommonInterop.xkb_state_update_key(
-                _xkbState, 
-                xkbKeycode, 
-                pressed ? 1u : 2u); // XKB_KEY_DOWN or XKB_KEY_UP
-            
-            var keyCode = KeysymToKeyCode(keysym);
-            
-            lock (_keyQueue)
-            {
-                _keyQueue.Enqueue(new KeyEvent(keyCode, pressed));
-            }
-        }
-    }
-
     private static KeyCode KeysymToKeyCode(uint keysym)
     {
-        // Convert XKB keysym to engine KeyCode
-        // This is a simplified mapping - full implementation would map all keys
-        
-        if (keysym >= 32 && keysym <= 126)
-            return (KeyCode)keysym; // ASCII range
-            
+        if (keysym is >= 'a' and <= 'z') return (KeyCode)((int)KeyCode.A + keysym - 'a');
+        if (keysym is >= 'A' and <= 'Z') return (KeyCode)((int)KeyCode.A + keysym - 'A');
+        if (keysym is >= '0' and <= '9') return (KeyCode)((int)KeyCode.D0 + keysym - '0');
+        if (keysym is >= 0xFFBE and <= 0xFFD5) return (KeyCode)((int)KeyCode.F1 + keysym - 0xFFBE);
+
         return keysym switch
         {
-            65307 => KeyCode.Escape,
-            65300 => KeyCode.Home,
-            65367 => KeyCode.End,
-            65301 => KeyCode.Up,
-            65362 => KeyCode.Up,
-            65302 => KeyCode.Down,
-            65364 => KeyCode.Down,
-            65303 => KeyCode.Right,
-            65363 => KeyCode.Right,
-            65304 => KeyCode.Left,
-            65361 => KeyCode.Left,
-            65288 => KeyCode.Backspace,
-            65293 => KeyCode.Enter,
-            65505 => KeyCode.LeftShift,
-            65506 => KeyCode.RightShift,
-            65507 => KeyCode.LeftControl,
-            65508 => KeyCode.RightControl,
-            65513 => KeyCode.LeftAlt,
-            65514 => KeyCode.RightAlt,
-            65515 => KeyCode.LeftSuper,
-            65516 => KeyCode.RightSuper,
-            65535 => KeyCode.Delete,
+            0x20 => KeyCode.Space,
+            0x27 => KeyCode.Apostrophe,
+            0x2C => KeyCode.Comma,
+            0x2D => KeyCode.Minus,
+            0x2E => KeyCode.Period,
+            0x2F => KeyCode.Slash,
+            0x3B => KeyCode.Semicolon,
+            0x3D => KeyCode.Equal,
+            0x5B => KeyCode.LeftBracket,
+            0x5C => KeyCode.Backslash,
+            0x5D => KeyCode.RightBracket,
+            0x60 => KeyCode.GraveAccent,
+            0xFF08 => KeyCode.Backspace,
+            0xFF09 => KeyCode.Tab,
+            0xFF0D => KeyCode.Enter,
+            0xFF1B => KeyCode.Escape,
+            0xFF50 => KeyCode.Home,
+            0xFF51 => KeyCode.Left,
+            0xFF52 => KeyCode.Up,
+            0xFF53 => KeyCode.Right,
+            0xFF54 => KeyCode.Down,
+            0xFF55 => KeyCode.PageUp,
+            0xFF56 => KeyCode.PageDown,
+            0xFF57 => KeyCode.End,
+            0xFF63 => KeyCode.Insert,
+            0xFFFF => KeyCode.Delete,
+            0xFFE1 => KeyCode.LeftShift,
+            0xFFE2 => KeyCode.RightShift,
+            0xFFE3 => KeyCode.LeftControl,
+            0xFFE4 => KeyCode.RightControl,
+            0xFFE9 => KeyCode.LeftAlt,
+            0xFFEA => KeyCode.RightAlt,
+            0xFFEB => KeyCode.LeftSuper,
+            0xFFEC => KeyCode.RightSuper,
+            0xFF7F => KeyCode.NumLock,
+            0xFF14 => KeyCode.ScrollLock,
+            0xFFE5 => KeyCode.CapsLock,
+            0xFF61 => KeyCode.PrintScreen,
+            0xFF13 => KeyCode.Pause,
+            0xFF67 => KeyCode.Menu,
+            0xFFB0 => KeyCode.Keypad0,
+            0xFFB1 => KeyCode.Keypad1,
+            0xFFB2 => KeyCode.Keypad2,
+            0xFFB3 => KeyCode.Keypad3,
+            0xFFB4 => KeyCode.Keypad4,
+            0xFFB5 => KeyCode.Keypad5,
+            0xFFB6 => KeyCode.Keypad6,
+            0xFFB7 => KeyCode.Keypad7,
+            0xFFB8 => KeyCode.Keypad8,
+            0xFFB9 => KeyCode.Keypad9,
+            0xFFAE => KeyCode.KeypadDecimal,
+            0xFFAF => KeyCode.KeypadDivide,
+            0xFFAA => KeyCode.KeypadMultiply,
+            0xFFAD => KeyCode.KeypadSubtract,
+            0xFFAB => KeyCode.KeypadAdd,
+            0xFF8D => KeyCode.KeypadEnter,
+            0xFFBD => KeyCode.KeypadEqual,
             _ => KeyCode.Unknown
         };
     }
 
     public void Dispose()
     {
+        if (_x11Window != null)
+        {
+            _x11Window.X11Event -= ProcessX11Event;
+            _x11Window = null;
+        }
+
         if (_xkbState != nint.Zero)
         {
             XkbCommonInterop.xkb_state_unref(_xkbState);
@@ -552,7 +507,7 @@ public sealed class LinuxInput : IInputContext
         [DllImport(XkbCommon)]
         public static extern int xkb_keysym_to_utf8(
             uint keysym, 
-            Span<char> buffer, 
+            [Out] byte[] buffer,
             uint buffer_size);
     }
     
@@ -569,11 +524,13 @@ public sealed class LinuxInput : IInputContext
     {
         public KeyCode KeyCode;
         public bool IsDown;
+        public ModifierKeys Modifiers;
         
-        public KeyEvent(KeyCode keyCode, bool isDown)
+        public KeyEvent(KeyCode keyCode, bool isDown, ModifierKeys modifiers)
         {
             KeyCode = keyCode;
             IsDown = isDown;
+            Modifiers = modifiers;
         }
     }
     

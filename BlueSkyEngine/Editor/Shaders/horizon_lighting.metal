@@ -39,7 +39,9 @@ struct ViewUniforms {
     float farPlane;
 };
 
-struct MaterialData {
+// Surface data (renamed; single global surface — no material system).
+// Field layout preserved so existing uniform uploads keep working.
+struct AstraSurface {
     packed_float3 albedo;
     float  metallic;
     float  roughness;
@@ -101,7 +103,7 @@ struct EntityUniforms {
 
 vertex VertexOut horizon_vertex(VertexIn in [[stage_in]],
                                  constant ViewUniforms& view [[buffer(10)]],
-                                 constant EntityUniforms& ent [[buffer(30)]])  // Entity data
+                                 constant EntityUniforms& ent [[buffer(12)]])  // Entity data
 {
     VertexOut out;
     
@@ -168,7 +170,9 @@ float3 calculateDirectionalLight(LightData light,
                                   float roughness,
                                   int quality)
 {
-    float3 L = -normalize(light.direction);
+    float directionLength = length(light.direction);
+    if (directionLength <= 1e-5) return float3(0.0);
+    float3 L = -light.direction / directionLength;
     float NdotL = max(dot(normal, L), 0.0);
     
     if (NdotL <= 0.0) return float3(0.0);
@@ -222,7 +226,7 @@ float3 calculatePointLight(LightData light,
     float3 toLight = light.position - worldPos;
     float distance = length(toLight);
     
-    if (distance >= light.range) return float3(0.0);
+    if (distance <= 1e-5 || distance >= light.range) return float3(0.0);
     
     float3 L = toLight / distance;
     float NdotL = max(dot(normal, L), 0.0);
@@ -278,7 +282,7 @@ float3 calculateSpotLight(LightData light,
     float3 toLight = light.position - worldPos;
     float distance = length(toLight);
     
-    if (distance >= light.range) return float3(0.0);
+    if (distance <= 1e-5 || distance >= light.range) return float3(0.0);
     
     float3 L = toLight / distance;
     float NdotL = max(dot(normal, L), 0.0);
@@ -286,15 +290,17 @@ float3 calculateSpotLight(LightData light,
     if (NdotL <= 0.0) return float3(0.0);
     
     // Spot cone attenuation
-    float spotDot = dot(-L, normalize(light.direction));
+    float directionLength = length(light.direction);
+    if (directionLength <= 1e-5) return float3(0.0);
+    float spotDot = clamp(dot(-L, light.direction / directionLength), -1.0, 1.0);
     float spotAngle = acos(spotDot);
     
     if (spotAngle > light.outerAngle) return float3(0.0);
     
     float spotAttenuation = 1.0;
     if (spotAngle > light.innerAngle) {
-        float t = (spotAngle - light.innerAngle) / (light.outerAngle - light.innerAngle);
-        spotAttenuation = 1.0 - (t * t);
+        float t = clamp((spotAngle - light.innerAngle) / max(light.outerAngle - light.innerAngle, 1e-5), 0.0, 1.0);
+        spotAttenuation = 1.0 - t * t * (3.0 - 2.0 * t);
     }
     
     float3 V = viewDir;
@@ -390,11 +396,14 @@ float3 calculateSimpleIBL(float3 normal,
     
     float3 ambient = (skyContribution + groundContribution) * albedo;
     
-    // Add subtle reflection for metallic/smooth surfaces
-    float reflectivity = metallic * (1.0 - roughness);
+    // Add a restrained Fresnel reflection, tinted by metallic base color.
+    // A scalar metallic weight made bright sky reflections bleach colored metal.
     float3 reflectionDir = reflect(-viewDir, normal);
     float reflectionSky = max(0.0, reflectionDir.y);
-    ambient += skyColor * reflectionSky * reflectivity * 0.3;
+    float NdotV = saturate(dot(normal, viewDir));
+    float3 F0 = mix(float3(0.04), albedo, metallic);
+    float3 fresnel = F0 + (1.0 - F0) * pow(1.0 - NdotV, 5.0);
+    ambient += skyColor * reflectionSky * fresnel * (1.0 - roughness) * 0.3;
     
     return ambient * ao;
 }
@@ -442,47 +451,48 @@ float3 calculateVolumetrics(float3 worldPos,
     return volumetricColor / 4.0;
 }
 
+// ── Khronos PBR Neutral (engine-wide single curve; mirrors viewport_3d.metal)
+float3 PBRNeutral(float3 color) {
+    const float startCompression = 0.8 - 0.04;
+    const float desaturation = 0.15;
+    float x = min(color.r, min(color.g, color.b));
+    float offset = x < 0.08 ? x - 6.25 * x * x : 0.04;
+    color -= offset;
+    float peak = max(color.r, max(color.g, color.b));
+    if (peak < startCompression) return color;
+    const float d = 1.0 - startCompression;
+    float newPeak = 1.0 - d * d / (peak + d - startCompression);
+    color *= newPeak / max(peak, 1e-6);
+    float g = 1.0 - 1.0 / (desaturation * (peak - newPeak) + 1.0);
+    return mix(color, float3(newPeak), g);
+}
+
+// ── Exact sRGB output encoding (linear → sRGB, piecewise)
+float3 LinearToSRGB(float3 c) {
+    c = saturate(c);
+    float3 low = c * 12.92;
+    float3 high = 1.055 * pow(c, float3(1.0 / 2.4)) - 0.055;
+    return mix(low, high, step(float3(0.0031308), c));
+}
+
 // ============================================================================
 // Fragment Shader
 fragment float4 horizon_fragment(VertexOut in [[stage_in]],
-                                  constant ViewUniforms& view [[buffer(10)]],
-                                  constant MaterialData& material [[buffer(11)]], 
-                                  constant LightData* lights [[buffer(12)]],      
-                                  constant int& lightCount [[buffer(13)]],        
-                                  constant LightingSettings& settings [[buffer(14)]],
-                                  texture2d<float> albedoMap [[texture(2)]],
-                                  texture2d<float> normalMap [[texture(3)]],
-                                  texture2d<float> rmaMap [[texture(4)]])
+                                   constant ViewUniforms& view [[buffer(10)]],
+                                   constant AstraSurface& surface [[buffer(11)]], 
+                                   constant LightData* lights [[buffer(12)]],      
+                                   constant int& lightCount [[buffer(13)]],        
+                                   constant LightingSettings& settings [[buffer(14)]])
 {
-    constexpr sampler texSampler(address::repeat, filter::linear, mip_filter::linear);
-
-    // Sample material properties
-    float3 albedo = material.albedo;
-    if (material.useAlbedoTex != 0) {
-        float4 texColor = albedoMap.sample(texSampler, in.uv);
-        albedo *= texColor.rgb;
-    }
+    // No material system: surface constant carries the global clay.
+    // Texture slots unbound by design.
+    float3 albedo = surface.albedo;
     
     float3 normal = normalize(in.normal);
-    if (material.useNormalTex != 0) {
-        // Basic tangent space mapping approximation (assuming flat UVs for now, proper TBN requires tangent vector)
-        float3 texNormal = normalMap.sample(texSampler, in.uv).rgb * 2.0 - 1.0;
-        // Simplified blend
-        normal = normalize(normal + texNormal * 0.5); 
-    }
     
-    float metallic = material.metallic;
-    float roughness = material.roughness;
-    float ao = material.ao;
-    
-    if (material.useRMATex != 0) {
-        float3 rma = rmaMap.sample(texSampler, in.uv).rgb;
-        roughness = rma.g;  // G = Roughness
-        metallic = rma.b;   // B = Metallic
-        // Note: some GLTF packings might use R=AO, G=Roughness, B=Metallic, or other variants. 
-        // Standard engine packing: R=AO, G=Roughness, B=Metallic
-        ao *= rma.r;
-    }
+    float metallic = surface.metallic;
+    float roughness = surface.roughness;
+    float ao = surface.ao;
     
     roughness = max(MIN_ROUGHNESS, roughness);
     
@@ -545,21 +555,14 @@ fragment float4 horizon_fragment(VertexOut in [[stage_in]],
     // Combine
     float3 finalColor = directLighting + ambient + volumetric;
     
-    // Emission
-    finalColor += albedo * material.emission;
-    
     // Exposure adjustment
     finalColor *= settings.exposure;
     
-    // Tone mapping (Improved ACES Filmic)
-    float3 x = max(float3(0.0), finalColor - 0.004);
-    finalColor = (x * (6.2 * x + 0.5)) / (x * (6.2 * x + 1.7) + 0.06);
+    // Tone mapping (Khronos PBR Neutral — engine-wide single curve)
+    finalColor = PBRNeutral(finalColor);
     
-    // Subtle color grading for warmth
-    finalColor *= float3(1.02, 1.0, 0.98);
-    
-    // Gamma correction
-    finalColor = pow(finalColor, float3(1.0 / 2.2));
+    // Output encoding (exact sRGB)
+    finalColor = LinearToSRGB(finalColor);
     
     return float4(finalColor, 1.0);
 }
@@ -575,7 +578,7 @@ struct ShadowVertexOut {
 
 vertex ShadowVertexOut horizon_shadow_vertex(VertexIn in [[stage_in]],
                                               constant float4x4& lightSpaceMatrix [[buffer(10)]],
-                                              constant EntityUniforms& ent [[buffer(30)]])
+                                              constant EntityUniforms& ent [[buffer(12)]])
 {
     ShadowVertexOut out;
     float4 worldPos = ent.model * float4(in.position, 1.0);

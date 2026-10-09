@@ -1,8 +1,8 @@
 using BlueSky.Platform;
 using System.Runtime.InteropServices;
-using static NotBSRenderer.Metal.MetalInterop;
+using static BlueSky.Rendering.RHI.Metal.MetalInterop;
 
-namespace NotBSRenderer.Metal;
+namespace BlueSky.Rendering.RHI.Metal;
 
 internal class MetalSwapchain : IRHISwapchain
 {
@@ -49,9 +49,10 @@ internal class MetalSwapchain : IRHISwapchain
         var setPixelFormatSel = GetSelector("setPixelFormat:");
         objc_msgSend_void_ulong(_metalLayer, setPixelFormatSel, ToMTLPixelFormat(Format));
         
-        // Set framebufferOnly to optimize GPU performance
+        // framebufferOnly disabled so Strata benchmark screenshots can blit
+        // from the drawable. Negligible cost on tile-based/shared-memory GPUs.
         var setFramebufferOnlySel = GetSelector("setFramebufferOnly:");
-        SetBoolNative(_metalLayer, setFramebufferOnlySel, true);
+        SetBoolNative(_metalLayer, setFramebufferOnlySel, false);
         
         // Set displaySyncEnabled based on presentMode (VSync or Immediate)
         var setDisplaySyncEnabledSel = GetSelector("setDisplaySyncEnabled:");

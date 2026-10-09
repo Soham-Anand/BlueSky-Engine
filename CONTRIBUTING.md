@@ -105,11 +105,11 @@ dotnet test
 
 ```
 BlueSkyEngine/
-├── Core/           # Engine core (ECS, memory, threading)
+├── Core/           # Engine core (ECS, assets, scenes, and gameplay)
 ├── Rendering/      # Rendering pipeline
 ├── RHI/            # Metal, Vulkan, DX11 backends
-├── Physics/        # Jolt physics integration
-├── Animation/      # Skeletal animation system
+├── Airborne/       # Jolt physics integration
+├── Motif/          # Skeletal animation system
 ├── Audio/          # 3D audio system
 ├── Editor/         # Editor UI and tools
 └── Platform/       # Platform-specific window code

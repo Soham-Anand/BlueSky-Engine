@@ -72,6 +72,7 @@ public class Lexer
                     AddToken(TokenType.Slash);
                 }
                 break;
+            case '%': AddToken(TokenType.Percent); break;
             case '=':
                 AddToken(Match('=') ? TokenType.Equal : TokenType.Assign);
                 break;

@@ -3,7 +3,7 @@ using System.Numerics;
 using System.Runtime.InteropServices;
 using System.Collections.Generic;
 
-namespace NotBSRenderer.Vulkan;
+namespace BlueSky.Rendering.RHI.Vulkan;
 
 /// <summary>
 /// Vulkan command buffer implementation. Records GPU commands into a VkCommandBuffer.
@@ -28,6 +28,7 @@ internal sealed class VulkanCommandBuffer : IRHICommandBuffer
     private readonly List<IntPtr> _transientFramebuffers = new();
     private readonly List<IntPtr> _transientRenderPasses = new();
     private readonly Dictionary<ulong, BoundDescriptor> _boundDescriptors = new();
+    private readonly List<VulkanBuffer> _inlineUniformBuffers = new();
 
     internal IntPtr Handle => _commandBuffer;
 
@@ -371,29 +372,40 @@ internal sealed class VulkanCommandBuffer : IRHICommandBuffer
         BindDescriptorSets();
     }
 
-    public void SetBindlessResourceTable(uint set, ReadOnlySpan<BindlessResourceHandle> handles)
-    {
-        // Bindless descriptor set binding
-    }
+    public void SetVertexUniforms(uint binding, ReadOnlySpan<byte> data) => SetInlineUniform(binding, data);
 
-    public void SetVertexUniforms(uint binding, ReadOnlySpan<byte> data)
-    {
-        // Vulkan uses explicit buffers for uniform data in this RHI path.
-    }
+    public void SetFragmentUniforms(uint binding, ReadOnlySpan<byte> data) => SetInlineUniform(binding, data);
 
-    public void SetFragmentUniforms(uint binding, ReadOnlySpan<byte> data)
-    {
-        // Vulkan uses explicit buffers for uniform data in this RHI path.
-    }
+    public void SetComputeUniforms(uint binding, ReadOnlySpan<byte> data) => SetInlineUniform(binding, data);
 
-    public void SetComputeUniforms(uint binding, ReadOnlySpan<byte> data)
+    private void SetInlineUniform(uint binding, ReadOnlySpan<byte> data)
     {
-        // Vulkan uses explicit buffers for uniform data in this RHI path.
+        if (data.IsEmpty)
+            throw new ArgumentException("Uniform data cannot be empty.", nameof(data));
+
+        ulong key = VulkanPipeline.DescriptorKey(0, binding);
+        if (_currentPipeline == null || !_currentPipeline.DescriptorBindings.TryGetValue(key, out var descriptor))
+            throw new InvalidOperationException($"The active Vulkan pipeline has no uniform binding at set 0, binding {binding}.");
+        if (descriptor.DescriptorType != VulkanInterop.VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)
+            throw new InvalidOperationException($"Vulkan set 0, binding {binding} is not a uniform-buffer descriptor.");
+
+        var buffer = (VulkanBuffer)_owner.CreateBuffer(new BufferDesc
+        {
+            Size = (ulong)data.Length,
+            Usage = BufferUsage.Uniform,
+            MemoryType = MemoryType.CpuToGpu,
+            DebugName = $"Vulkan.InlineUniform.{binding}"
+        });
+        _owner.UploadBuffer(buffer, data);
+        _inlineUniformBuffers.Add(buffer);
+        _boundDescriptors[key] = new BoundDescriptor(VulkanInterop.VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, buffer);
+        BindDescriptorSets();
     }
 
     public void SetVertexUniforms(uint binding, ref Matrix4x4 matrix)
     {
-        // Vulkan uses explicit buffers for uniform data in this RHI path.
+        ReadOnlySpan<Matrix4x4> matrixSpan = MemoryMarshal.CreateReadOnlySpan(ref matrix, 1);
+        SetInlineUniform(binding, MemoryMarshal.AsBytes(matrixSpan));
     }
 
     private void BindDescriptorSets()
@@ -572,12 +584,16 @@ internal sealed class VulkanCommandBuffer : IRHICommandBuffer
 
     public void DrawIndirect(IRHIBuffer buffer, ulong offset, uint drawCount, uint stride)
     {
+        if (drawCount > 1 && !_owner.Capabilities.HasFlag(RHICapabilities.MultiDrawIndirect))
+            throw new NotSupportedException("This Vulkan device does not support multi-draw indirect commands.");
         var vkBuf = (VulkanBuffer)buffer;
         VulkanInterop.vkCmdDrawIndirect(_commandBuffer, vkBuf.Handle, offset, drawCount, stride);
     }
 
     public void DrawIndexedIndirect(IRHIBuffer buffer, ulong offset, uint drawCount, uint stride)
     {
+        if (drawCount > 1 && !_owner.Capabilities.HasFlag(RHICapabilities.MultiDrawIndirect))
+            throw new NotSupportedException("This Vulkan device does not support multi-draw indirect commands.");
         var vkBuf = (VulkanBuffer)buffer;
         VulkanInterop.vkCmdDrawIndexedIndirect(_commandBuffer, vkBuf.Handle, offset, drawCount, stride);
     }
@@ -860,6 +876,10 @@ internal sealed class VulkanCommandBuffer : IRHICommandBuffer
             VulkanInterop.vkDestroyDescriptorPool(_owner.Device, _descriptorPool, IntPtr.Zero);
             _descriptorPool = IntPtr.Zero;
         }
+
+        foreach (var buffer in _inlineUniformBuffers)
+            buffer.Dispose();
+        _inlineUniformBuffers.Clear();
 
         if (_commandPool != IntPtr.Zero)
         {

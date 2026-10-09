@@ -11,7 +11,7 @@ using BlueSky.Core.Math;
 using BlueSky.Rendering;
 using BlueSky.Core.Scripting;
 using BlueSky.Core.Scene;
-using NotBSRenderer;
+using BlueSky.Rendering.RHI;
 
 namespace BlueSky.Editor;
 
@@ -19,6 +19,8 @@ partial class Program
 {
     private static void BuildProjectBrowserUI()
     {
+        ProjectConfig.ApplyCompletedDesktopProjectScan();
+
         float w = _window!.Size.X;
         float h = _window!.Size.Y;
 
@@ -86,7 +88,7 @@ partial class Program
         _ui.SetCursor(24, h - 72);
         _ui.Text("Renderer", EditorTheme.TextDisabled);
         _ui.SetCursor(24, h - 50);
-        _ui.Text("Forward+ / Ease+", EditorTheme.TextMuted);
+        _ui.Text("Forward+", EditorTheme.TextMuted);
         _ui.SetCursor(24, h - 26);
         _ui.Text("v0.1.0-alpha", EditorTheme.TextDisabled);
 
@@ -258,7 +260,7 @@ partial class Program
             }
             else
             {
-                float cardW = 260, cardH = 80, gap = 12;
+                float cardH = 80, gap = 12;
 
                 for (int i = 0; i < recent.Count; i++)
                 {
@@ -347,7 +349,6 @@ partial class Program
             }
         }
 
-        _ui.EndFrame();
     }
 
     private static void TransitionToWorkspace()
@@ -358,11 +359,9 @@ partial class Program
         // Initialize TeaScript system
         _teaScriptSystem = new BlueSky.Core.Scripting.TeaScriptSystem(_world);
         _teaScriptSystem.SetInputProviders(IsTeaScriptKeyDown, IsTeaScriptMouseButtonDown);
-        Console.WriteLine("[Editor] TeaScriptSystem initialized");
         
         // Initialize Terrain system
         _terrainSystem = new BlueSky.Rendering.TerrainSystem(_world);
-        Console.WriteLine("[Editor] TerrainSystem initialized");
         
         // Car Controller system is initialized after the Viewport is created (see below)
         
@@ -370,44 +369,7 @@ partial class Program
         string projectName = Path.GetFileName(ProjectManager.CurrentProjectDir) ?? "Project";
         _notificationSystem?.ShowSuccess($"Welcome to {projectName}!", duration: 3f);
 
-        // Create a simple cube entity with TransformComponent
-        var entity1 = _world.CreateEntity();
-        var transform1 = new TransformComponent
-        {
-            Position = new BlueSky.Core.Math.Vector3(0, 1, 0),
-            Rotation = BlueSky.Core.Math.Quaternion.Identity,
-            Scale = BlueSky.Core.Math.Vector3.One
-        };
-        _world.AddComponent(entity1, transform1);
-        _world.AddComponent(entity1, new BlueSky.Core.ECS.Builtin.StaticMeshComponent { MeshAssetId = "CorvetteC7" });
-        _world.AddComponent(entity1, new BlueSky.Core.ECS.Builtin.RigidbodyComponent { Mass = 1400f, Drag = 0.5f, AngularDrag = 2.0f, UseGravity = true, IsKinematic = false });
-        _world.AddComponent(entity1, new BlueSky.Core.ECS.Builtin.ColliderComponent { Type = BlueSky.Core.ECS.Builtin.ColliderType.Box, Size = new System.Numerics.Vector3(2.0f, 1.2f, 4.5f), Friction = 0.8f, Restitution = 0.1f });
 
-        // Create a second cube entity
-        var entity2 = _world.CreateEntity();
-        var transform2 = new TransformComponent
-        {
-            Position = new BlueSky.Core.Math.Vector3(2, 1, 0),
-            Rotation = BlueSky.Core.Math.Quaternion.Identity,
-            Scale = BlueSky.Core.Math.Vector3.One
-        };
-        _world.AddComponent(entity2, transform2);
-        _world.AddComponent(entity2, new BlueSky.Core.ECS.Builtin.StaticMeshComponent { MeshAssetId = "CorvetteC7" });
-        _world.AddComponent(entity2, new BlueSky.Core.ECS.Builtin.RigidbodyComponent { Mass = 1400f, Drag = 0.5f, AngularDrag = 2.0f, UseGravity = true, IsKinematic = false });
-        _world.AddComponent(entity2, new BlueSky.Core.ECS.Builtin.ColliderComponent { Type = BlueSky.Core.ECS.Builtin.ColliderType.Box, Size = new System.Numerics.Vector3(2.0f, 1.2f, 4.5f), Friction = 0.8f, Restitution = 0.1f });
-
-        // Create a third cube entity
-        var entity3 = _world.CreateEntity();
-        var transform3 = new TransformComponent
-        {
-            Position = new BlueSky.Core.Math.Vector3(-2, 1, 0),
-            Rotation = BlueSky.Core.Math.Quaternion.Identity,
-            Scale = BlueSky.Core.Math.Vector3.One
-        };
-        _world.AddComponent(entity3, transform3);
-        _world.AddComponent(entity3, new BlueSky.Core.ECS.Builtin.StaticMeshComponent { MeshAssetId = "CorvetteC7" });
-        _world.AddComponent(entity3, new BlueSky.Core.ECS.Builtin.RigidbodyComponent { Mass = 1400f, Drag = 0.5f, AngularDrag = 2.0f, UseGravity = true, IsKinematic = false });
-        _world.AddComponent(entity3, new BlueSky.Core.ECS.Builtin.ColliderComponent { Type = BlueSky.Core.ECS.Builtin.ColliderType.Box, Size = new System.Numerics.Vector3(2.0f, 1.2f, 4.5f), Friction = 0.8f, Restitution = 0.1f });
 
         // Initialize UE5-style docking layout FIRST
         float w = _window!.Size.X, h = _window.Size.Y;
@@ -431,6 +393,9 @@ partial class Program
         _dockingSystem.DockTo("content", DockPosition.Bottom);
         _dockingSystem.DockTo("console", "content", DockPosition.Center); // Tab with content browser
 
+        // Strata last: it tabs into Details, which must already be docked.
+        RegisterStrataPanel();
+
         // ── Viewport 3D rendering ─────────────────────────────────────
         try
         {
@@ -440,23 +405,11 @@ partial class Program
             var viewportRenderer = new BlueSky.Editor.ViewportRenderer(_rhi!, _world, _terrainSystem);
             _editorViewportRenderer = viewportRenderer;
 
-            if (_useEaseRenderer)
-            {
-                var easeRenderer = new BlueSky.Rendering.EasePlus.EasePlusRenderer(_window!, _rhi!);
-                easeRenderer.SetViewportRenderer(viewportRenderer);
-                easeRenderer.Initialize();
-                mainRenderer = easeRenderer;
-                Console.WriteLine("[Editor] Started with Ease+ Ultimate Renderer");
-            }
-            else
-            {
-                var ultraRenderer = new UltraRenderer(_window!, _rhi!);
-                ultraRenderer.SetViewportRenderer(viewportRenderer);
-                ultraRenderer.Initialize();
-                
-                mainRenderer = ultraRenderer;
-                Console.WriteLine("[Editor] Started with UltraRenderer (Forward+)");
-            }
+            var bsrRenderer = new BSRRenderer(_window!, _rhi!);
+            bsrRenderer.SetViewportRenderer(viewportRenderer);
+            bsrRenderer.Initialize();
+            
+            mainRenderer = bsrRenderer;
 
             _viewport = new BlueSky.Rendering.Viewport(_window!, _input!, _world, mainRenderer);
         }
@@ -476,7 +429,6 @@ partial class Program
         if (_input != null && _viewport != null)
         {
             _carControllerSystem.Initialize(_world, _input, _viewport);
-            Console.WriteLine("[Editor] CarControllerSystem initialized - Press F to possess cars!");
         }
         else
         {

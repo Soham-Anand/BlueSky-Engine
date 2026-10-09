@@ -32,7 +32,9 @@ public class AIBrain
     {
         // Find highest priority behavior that can run
         AIBehavior? nextBehavior = null;
-        foreach (var behavior in Behaviors)
+        // Behavior scripts may register another behavior while executing.
+        // Iterate a snapshot so registration cannot invalidate this traversal.
+        foreach (var behavior in Behaviors.ToArray())
         {
             if (behavior.CanExecute())
             {

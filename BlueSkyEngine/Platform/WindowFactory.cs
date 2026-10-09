@@ -26,10 +26,8 @@ public static class WindowFactory
             if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("DISPLAY")))
                 return new Linux.X11Window(options);
 
-            if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WAYLAND_DISPLAY")))
-                return new Linux.WaylandWindow(options);
-
-            throw new PlatformNotSupportedException("Linux windowing requires DISPLAY or WAYLAND_DISPLAY.");
+            throw new PlatformNotSupportedException(
+                "Linux windowing currently requires an X11 display (DISPLAY). Wayland-only sessions are not supported.");
         }
         else
         {
@@ -54,11 +52,7 @@ public static class WindowFactory
         }
         else if (window is Linux.X11Window x11Window)
         {
-            return new Linux.LinuxInput(x11Window.GetDisplayHandle(), isWayland: false);
-        }
-        else if (window is Linux.WaylandWindow waylandWindow)
-        {
-            return new Linux.LinuxInput(waylandWindow.GetWaylandDisplay(), isWayland: true);
+            return new Linux.LinuxInput(x11Window);
         }
         else
         {

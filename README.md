@@ -45,7 +45,7 @@ CPU ray tracing research • TeaScript • BSR rendering • Horizon lighting �
 | **Metal Backend** | 🚧 Partial | Most complete backend (render + compute). No iOS support, no tile-based deferred path. |
 | **Vulkan Backend** | 🚧 Partial | Hand-rolled loader (X11/Win32/MoltenVK surfaces). Requires SPIR-V bytecode; no `.spv` binaries ship in-tree, so Vulkan UI/mesh pipelines warn and fall back. |
 | **DirectX 11 Backend** | 🚧 Partial | Windows raster backend (VS+PS, input layout, blend/depth, DXGI swapchain). Compute pipelines and storage-resource binding throw `NotSupportedException` by design. |
-| **Vectra particles** | ❌ Absent | No particle code exists in-tree (name reserved for a future system). |
+| **Vectra particles** | 🚧 Partial | CPU particle pool (8,192 cap), emitters, and a sprite renderer drawn in the editor and game viewports. TeaScript API: `addEmitter`, `setEmitterPos`, `setEmitterRate`, `removeEmitter`, `burst`, `particleCount`, `clearParticles`. Emitters come from scripts or the editor's demo smoke emitter (System Actor panel); there is no ECS emitter component and emitters are not saved in scenes. |
 | **Horizon lighting** | 🚧 In Progress | The viewport consumes ECS lights through the Horizon shader path. Forward+ culling, contact-shadow rendering, and volumetric passes remain incomplete. |
 | **Skeletal Animation** | 🚧 Partial | Skeletal rig/skin/clip data import; `AnimationClip.Sample()` interpolates. No runtime playback controller, no IK, no runtime LOD selection. |
 | **Terrain System** | ✅ Mostly complete | Heightmap rendering, brush sculpting, raycast, Jolt heightfield collision. `ChunkSize`/`LodCount` are stored per terrain but the renderer draws the full mesh (no runtime LOD selection yet). |
@@ -91,16 +91,19 @@ CPU ray tracing research • TeaScript • BSR rendering • Horizon lighting �
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| **Playback backend** | ❌ Planned | Zero `IAudioBackend` implementations in-tree; `Echo` orchestrates with nothing to play through. |
-| **Spatial audio** | 🚧 Partial (silent) | Attenuation, panning, Doppler approximation, and Airborne raycast occlusion are computed; no audible output without a backend. |
-| **DSP Effects** | ❌ Planned | Reverb, filters planned |
+| **Playback backend** | ✅ Implemented | Cross-platform `MiniAudioBackend` (miniaudio via Miniaudio-CS) with one `ma_engine`, per-source `ma_sound`, listener tracking, and graceful silent fallback when no device exists. WAV/MP3/FLAC decode natively; OGG/Vorbis decodes through NVorbis into an in-memory miniaudio buffer. |
+| **Spatial audio** | ✅ Implemented | Attenuation, panning, Doppler approximation, Airborne raycast occlusion, and 3D positioning applied through the miniaudio engine. |
+| **ECS integration** | ✅ Implemented | `EchoSystem` turns entities with `AudioSourceComponent` + `TransformComponent` into live voices (lazy clip loading, PlayOnStart/IsPlaying, positional updates, cleanup). |
+| **Content browser & placement** | ✅ Implemented | `.wav`/`.ogg` (plus `.mp3`/`.flac`) show in the Content Browser, import into `Assets/`, preview on double-click, and drag into the viewport to spawn an Audio Source that plays on Play. |
+| **Scripting** | ✅ Implemented | TeaScript `playSound`, `playMusic`, `stopAllSounds`, and `setAudioVolume` bind through `EchoTeaScriptBridge`. |
+| **DSP Effects** | ✅ Implemented | Echo Super assets (`.echosuper`) hold an effect chain applied live during playback: gain, EQ, low-pass, high-pass, delay, reverb, compressor, distortion. Edited in the Echo window. |
 
 ### 🤖 Overthinking AI & TeaScript
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| **TeaScript Language** | ✅ Complete (small) | Lexer → Parser → tree-walk runtime with hot-reload, step/depth guards. No `for` loops, classes, or modules; calls are `Ident(args)` only. |
-| **TeaScript C# Bindings** | ✅ Complete | Native engine API access for UI and physics; audio playback bindings are not wired. |
+| **TeaScript Language** | ✅ Complete (small) | Lexer → Parser → tree-walk runtime with hot-reload, step/depth guards. C-style `for` + `break`/`continue`, `while`, arrays, core math/array stdlib (`len/push/pop/sqrt/sin/cos/...`). No classes or modules; calls are `Ident(args)` only. |
+| **TeaScript C# Bindings** | ✅ Complete | Native engine API access for UI, physics, Echo audio, and Vectra particles. |
 | **Overthinking AI System** | 🧪 Orphaned | Brain/behavior classes exist but nothing in editor/runtime registers or ticks them (only referenced by tests). |
 | **NavMesh** | ❌ Planned | No pathfinding code in-tree |
 
@@ -269,32 +272,24 @@ dotnet run --project ./BlueSkyEngine/BlueSkyEngine.csproj
 
 ```
 BlueSkyEngine/
-├── Core/
-│   ├── ECS/              # Keystone: Entity Component System
-│   ├── Scene/            # Keystone: scene serialization
-│   └── Gameplay/         # Controllers and vehicle systems
-├── Rendering/
-│   ├── Strata/           # Material format, importer, and surface data
-│   ├── RayTracing/
-│   │   └── Polaris/      # CPU ray tracer
-│   └── TerrainSystem.cs  # Terra
-├── RHI/                  # BSR graphics API layer
-│   ├── Metal/            # macOS/iOS backend
-│   ├── Vulkan/           # Cross-platform backend
-│   └── DirectX11/        # Windows backend
-├── Airborne/
-│   ├── PhysicsWorld.cs   # Jolt integration
-│   └── VehiclePhysics.cs # Car simulation
-├── Motif/
-│   ├── SkeletalMesh.cs
-│   └── AnimationClip.cs  # Imported clip data; no runtime playback controller
+├── SkyCore/              # Keystone: Entity Component System
+├── Meridian/             # Keystone: scene serialization, streaming, world
+├── Airborne/             # Physics (Jolt) + vehicle simulation
+├── Motif/                # Animation (imported clip data; no runtime playback controller)
+├── Echo/                 # Audio (miniaudio backend, ECS bridge, TeaScript bindings)
 ├── TeaScript/            # Custom language implementation
-├── Audio/
-│   └── Echo.cs      # Audio orchestration; platform playback backend not included
-├── AI/
-│   └── Overthinking/     # AI behavior system
-├── Networking/           # LHO rewrite target
+├── Overthinking/         # AI behavior system
+├── LHO/                  # Networking (EOS/replication; rewrite target)
+├── BSR (Rendering)/      # Raster rendering, terrain
+│   ├── Strata/           # Material format, importer, and surface data
+│   ├── Polaris/          # CPU ray tracer
+│   └── Vectra/           # Particle system (CPU sim, sprite renderer, TeaScript API)
+├── RHI/                  # Graphics API layer (Metal/Vulkan/DX11)
+├── Aegis/                # Platform abstraction (windowing, input, detection)
+├── Pulse/                # Diagnostics, debug viz, perf
+├── Ramanujan/            # Math + SIMD
 ├── Editor/
+├── Runtime/
 │   ├── EditorApp.cs      # Main editor loop
 │   ├── DockingSystem.cs  # UE5-style panels
 │   └── ViewportRenderer.cs

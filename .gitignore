@@ -43,6 +43,10 @@ Thumbs.db
 .aider*
 graphify/
 
+# Local build output and benchmark captures
+/Builds/
+*.bmp
+
 # Third-party SDKs (Epic Online Services SDK - Do Not Redistribute)
 ThirdParty/
 ThirdParty/EOSSDK/

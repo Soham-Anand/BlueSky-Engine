@@ -8,7 +8,7 @@ CPU ray tracing research • TeaScript • BSR rendering • Horizon lighting �
 > verified against the tree. Status meanings are defined in Project Status.
 > Numbers marked "reported" are historic claims without a reproducible in-tree benchmark.
 
-![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)
+![Platform](https://img.shields.io/badge/platform-macOS%20(tested)%20%7C%20Windows%20(partial)%20%7C%20Linux%20(partial)-blue)
 ![License](https://img.shields.io/badge/license-Custom%20(Attribution%20Required)-blue)
 ![.NET](https://img.shields.io/badge/.NET-8.0-purple)
 
@@ -35,7 +35,7 @@ CPU ray tracing research • TeaScript • BSR rendering • Horizon lighting �
 | **Archetype-Based ECS** | ✅ Complete (single-threaded) | Generational IDs, chunk swap-remove, query cache. Update loop is synchronous; no job system, no lock-free path (the old "<0.1ms" badge is a reported claim, not a reproduced benchmark) |
 | **Work-Stealing Job System** | ❌ Planned | The engine update loop is synchronous; Jolt uses its own worker pool. |
 | **Asset Database** | ❌ Planned | The editor content browser scans project files directly; there is no central GUID registry or dependency database. Mesh import uses Blender Ease and `.stratapack`. |
-| **Scene Serialization** | ✅ Complete | Save/load with prefab support |
+| **Scene Serialization** | ✅ Implemented | Save/load with prefab support. Save As and Open Scene were fixed in code, but the test suite does not exercise them, and they have not been checked by hand in the running editor |
 | **Memory Allocators** | ❌ Planned | The runtime currently uses managed .NET memory; no custom allocator subsystem is connected. |
 
 ### 🎨 BSR — BlueSky Rendering
@@ -69,7 +69,7 @@ CPU ray tracing research • TeaScript • BSR rendering • Horizon lighting �
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| **Rigidbody Simulation** | ✅ Complete | 1000+ bodies at 60 FPS |
+| **Rigidbody Simulation** | ✅ Implemented | Jolt-backed rigidbodies, covered by physics tests. The "1000+ bodies at 60 FPS" figure is a reported claim, not reproduced here |
 | **Terrain Collision** | ✅ Complete | Heightfield with normal extraction |
 | **Raycast System** | ✅ Complete | Fast spatial queries |
 | **Vehicle Physics** | ✅ Complete | 4-wheel suspension, tire force model |
@@ -92,7 +92,7 @@ CPU ray tracing research • TeaScript • BSR rendering • Horizon lighting �
 | Feature | Status | Notes |
 |---------|--------|-------|
 | **Playback backend** | ✅ Implemented | Cross-platform `MiniAudioBackend` (miniaudio via Miniaudio-CS) with one `ma_engine`, per-source `ma_sound`, listener tracking, and graceful silent fallback when no device exists. WAV/MP3/FLAC decode natively; OGG/Vorbis decodes through NVorbis into an in-memory miniaudio buffer. |
-| **Spatial audio** | ✅ Implemented | Attenuation, panning, Doppler approximation, Airborne raycast occlusion, and 3D positioning applied through the miniaudio engine. |
+| **Spatial audio** | ✅ Implemented | Attenuation, panning, Doppler approximation, 3D positioning, and simplified occlusion (one physics raycast from source to listener, through `PhysicsTeaScriptBridge`). Applied through the miniaudio engine. |
 | **ECS integration** | ✅ Implemented | `EchoSystem` turns entities with `AudioSourceComponent` + `TransformComponent` into live voices (lazy clip loading, PlayOnStart/IsPlaying, positional updates, cleanup). |
 | **Content browser & placement** | ✅ Implemented | `.wav`/`.ogg` (plus `.mp3`/`.flac`) show in the Content Browser, import into `Assets/`, preview on double-click, and drag into the viewport to spawn an Audio Source that plays on Play. |
 | **Scripting** | ✅ Implemented | TeaScript `playSound`, `playMusic`, `stopAllSounds`, and `setAudioVolume` bind through `EchoTeaScriptBridge`. |
@@ -121,6 +121,7 @@ CPU ray tracing research • TeaScript • BSR rendering • Horizon lighting �
 | **Animation Timeline** | ❌ Planned | An animation timeline editor is not included. |
 | **Visual Scripting** | ❌ Planned | Blueprint-style nodes planned (no code in-tree) |
 | **Profiler** | ❌ Planned | No dedicated CPU/GPU profiler is included (no profiler classes in-tree). |
+| **Avalanche (macOS packager)** | 🚧 Partial | Builds a `.app` with the project's scenes, assets, a bundled .NET 8 runtime, and `libminiaudio`. The app is ad-hoc signed, so Gatekeeper blocks it on other Macs until you sign with a Developer ID. No notarization, arm64 only. No Windows or Linux output. |
 
 ### 🌐 LHO — Let's Hop On (Networking)
 
@@ -172,7 +173,7 @@ Performance Budget (i5-2410M + Intel HD 3000):
 - **BVH + SAH**: ~20,000x speedup over naive intersection
 - **Checkerboard**: Render 320×180, upscale to 720p
 - **Temporal Accumulation**: Reduce noise across frames
-- **Automatic fallback**: No runtime selector is included in this checkout; Polaris requires explicit construction and supported shader binaries.
+- **No automatic fallback**: Polaris has no runtime selector. It must be constructed explicitly and needs supported shader binaries.
 
 ### TeaScript: Custom Language for Game Dev
 
@@ -264,6 +265,8 @@ dotnet run --project ./BlueSkyEngine/BlueSkyEngine.csproj
 4. **Add TeaScript** (optional):
    - Attach a `.tea` script asset to the car entity
 
+**Not yet verified:** the Rigidbody and Car Controller steps above are not matched to button labels in the editor source. The Collider type `Box` is in the Details panel. Check the other labels in your build before following this guide.
+
 **Pro Tip**: Use the [UE5 Car Rigger Addon for Blender](https://blendermarket.com/products/ue5-car-rigger) with bone names: **FR, FL, RR, RL** for wheels
 
 ---
@@ -271,48 +274,49 @@ dotnet run --project ./BlueSkyEngine/BlueSkyEngine.csproj
 ## 📐 Architecture
 
 ```
-BlueSkyEngine/
-├── SkyCore/              # Keystone: Entity Component System
-├── Meridian/             # Keystone: scene serialization, streaming, world
-├── Airborne/             # Physics (Jolt) + vehicle simulation
-├── Motif/                # Animation (imported clip data; no runtime playback controller)
-├── Echo/                 # Audio (miniaudio backend, ECS bridge, TeaScript bindings)
-├── TeaScript/            # Custom language implementation
-├── Overthinking/         # AI behavior system
-├── LHO/                  # Networking (EOS/replication; rewrite target)
-├── BSR (Rendering)/      # Raster rendering, terrain
-│   ├── Strata/           # Material format, importer, and surface data
-│   ├── Polaris/          # CPU ray tracer
-│   └── Vectra/           # Particle system (CPU sim, sprite renderer, TeaScript API)
-├── RHI/                  # Graphics API layer (Metal/Vulkan/DX11)
-├── Aegis/                # Platform abstraction (windowing, input, detection)
-├── Pulse/                # Diagnostics, debug viz, perf
-├── Ramanujan/            # Math + SIMD
-├── Editor/
-├── Runtime/
-│   ├── EditorApp.cs      # Main editor loop
-│   ├── DockingSystem.cs  # UE5-style panels
-│   └── ViewportRenderer.cs
-└── Platform/
-    ├── macOS/            # Cocoa window
-    ├── Windows/          # Win32 window
-    └── Linux/            # X11 window and input backend
+BlueSky Engine/
+├── TeaScript/            # TeaScript language: lexer, parser, interpreter (repo root)
+├── Blender/              # Ease addon: exports .stratapack meshes
+├── BlueSkyEngine/
+│   ├── SkyCore/          # Entity Component System (archetypes, queries, command buffers)
+│   ├── Meridian/         # Scene serialization, world streaming
+│   ├── Airborne/         # Physics (Jolt) and vehicle simulation
+│   ├── Motif/            # Animation data (clips, skeletons); no runtime playback controller
+│   ├── Echo/             # Audio: miniaudio backend, ECS bridge, DSP, TeaScript bindings
+│   ├── Core/             # Asset pipeline and scripting host
+│   ├── Overthinking/     # AI behavior system (not wired into the editor or runtime)
+│   ├── LHO/              # Networking: EOS and replication (legacy; rewrite planned)
+│   ├── BSR/              # Rendering
+│   │   ├── Strata/       # Material format, importer, surface data
+│   │   ├── RayTracing/Polaris/  # CPU ray tracer (not used by the editor or runtime)
+│   │   └── Vectra/       # Particles (CPU sim, sprite renderer, TeaScript API)
+│   ├── RHI/              # Graphics API layer (Metal, Vulkan, DirectX 11)
+│   ├── Aegis/            # Windowing, input, and GPU detection (macOS, Windows, Linux folders)
+│   ├── Pulse/            # Diagnostics and debug visualization
+│   ├── Ramanujan/        # Math and SIMD
+│   ├── Editor/           # Editor app, panels, viewport, Avalanche packager
+│   ├── Runtime/          # Runtime UI
+│   └── Tests/            # Engine test suites (run with --test)
+└── Assets/               # Splash screen and sample scenes
 ```
 
 ---
 
 ## 🧪 Tests
 
-17 in-tree suites (ECS, TeaScript, physics/vehicle, Polaris SIMD, Strata
-codec/pack/importer/probe/sky/surface, networking, audio/AI, editor stability)
-run through a custom console runner — no xUnit/NUnit:
+22 in-tree suites (platform detection, Ramanujan math, ECS, TeaScript, Polaris SIMD,
+physics/vehicle, asset import, audio/AI, networking, Strata, editor stability, Vectra,
+Metal async, Avalanche packager) run through a custom console runner. No xUnit/NUnit.
 
 ```bash
-dotnet run --project ./BlueSkyEngine/BlueSkyEngine.csproj -- --test
+dotnet build ./BlueSkyEngine/BlueSkyEngine.csproj
+dotnet BlueSkyEngine/bin/Debug/net8.0/BlueSkyEngine.dll --test
 ```
 
-Coverage is Strata-heavy; ECS/audio/networking suites are smoke-level.
-A green run prints `ALL ENGINE SUBSYSTEM TESTS PASSED`.
+Running `dotnet run ... -- --test` is an alternative, but it was killed by the system
+(exit 137) in some development runs. The direct DLL command has not hit that problem.
+The last run passed with exit 0 and printed `ALL ENGINE SUBSYSTEM TESTS PASSED`.
+Coverage is Strata-heavy; ECS, audio, and networking suites are smoke-level.
 
 ---
 

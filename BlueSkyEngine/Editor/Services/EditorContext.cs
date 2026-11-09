@@ -1,8 +1,8 @@
-using BlueSky.Core.ECS;
+using BlueSky.SkyCore;
 using BlueSky.Editor.UI;
-using BlueSky.Platform;
-using BlueSky.Platform.Input;
-using BlueSky.Rendering.RHI;
+using BlueSky.Aegis;
+using BlueSky.Aegis.Input;
+using BlueSky.BSR.RHI;
 
 namespace BlueSky.Editor.Services;
 

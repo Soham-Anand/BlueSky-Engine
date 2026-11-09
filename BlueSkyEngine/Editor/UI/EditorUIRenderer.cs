@@ -1,6 +1,6 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
-using BlueSky.Rendering.RHI;
+using BlueSky.BSR.RHI;
 
 namespace BlueSky.Editor.UI;
 
@@ -27,13 +27,19 @@ public sealed class EditorUIRenderer : IDisposable
     // ── RHI resources ─────────────────────────────────────────────────────
     private readonly IRHIDevice    _device;
     private          IRHIPipeline? _pipeline;
-    private          IRHIBuffer?   _vertexBuffer;
-    private          IRHIBuffer?   _indexBuffer;
-    private          IRHIBuffer?   _textureVertexBuffer;
-    private          IRHIBuffer?   _textureIndexBuffer;
-    private          IRHIBuffer?   _uniformBuffer;
+    // M4: per-frame dynamic buffers are ringed ×FramesInFlight so frame N+1
+    // CPU uploads never race frame N GPU reads once submits go no-wait.
+    // A second UI renderer (the Echo window) gets its own three slots so the
+    // two windows never write the same buffer in one frame.
+    private const int FrameRing = 6;
+    private readonly int _slotBase;
+    private readonly IRHIBuffer?[] _vertexBuffers        = new IRHIBuffer?[FrameRing];
+    private readonly IRHIBuffer?[] _indexBuffers         = new IRHIBuffer?[FrameRing];
+    private readonly IRHIBuffer?[] _textureVertexBuffers = new IRHIBuffer?[FrameRing];
+    private readonly IRHIBuffer?[] _textureIndexBuffers  = new IRHIBuffer?[FrameRing];
+    private readonly IRHIBuffer?[] _uniformBuffers       = new IRHIBuffer?[FrameRing];
     private          IRHITexture?  _whiteTexture;
-    private          IntPtr        _dx11Sampler; // ID3D11SamplerState*
+    private          IRHISampler?  _uiSampler; // M2: RHI sampler bound at slot 0
     
     // ── font rendering ──────────────────────────────────────────────────────
     public           FontAtlas?    FontAtlas { get; set; }
@@ -43,14 +49,18 @@ public sealed class EditorUIRenderer : IDisposable
     private readonly List<ushort>   _indices  = new(8192);
     private          Matrix4x4      _projection;
     private          bool           _overflowed;
+    // Projection upload dedup: Render() and RenderTexture() share one UB per
+    // frame — a second upload would rewrite identical bytes.
+    private          long           _projUploadedFrame = -1;
 
     // ─────────────────────────────────────────────────────────────────────
     // Construction
     // ─────────────────────────────────────────────────────────────────────
 
-    public EditorUIRenderer(IRHIDevice device)
+    public EditorUIRenderer(IRHIDevice device, int slotBase = 0)
     {
         _device = device;
+        _slotBase = slotBase;
         CreatePipeline();
         CreateBuffers();
         CreateWhiteTexture();
@@ -167,7 +177,7 @@ float4 fs_ui(VS_OUTPUT input) : SV_Target {
             string profile = stage == ShaderStage.Vertex ? "vs_4_0" : "ps_4_0";
             IntPtr pSrc = Marshal.StringToHGlobalAnsi(SimpleUI_HLSL);
             
-            int hr = BlueSky.Rendering.RHI.DirectX11.D3D11Interop.D3DCompile(
+            int hr = BlueSky.BSR.RHI.DirectX11.D3D11Interop.D3DCompile(
                 pSrc,
                 (nuint)SimpleUI_HLSL.Length,
                 "simple_ui.hlsl",
@@ -185,7 +195,7 @@ float4 fs_ui(VS_OUTPUT input) : SV_Target {
             {
                 if (errorBlob != IntPtr.Zero)
                 {
-                    IntPtr pErrorStr = BlueSky.Rendering.RHI.DirectX11.D3D11Interop.GetBufferPointer(errorBlob);
+                    IntPtr pErrorStr = BlueSky.BSR.RHI.DirectX11.D3D11Interop.GetBufferPointer(errorBlob);
                     string? errorMsg = Marshal.PtrToStringAnsi(pErrorStr);
                     Console.WriteLine($"[EditorUIRenderer] DX11 Shader Compile Error ({entryPoint}):\n{errorMsg}");
                     Marshal.Release(errorBlob);
@@ -196,8 +206,8 @@ float4 fs_ui(VS_OUTPUT input) : SV_Target {
             {
                 if (blob != IntPtr.Zero)
                 {
-                    IntPtr pCode = BlueSky.Rendering.RHI.DirectX11.D3D11Interop.GetBufferPointer(blob);
-                    nuint size = BlueSky.Rendering.RHI.DirectX11.D3D11Interop.GetBufferSize(blob);
+                    IntPtr pCode = BlueSky.BSR.RHI.DirectX11.D3D11Interop.GetBufferPointer(blob);
+                    nuint size = BlueSky.BSR.RHI.DirectX11.D3D11Interop.GetBufferSize(blob);
                     bytecode = new byte[size];
                     Marshal.Copy(pCode, bytecode, 0, (int)size);
                     Marshal.Release(blob);
@@ -237,47 +247,67 @@ float4 fs_ui(VS_OUTPUT input) : SV_Target {
         };
     }
 
+    private int FrameSlot()
+    {
+        var inner = (_device as IRHIWrapped<IRHIDevice>)?.Inner;
+        if (inner is BlueSky.BSR.RHI.Metal.MetalDevice metal)
+            return (_slotBase + metal.FrameIndex) % FrameRing;
+        return _slotBase % FrameRing;
+    }
+
+    private void UploadProjectionOnce(int slot)
+    {
+        long frame = BlueSky.BSR.Strata.StrataBenchmark.FrameIndex;
+        if (_projUploadedFrame == frame) return;
+        var projBytes = MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref _projection, 1));
+        _device.UpdateBuffer(_uniformBuffers[slot]!, projBytes);
+        _projUploadedFrame = frame;
+    }
+
     private void CreateBuffers()
     {
-        _vertexBuffer = _device.CreateBuffer(new BufferDesc
+        for (int i = 0; i < FrameRing; i++)
         {
-            Size       = (ulong)(MaxVertices * UIVertex.Stride),
-            Usage      = BufferUsage.Vertex,
-            MemoryType = MemoryType.CpuToGpu,
-            DebugName  = "EditorUI.VB",
-        });
+            _vertexBuffers[i] = _device.CreateBuffer(new BufferDesc
+            {
+                Size       = (ulong)(MaxVertices * UIVertex.Stride),
+                Usage      = BufferUsage.Vertex,
+                MemoryType = MemoryType.CpuToGpu,
+                DebugName  = $"EditorUI.VB{i}",
+            });
 
-        _indexBuffer = _device.CreateBuffer(new BufferDesc
-        {
-            Size       = (ulong)(MaxIndices * sizeof(ushort)),
-            Usage      = BufferUsage.Index,
-            MemoryType = MemoryType.CpuToGpu,
-            DebugName  = "EditorUI.IB",
-        });
+            _indexBuffers[i] = _device.CreateBuffer(new BufferDesc
+            {
+                Size       = (ulong)(MaxIndices * sizeof(ushort)),
+                Usage      = BufferUsage.Index,
+                MemoryType = MemoryType.CpuToGpu,
+                DebugName  = $"EditorUI.IB{i}",
+            });
 
-        _textureVertexBuffer = _device.CreateBuffer(new BufferDesc
-        {
-            Size       = (ulong)(4 * UIVertex.Stride),
-            Usage      = BufferUsage.Vertex,
-            MemoryType = MemoryType.CpuToGpu,
-            DebugName  = "EditorUI.TextureVB",
-        });
+            _textureVertexBuffers[i] = _device.CreateBuffer(new BufferDesc
+            {
+                Size       = (ulong)(4 * UIVertex.Stride),
+                Usage      = BufferUsage.Vertex,
+                MemoryType = MemoryType.CpuToGpu,
+                DebugName  = $"EditorUI.TextureVB{i}",
+            });
 
-        _textureIndexBuffer = _device.CreateBuffer(new BufferDesc
-        {
-            Size       = 6 * sizeof(ushort),
-            Usage      = BufferUsage.Index,
-            MemoryType = MemoryType.CpuToGpu,
-            DebugName  = "EditorUI.TextureIB",
-        });
+            _textureIndexBuffers[i] = _device.CreateBuffer(new BufferDesc
+            {
+                Size       = 6 * sizeof(ushort),
+                Usage      = BufferUsage.Index,
+                MemoryType = MemoryType.CpuToGpu,
+                DebugName  = $"EditorUI.TextureIB{i}",
+            });
 
-        _uniformBuffer = _device.CreateBuffer(new BufferDesc
-        {
-            Size       = 64,
-            Usage      = BufferUsage.Uniform,
-            MemoryType = MemoryType.CpuToGpu,
-            DebugName  = "EditorUI.UB",
-        });
+            _uniformBuffers[i] = _device.CreateBuffer(new BufferDesc
+            {
+                Size       = 64,
+                Usage      = BufferUsage.Uniform,
+                MemoryType = MemoryType.CpuToGpu,
+                DebugName  = $"EditorUI.UB{i}",
+            });
+        }
     }
 
     private void CreateWhiteTexture()
@@ -297,14 +327,8 @@ float4 fs_ui(VS_OUTPUT input) : SV_Target {
         Span<byte> pixel = stackalloc byte[4] { 255, 255, 255, 255 };
         _device.UploadTexture(_whiteTexture, pixel);
 
-        if (_device.Backend == RHIBackend.DirectX11 && _device is BlueSky.Rendering.RHI.DirectX11.D3D11Device d3dDevice)
-        {
-            // Create a default linear sampler for DX11
-            _dx11Sampler = d3dDevice.CreateSamplerState(
-                21, // D3D11_FILTER_MIN_MAG_MIP_LINEAR
-                1   // D3D11_TEXTURE_ADDRESS_WRAP
-            );
-        }
+        // M2: one linear-clamp sampler for font glyphs + viewport blits (all backends).
+        _uiSampler = _device.CreateSampler(SamplerDesc.LinearClamp);
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -337,31 +361,29 @@ float4 fs_ui(VS_OUTPUT input) : SV_Target {
             return;
         }
 
-        // ── upload geometry ───────────────────────────────────────────────
+        // ── upload geometry (M4: this frame's ring slot) ────────────────────
+        int slot = FrameSlot();
         var vertexBytes = MemoryMarshal.AsBytes(CollectionsMarshal.AsSpan(_vertices));
-        _device.UpdateBuffer(_vertexBuffer!, vertexBytes);
+        _device.UpdateBuffer(_vertexBuffers[slot]!, vertexBytes);
 
         var indexBytes  = MemoryMarshal.AsBytes(CollectionsMarshal.AsSpan(_indices));
-        _device.UpdateBuffer(_indexBuffer!, indexBytes);
+        _device.UpdateBuffer(_indexBuffers[slot]!, indexBytes);
 
-        var projBytes   = MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref _projection, 1));
-        _device.UpdateBuffer(_uniformBuffer!, projBytes);
+        UploadProjectionOnce(slot);
 
         // ── bind pipeline + buffers ───────────────────────────────────────
         cmd.SetPipeline(_pipeline!);
-        cmd.SetVertexBuffer(_vertexBuffer!, 0, 0);
-        cmd.SetIndexBuffer(_indexBuffer!, IndexType.UInt16, 0);
-        cmd.SetUniformBuffer(_uniformBuffer!, 1, 0);
+        cmd.SetVertexBuffer(_vertexBuffers[slot]!, 0, 0);
+        cmd.SetIndexBuffer(_indexBuffers[slot]!, IndexType.UInt16, 0);
+        cmd.SetUniformBuffer(_uniformBuffers[slot]!, 1, 0);
         
         if (FontAtlas != null)
             cmd.SetTexture(FontAtlas.AtlasTexture, 0, 0);
         else if (_whiteTexture != null)
             cmd.SetTexture(_whiteTexture, 0, 0);
 
-        if (_device.Backend == RHIBackend.DirectX11 && cmd is BlueSky.Rendering.RHI.DirectX11.D3D11CommandBuffer d3dCmd && _dx11Sampler != IntPtr.Zero)
-        {
-            d3dCmd.SetSampler(_dx11Sampler, 0);
-        }
+        if (_uiSampler != null)
+            cmd.SetSampler(_uiSampler, 0, 0);
 
         cmd.DrawIndexed((uint)_indices.Count);
 
@@ -386,8 +408,9 @@ float4 fs_ui(VS_OUTPUT input) : SV_Target {
         w = MathF.Round(w);
         h = MathF.Round(h);
 
-        // Draw an immediate quad with the given texture using the UI pipeline
-        var verts = new UIVertex[4];
+        // Draw an immediate quad with the given texture using the UI pipeline.
+        // Stack-only verts/indices — this runs every frame, no heap allocs.
+        Span<UIVertex> verts = stackalloc UIVertex[4];
         var color = new Vector4(1, 1, 1, 1);
         // Mode = 2: full texture render
         verts[0] = new UIVertex(new Vector2(x, y),         color, new Vector2(0, 0)) { Mode = 2 }; // TL
@@ -395,29 +418,29 @@ float4 fs_ui(VS_OUTPUT input) : SV_Target {
         verts[2] = new UIVertex(new Vector2(x + w, y + h), color, new Vector2(1, 1)) { Mode = 2 }; // BR
         verts[3] = new UIVertex(new Vector2(x, y + h),     color, new Vector2(0, 1)) { Mode = 2 }; // BL
 
-        ushort[] indices = { 0, 1, 2, 0, 2, 3 };
+        Span<ushort> indices = stackalloc ushort[6] { 0, 1, 2, 0, 2, 3 };
 
-        var vertexBytes = MemoryMarshal.AsBytes(verts.AsSpan());
-        _device.UpdateBuffer(_textureVertexBuffer!, vertexBytes);
+        var vertexBytes = MemoryMarshal.AsBytes(verts);
+        int tslot = FrameSlot();
+        _device.UpdateBuffer(_textureVertexBuffers[tslot]!, vertexBytes);
 
-        var indexBytes = MemoryMarshal.AsBytes(indices.AsSpan());
-        _device.UpdateBuffer(_textureIndexBuffer!, indexBytes);
+        var indexBytes = MemoryMarshal.AsBytes(indices);
+        _device.UpdateBuffer(_textureIndexBuffers[tslot]!, indexBytes);
 
-        var projBytes = MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref _projection, 1));
-        _device.UpdateBuffer(_uniformBuffer!, projBytes);
+        // Projection is uploaded by Render() in the same frame — skip the
+        // duplicate upload, but always (re)bind: same slot, same pass.
+        UploadProjectionOnce(tslot);
 
         cmd.SetPipeline(_pipeline!);
-        cmd.SetVertexBuffer(_textureVertexBuffer!, 0, 0);
-        cmd.SetIndexBuffer(_textureIndexBuffer!, IndexType.UInt16, 0);
-        cmd.SetUniformBuffer(_uniformBuffer!, 1, 0);
+        cmd.SetVertexBuffer(_textureVertexBuffers[tslot]!, 0, 0);
+        cmd.SetIndexBuffer(_textureIndexBuffers[tslot]!, IndexType.UInt16, 0);
+        cmd.SetUniformBuffer(_uniformBuffers[tslot]!, 1, 0);
 
         // Bind the viewport texture (slot 0, same as font atlas in Render())
         cmd.SetTexture(texture, 0, 0);
 
-        if (_device.Backend == RHIBackend.DirectX11 && cmd is BlueSky.Rendering.RHI.DirectX11.D3D11CommandBuffer d3dCmd && _dx11Sampler != IntPtr.Zero)
-        {
-            d3dCmd.SetSampler(_dx11Sampler, 0);
-        }
+        if (_uiSampler != null)
+            cmd.SetSampler(_uiSampler, 0, 0);
 
         cmd.DrawIndexed(6);
     }
@@ -475,6 +498,10 @@ float4 fs_ui(VS_OUTPUT input) : SV_Target {
                 case EditorUI.DrawCommandType.RoundedGradientRectFilled:
                     if (TryClipQuad(cmd.Position, cmd.Size, cmd.ClipRect, out var rgPos, out var rgSize))
                         AddRoundedGradientRect(rgPos, rgSize, cmd.Color, cmd.ColorEnd, cmd.CornerRadius, cmd.GradientVertical);
+                    break;
+
+                case EditorUI.DrawCommandType.TriangleFilled:
+                    AddFilledTriangle(cmd.Position, cmd.P1, cmd.P2, cmd.Color);
                     break;
             }
         }
@@ -573,6 +600,19 @@ float4 fs_ui(VS_OUTPUT input) : SV_Target {
             new Vector2(pos.X + size.X, pos.Y + size.Y),
             new Vector2(pos.X,          pos.Y + size.Y),
             color);
+    }
+
+    // ── solid triangle (icons: play, chevrons-as-fills, carets) ────────────
+    private void AddFilledTriangle(Vector2 p0, Vector2 p1, Vector2 p2, Vector4 color)
+    {
+        if (!CanFit(3, 3)) return;
+
+        ushort b = (ushort)_vertices.Count;
+        _vertices.Add(new UIVertex(p0, color));
+        _vertices.Add(new UIVertex(p1, color));
+        _vertices.Add(new UIVertex(p2, color));
+
+        _indices.Add(b); _indices.Add((ushort)(b + 1)); _indices.Add((ushort)(b + 2));
     }
 
     // ── gradient quad (different colors at each corner for interpolation) ──
@@ -858,11 +898,12 @@ float4 fs_ui(VS_OUTPUT input) : SV_Target {
     public void Dispose()
     {
         _pipeline?.Dispose();
-        _vertexBuffer?.Dispose();
-        _indexBuffer?.Dispose();
-        _textureVertexBuffer?.Dispose();
-        _textureIndexBuffer?.Dispose();
-        _uniformBuffer?.Dispose();
+        foreach (var b in _vertexBuffers) b?.Dispose();
+        foreach (var b in _indexBuffers) b?.Dispose();
+        foreach (var b in _textureVertexBuffers) b?.Dispose();
+        foreach (var b in _textureIndexBuffers) b?.Dispose();
+        foreach (var b in _uniformBuffers) b?.Dispose();
         _whiteTexture?.Dispose();
+        _uiSampler?.Dispose();
     }
 }

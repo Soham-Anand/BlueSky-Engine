@@ -17,10 +17,10 @@ using System.Text.Json;
 using BlueSky.Motif;
 using BlueSky.Core.Assets;
 using BlueSky.Editor.UI;
-using BlueSky.Core.ECS.Builtin;
-using BlueSky.Rendering;
-using BlueSky.Rendering.RHI;
-using Viewport = BlueSky.Rendering.Viewport;
+using BlueSky.SkyCore.Builtin;
+using BlueSky.BSR;
+using BlueSky.BSR.RHI;
+using Viewport = BlueSky.BSR.Viewport;
 using AssetType = BlueSky.Core.Assets.AssetType;
 
 namespace BlueSky.Editor;
@@ -37,8 +37,8 @@ public class SkeletalMeshEditor
     private bool _isDirty = false;
 
     // ── Preview ───────────────────────────────────────────────────────────
-    private Core.ECS.Entity _previewEntity;
-    private Core.ECS.World? _lastWorld;
+    private SkyCore.Entity _previewEntity;
+    private SkyCore.World? _lastWorld;
     private bool _hasSpawnedPreview = false;
     private ViewportRenderer? _previewRenderer;
     private IRHITexture? _previewTexture;
@@ -77,7 +77,7 @@ public class SkeletalMeshEditor
     // OPEN / CLOSE
     // ════════════════════════════════════════════════════════════════════════
 
-    public void Open(string assetPath, Core.ECS.World world, Viewport viewport, IRHIDevice rhi)
+    public void Open(string assetPath, SkyCore.World world, Viewport viewport, IRHIDevice rhi)
     {
         try
         {
@@ -131,7 +131,7 @@ public class SkeletalMeshEditor
         }
     }
 
-    public void Close(Core.ECS.World world)
+    public void Close(SkyCore.World world)
     {
         if (_hasSpawnedPreview && _previewEntity.Id != 0)
         {
@@ -150,7 +150,7 @@ public class SkeletalMeshEditor
     // PREVIEW RENDERING
     // ════════════════════════════════════════════════════════════════════════
 
-    private void InitializePreviewRenderer(Core.ECS.World world, Viewport viewport)
+    private void InitializePreviewRenderer(SkyCore.World world, Viewport viewport)
     {
         if (_rhi == null) return;
         try
@@ -159,7 +159,7 @@ public class SkeletalMeshEditor
             {
                 Width = _previewWidth, Height = _previewHeight,
                 Depth = 1, MipLevels = 1, ArrayLayers = 1,
-                Format = BlueSky.Rendering.RHI.TextureFormat.RGBA8Unorm,
+                Format = BlueSky.BSR.RHI.TextureFormat.RGBA8Unorm,
                 Usage = TextureUsage.RenderTarget | TextureUsage.Sampled,
                 DebugName = "SkeletalMeshPreview"
             });
@@ -185,32 +185,32 @@ public class SkeletalMeshEditor
             float distance = (diagonal * 0.5f) / MathF.Tan(fovRad * 0.5f);
             distance = Math.Max(distance * 1.2f, 3.0f);
 
-            var cameraPos = new Core.Math.Vector3(
+            var cameraPos = new Ramanujan.Vector3(
                 center.X + diagonal * 0.4f,
                 center.Y + diagonal * 0.35f,
                 center.Z + distance);
 
             ref var cam = ref viewport.GetCameraTransform();
             cam.SetPosition(cameraPos);
-            cam.LookAt(new Core.Math.Vector3(center.X, center.Y, center.Z), Core.Math.Vector3.Up);
+            cam.LookAt(new Ramanujan.Vector3(center.X, center.Y, center.Z), Ramanujan.Vector3.Up);
         }
         catch { }
     }
 
-    private void SpawnPreviewMesh(Core.ECS.World world, Viewport viewport)
+    private void SpawnPreviewMesh(SkyCore.World world, Viewport viewport)
     {
         if (_currentAsset == null) return;
 
-        if (_hasSpawnedPreview && world.HasComponent<Core.ECS.Builtin.SkeletalMeshComponent>(_previewEntity))
+        if (_hasSpawnedPreview && world.HasComponent<SkyCore.Builtin.SkeletalMeshComponent>(_previewEntity))
         {
-            ref var meshComp = ref world.GetComponent<Core.ECS.Builtin.SkeletalMeshComponent>(_previewEntity);
+            ref var meshComp = ref world.GetComponent<SkyCore.Builtin.SkeletalMeshComponent>(_previewEntity);
             meshComp.MeshAssetPath = _assetPath;
-            if (world.HasComponent<Core.ECS.Builtin.TransformComponent>(_previewEntity))
+            if (world.HasComponent<SkyCore.Builtin.TransformComponent>(_previewEntity))
             {
-                ref var t = ref world.GetComponent<Core.ECS.Builtin.TransformComponent>(_previewEntity);
-                t.Position = Core.Math.Vector3.Zero;
-                t.Rotation = Core.Math.Quaternion.Identity;
-                t.Scale = Core.Math.Vector3.One;
+                ref var t = ref world.GetComponent<SkyCore.Builtin.TransformComponent>(_previewEntity);
+                t.Position = Ramanujan.Vector3.Zero;
+                t.Rotation = Ramanujan.Quaternion.Identity;
+                t.Scale = Ramanujan.Vector3.One;
             }
             Program.GetMainViewport()?.InvalidateMeshGpuCache(_assetPath);
             return;
@@ -219,13 +219,14 @@ public class SkeletalMeshEditor
         try
         {
             _previewEntity = world.CreateEntity();
-            world.AddComponent(_previewEntity, new Core.ECS.Builtin.TransformComponent
+            world.AddComponent(_previewEntity, new SkyCore.Builtin.EditorOnlyTagComponent(1));
+            world.AddComponent(_previewEntity, new SkyCore.Builtin.TransformComponent
             {
-                Position = Core.Math.Vector3.Zero,
-                Rotation = Core.Math.Quaternion.Identity,
-                Scale = Core.Math.Vector3.One
+                Position = Ramanujan.Vector3.Zero,
+                Rotation = Ramanujan.Quaternion.Identity,
+                Scale = Ramanujan.Vector3.One
             });
-            var skelComp = new Core.ECS.Builtin.SkeletalMeshComponent(_assetPath);
+            var skelComp = new SkyCore.Builtin.SkeletalMeshComponent(_assetPath);
             world.AddComponent(_previewEntity, skelComp);
             _hasSpawnedPreview = true;
             Program.GetMainViewport()?.InvalidateMeshGpuCache(_assetPath);
@@ -1361,13 +1362,13 @@ public class SkeletalMeshEditor
         }
 
         if (_hasSpawnedPreview && _lastWorld != null &&
-            _lastWorld.HasComponent<Core.ECS.Builtin.TransformComponent>(_previewEntity))
+            _lastWorld.HasComponent<SkyCore.Builtin.TransformComponent>(_previewEntity))
         {
-            ref var t = ref _lastWorld.GetComponent<Core.ECS.Builtin.TransformComponent>(_previewEntity);
+            ref var t = ref _lastWorld.GetComponent<SkyCore.Builtin.TransformComponent>(_previewEntity);
             if (_autoRotate)
             {
                 float yaw = _previewRotation * (180f / MathF.PI);
-                t.Rotation = Core.Math.Quaternion.Euler(0, yaw, 0);
+                t.Rotation = Ramanujan.Quaternion.Euler(0, yaw, 0);
             }
         }
 
@@ -1398,9 +1399,9 @@ public class SkeletalMeshEditor
 
         System.Numerics.Matrix4x4 entityWorld = System.Numerics.Matrix4x4.Identity;
         if (_hasSpawnedPreview && _lastWorld != null &&
-            _lastWorld.HasComponent<Core.ECS.Builtin.TransformComponent>(_previewEntity))
+            _lastWorld.HasComponent<SkyCore.Builtin.TransformComponent>(_previewEntity))
         {
-            ref var t = ref _lastWorld.GetComponent<Core.ECS.Builtin.TransformComponent>(_previewEntity);
+            ref var t = ref _lastWorld.GetComponent<SkyCore.Builtin.TransformComponent>(_previewEntity);
             var pos = new System.Numerics.Vector3(t.Position.X, t.Position.Y, t.Position.Z);
             var rot = new System.Numerics.Quaternion(t.Rotation.X, t.Rotation.Y, t.Rotation.Z, t.Rotation.W);
             var scl = new System.Numerics.Vector3(t.Scale.X, t.Scale.Y, t.Scale.Z);

@@ -1,6 +1,6 @@
-using static BlueSky.Rendering.RHI.Metal.MetalInterop;
+using static BlueSky.BSR.RHI.Metal.MetalInterop;
 
-namespace BlueSky.Rendering.RHI.Metal;
+namespace BlueSky.BSR.RHI.Metal;
 
 internal class MetalPipeline : IRHIPipeline
 {
@@ -9,44 +9,60 @@ internal class MetalPipeline : IRHIPipeline
     private ulong _cullMode;
     private ulong _fillMode;
     private ulong _primitiveType;
+    private ulong _winding;
     private bool _disposed;
-    
+
+    // M1: process-lifetime MTLLibrary cache — avoids disk reload + recompile per pipeline.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, IntPtr> _libraryCache = new();
+    private static readonly object _libraryCacheLock = new();
     internal IntPtr Handle => _renderPipelineState;
     internal IntPtr DepthStencilState => _depthStencilState;
     internal ulong RasterizerCullMode => _cullMode;
     internal ulong FillMode => _fillMode;
     internal ulong PrimitiveType => _primitiveType;
+    internal ulong FrontWinding => _winding;
     
     public MetalPipeline(MetalDevice device, GraphicsPipelineDesc desc)
     {
         _cullMode = ToMTLCullMode(desc.RasterizerState.CullMode);
         _fillMode = ToMTLFillMode(desc.RasterizerState.FillMode);
         _primitiveType = ToMTLPrimitiveType(desc.Topology);
+        _winding = ToMTLWinding(desc.RasterizerState.FrontFace);
         CreateRenderPipelineState(device, desc);
         CreateDepthStencilState(device, desc.DepthStencilState);
     }
     
-    private static ulong ToMTLCullMode(BlueSky.Rendering.RHI.CullMode mode)
+    private static ulong ToMTLCullMode(BlueSky.BSR.RHI.CullMode mode)
     {
         return mode switch
         {
-            BlueSky.Rendering.RHI.CullMode.None => 0,  // MTLCullModeNone
-            BlueSky.Rendering.RHI.CullMode.Front => 1, // MTLCullModeFront
-            BlueSky.Rendering.RHI.CullMode.Back => 2,  // MTLCullModeBack
+            BlueSky.BSR.RHI.CullMode.None => 0,  // MTLCullModeNone
+            BlueSky.BSR.RHI.CullMode.Front => 1, // MTLCullModeFront
+            BlueSky.BSR.RHI.CullMode.Back => 2,  // MTLCullModeBack
             _ => 0
         };
     }
     
-    private static ulong ToMTLFillMode(BlueSky.Rendering.RHI.FillMode mode)
+    private static ulong ToMTLFillMode(BlueSky.BSR.RHI.FillMode mode)
     {
         return mode switch
         {
-            BlueSky.Rendering.RHI.FillMode.Solid => 0,      // MTLTriangleFillModeFill
-            BlueSky.Rendering.RHI.FillMode.Wireframe => 1,  // MTLTriangleFillModeLines
+            BlueSky.BSR.RHI.FillMode.Solid => 0,      // MTLTriangleFillModeFill
+            BlueSky.BSR.RHI.FillMode.Wireframe => 1,  // MTLTriangleFillModeLines
             _ => 0
         };
     }
     
+    private static ulong ToMTLWinding(BlueSky.BSR.RHI.FrontFace face)
+    {
+        return face switch
+        {
+            BlueSky.BSR.RHI.FrontFace.Clockwise => 0,        // MTLWindingClockwise
+            BlueSky.BSR.RHI.FrontFace.CounterClockwise => 1, // MTLWindingCounterClockwise
+            _ => 1
+        };
+    }
+
     private void CreateRenderPipelineState(MetalDevice device, GraphicsPipelineDesc desc)
     {
         // Create pipeline descriptor
@@ -176,10 +192,77 @@ internal class MetalPipeline : IRHIPipeline
     
     private IntPtr LoadShader(MetalDevice device, ShaderDesc shader)
     {
-        IntPtr library;
-        
-        // If bytecode is provided, write to temp file and load from there
-        if (shader.Bytecode != null && shader.Bytecode.Length > 0)
+        IntPtr library = IntPtr.Zero;
+
+        // Determine library base name based on entry point
+        string baseName;
+        if (shader.EntryPoint.StartsWith("vs_ui") || shader.EntryPoint.StartsWith("fs_ui"))
+            baseName = "simple_ui";
+        else if (shader.EntryPoint.StartsWith("horizon_"))
+            baseName = "horizon_lighting";
+        else if (shader.EntryPoint.StartsWith("vs_sky") || shader.EntryPoint.StartsWith("fs_sky") ||
+                 shader.EntryPoint.StartsWith("vs_grid") || shader.EntryPoint.StartsWith("fs_grid") ||
+                 shader.EntryPoint.StartsWith("vs_mesh") || shader.EntryPoint.StartsWith("fs_mesh") ||
+                 shader.EntryPoint.StartsWith("vs_shadow") || shader.EntryPoint.StartsWith("fs_shadow") ||
+                 shader.EntryPoint.StartsWith("vs_vectra") || shader.EntryPoint.StartsWith("fs_smoke") ||
+                 shader.EntryPoint.StartsWith("vs_gizmo") || shader.EntryPoint.StartsWith("fs_gizmo") ||
+                 shader.EntryPoint.StartsWith("fs_wireframe"))
+            baseName = "viewport_3d";
+        else
+            baseName = "default";
+
+        // Check if a newer .metal source file exists on disk; if so, compile live
+        // via MTLDevice.newLibraryWithSource:options:error: and cache in _libraryCache
+        // so shader edits take effect immediately even without xcrun metal CLI.
+        var exeDir = System.AppContext.BaseDirectory;
+        string[] sourceCandidates = new[]
+        {
+            System.IO.Path.Combine(System.IO.Directory.GetCurrentDirectory(), "BlueSkyEngine", "Editor", "Shaders", baseName + ".metal"),
+            System.IO.Path.Combine(System.IO.Directory.GetCurrentDirectory(), "Editor", "Shaders", baseName + ".metal"),
+            System.IO.Path.Combine(exeDir, "Editor", "Shaders", baseName + ".metal"),
+        };
+        string[] libCandidates = new[]
+        {
+            System.IO.Path.Combine(System.IO.Directory.GetCurrentDirectory(), "BlueSkyEngine", "Editor", "Shaders", baseName + ".metallib"),
+            System.IO.Path.Combine(System.IO.Directory.GetCurrentDirectory(), "Editor", "Shaders", baseName + ".metallib"),
+            System.IO.Path.Combine(exeDir, "Editor", "Shaders", baseName + ".metallib"),
+        };
+        string? sourcePath = System.Array.Find(sourceCandidates, System.IO.File.Exists);
+        string? diskLibPath = System.Array.Find(libCandidates, System.IO.File.Exists);
+        bool preferSource = sourcePath != null &&
+            (diskLibPath == null || System.IO.File.GetLastWriteTimeUtc(sourcePath) > System.IO.File.GetLastWriteTimeUtc(diskLibPath));
+
+        if (preferSource && sourcePath != null)
+        {
+            string cacheKey = "src:" + sourcePath;
+            lock (_libraryCacheLock)
+            {
+                if (_libraryCache.TryGetValue(cacheKey, out var cachedSrc) && cachedSrc != IntPtr.Zero)
+                {
+                    library = cachedSrc;
+                }
+                else
+                {
+                    var srcText = System.IO.File.ReadAllText(sourcePath);
+                    var srcNS = CreateNSString(srcText);
+                    IntPtr srcErr = IntPtr.Zero;
+                    var compiled = NewLibraryWithSource(device.Device, GetSelector("newLibraryWithSource:options:error:"), srcNS, IntPtr.Zero, ref srcErr);
+                    Release(srcNS);
+                    if (compiled != IntPtr.Zero)
+                    {
+                        _libraryCache[cacheKey] = compiled;
+                        library = compiled;
+                    }
+                    else
+                    {
+                        Console.WriteLine($"[Metal] Live source compile warning for {baseName}.metal: {GetNSErrorDescription(srcErr)}");
+                    }
+                }
+            }
+        }
+
+        // If bytecode is provided and we didn't compile from newer source, load from bytecode
+        if (library == IntPtr.Zero && shader.Bytecode != null && shader.Bytecode.Length > 0)
         {
             // Write bytecode to temp file for reliable loading
             var tempPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"bs_shader_{shader.EntryPoint}_{Guid.NewGuid()}.metallib");
@@ -214,25 +297,11 @@ internal class MetalPipeline : IRHIPipeline
                 try { System.IO.File.Delete(tempPath); } catch { }
             }
         }
-        else
+        else if (library == IntPtr.Zero)
         {
-            // Determine library name based on entry point
-            string libraryName;
-            if (shader.EntryPoint.StartsWith("vs_ui") || shader.EntryPoint.StartsWith("fs_ui"))
-                libraryName = "simple_ui.metallib";
-            else if (shader.EntryPoint.StartsWith("horizon_"))
-                libraryName = "horizon_lighting.metallib";
-            else if (shader.EntryPoint.StartsWith("vs_sky") || shader.EntryPoint.StartsWith("fs_sky") ||
-                     shader.EntryPoint.StartsWith("vs_grid") || shader.EntryPoint.StartsWith("fs_grid") ||
-                     shader.EntryPoint.StartsWith("vs_mesh") || shader.EntryPoint.StartsWith("fs_mesh") ||
-                     shader.EntryPoint.StartsWith("vs_shadow") || shader.EntryPoint.StartsWith("fs_shadow") ||
-                     shader.EntryPoint.StartsWith("fs_wireframe"))
-                libraryName = "viewport_3d.metallib";
-            else
-                libraryName = "default.metallib";
+            string libraryName = baseName + ".metallib";
 
             // Editor shader libraries are the single source of compiled viewport shaders.
-            var exeDir = System.AppContext.BaseDirectory;
             var libraryPath = System.IO.Path.Combine(exeDir, "Editor", "Shaders", libraryName);
                 
             // Bundle fallback: check the packaged editor shader directory.
@@ -244,35 +313,51 @@ internal class MetalPipeline : IRHIPipeline
 
             if (!System.IO.File.Exists(libraryPath))
                 throw new Exception($"Metal library not found: {libraryPath}");
-            
-            var urlClass = GetClass("NSURL");
-            var fileURLWithPathSel = GetSelector("fileURLWithPath:");
-            var pathNS = CreateNSString(libraryPath);
-            var url = objc_msgSend_ptr(urlClass, fileURLWithPathSel, pathNS);
-            Release(pathNS);
-            
-            if (url == IntPtr.Zero)
-                throw new Exception("Failed to create NSURL for Metal library");
-            
-            var newLibraryWithURLSel = GetSelector("newLibraryWithURL:error:");
-            IntPtr error = IntPtr.Zero;
-            library = NewLibraryWithURL(device.Device, newLibraryWithURLSel, url, ref error);
-            
-            if (library == IntPtr.Zero)
+
+            // M1: reuse cached MTLLibrary for this path (retained for process lifetime).
+            lock (_libraryCacheLock)
             {
-                var errorMsg = GetNSErrorDescription(error);
-                throw new Exception($"Failed to load Metal library: {errorMsg}");
+                if (_libraryCache.TryGetValue(libraryPath, out var cached) && cached != IntPtr.Zero)
+                {
+                    library = cached;
+                }
+                else
+                {
+                    var urlClass = GetClass("NSURL");
+                    var fileURLWithPathSel = GetSelector("fileURLWithPath:");
+                    var pathNS = CreateNSString(libraryPath);
+                    var url = objc_msgSend_ptr(urlClass, fileURLWithPathSel, pathNS);
+                    Release(pathNS);
+
+                    if (url == IntPtr.Zero)
+                        throw new Exception("Failed to create NSURL for Metal library");
+
+                    var newLibraryWithURLSel = GetSelector("newLibraryWithURL:error:");
+                    IntPtr error = IntPtr.Zero;
+                    library = NewLibraryWithURL(device.Device, newLibraryWithURLSel, url, ref error);
+
+                    if (library == IntPtr.Zero)
+                    {
+                        var errorMsg = GetNSErrorDescription(error);
+                        throw new Exception($"Failed to load Metal library: {errorMsg}");
+                    }
+
+                    _libraryCache[libraryPath] = library;
+                }
             }
-            
+
         }
-        
+
         // Get function by name
         var newFunctionSel = GetSelector("newFunctionWithName:");
         var entryPointNS = CreateNSString(shader.EntryPoint);
         var function = objc_msgSend_ptr(library, newFunctionSel, entryPointNS);
-        
+
         Release(entryPointNS);
-        Release(library);
+        // NOTE: cached libraries stay retained in _libraryCache; only release
+        // non-cached (bytecode temp) libraries here.
+        if (!preferSource && shader.Bytecode != null && shader.Bytecode.Length > 0)
+            Release(library);
         
         if (function == IntPtr.Zero)
             throw new Exception($"Failed to find shader function: {shader.EntryPoint}");
@@ -425,6 +510,9 @@ internal class MetalPipeline : IRHIPipeline
     
     [System.Runtime.InteropServices.DllImport("/usr/lib/libobjc.A.dylib", EntryPoint = "objc_msgSend")]
     private static extern IntPtr NewLibraryWithURL(IntPtr receiver, IntPtr selector, IntPtr url, ref IntPtr error);
+
+    [System.Runtime.InteropServices.DllImport("/usr/lib/libobjc.A.dylib", EntryPoint = "objc_msgSend")]
+    private static extern IntPtr NewLibraryWithSource(IntPtr receiver, IntPtr selector, IntPtr source, IntPtr options, ref IntPtr error);
     
     public void Dispose()
     {

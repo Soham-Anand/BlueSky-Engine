@@ -1,4 +1,4 @@
-namespace BlueSky.Rendering.RHI;
+namespace BlueSky.BSR.RHI;
 
 public interface IRHIWrapped<out T>
 {

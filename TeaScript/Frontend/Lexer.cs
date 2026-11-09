@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Text;
 
 namespace TeaScript.Frontend;
@@ -17,12 +18,16 @@ public class Lexer
     {
         { "let", TokenType.Let },
         { "fn", TokenType.Fn },
+        { "func", TokenType.Fn },
         { "if", TokenType.If },
         { "else", TokenType.Else },
         { "return", TokenType.Return },
         { "true", TokenType.True },
         { "false", TokenType.False },
         { "while", TokenType.While },
+        { "for", TokenType.For },
+        { "break", TokenType.Break },
+        { "continue", TokenType.Continue },
         { "and", TokenType.And },
         { "or", TokenType.Or },
         { "not", TokenType.Not }
@@ -58,13 +63,13 @@ public class Lexer
             case '[': AddToken(TokenType.LeftBracket); break;
             case ']': AddToken(TokenType.RightBracket); break;
             case ',': AddToken(TokenType.Comma); break;
+            case ';': AddToken(TokenType.Semicolon); break;
             case '+': AddToken(TokenType.Plus); break;
             case '-': AddToken(TokenType.Minus); break;
             case '*': AddToken(TokenType.Star); break;
             case '/':
                 if (Match('/'))
                 {
-                    // Comment - skip to end of line
                     while (Peek() != '\n' && !IsAtEnd()) Advance();
                 }
                 else
@@ -77,8 +82,19 @@ public class Lexer
                 AddToken(Match('=') ? TokenType.Equal : TokenType.Assign);
                 break;
             case '!':
-                if (Match('='))
-                    AddToken(TokenType.NotEqual);
+                AddToken(Match('=') ? TokenType.NotEqual : TokenType.Not);
+                break;
+            case '&':
+                if (Match('&'))
+                    AddToken(TokenType.And);
+                else
+                    throw new Exception($"Unexpected character '&' at {_line}:{_column}");
+                break;
+            case '|':
+                if (Match('|'))
+                    AddToken(TokenType.Or);
+                else
+                    throw new Exception($"Unexpected character '|' at {_line}:{_column}");
                 break;
             case '<':
                 AddToken(Match('=') ? TokenType.LessEqual : TokenType.Less);
@@ -89,7 +105,6 @@ public class Lexer
             case ' ':
             case '\r':
             case '\t':
-                // Ignore whitespace
                 break;
             case '\n':
                 _line++;
@@ -134,7 +149,6 @@ public class Lexer
             throw new Exception($"Unterminated string at {_line}:{_column}");
         }
         
-        // Closing "
         Advance();
         
         AddToken(TokenType.String, value.ToString());
@@ -144,15 +158,14 @@ public class Lexer
     {
         while (IsDigit(Peek())) Advance();
         
-        // Look for decimal part
         if (Peek() == '.' && IsDigit(PeekNext()))
         {
-            Advance(); // Consume '.'
+            Advance();
             while (IsDigit(Peek())) Advance();
         }
         
         string text = _source.Substring(_start, _current - _start);
-        AddToken(TokenType.Number, double.Parse(text));
+        AddToken(TokenType.Number, double.Parse(text, CultureInfo.InvariantCulture));
     }
     
     private void ScanIdentifier()
@@ -162,7 +175,6 @@ public class Lexer
         string text = _source.Substring(_start, _current - _start);
         TokenType type = Keywords.ContainsKey(text) ? Keywords[text] : TokenType.Identifier;
         
-        // Handle boolean literals
         object? literal = null;
         if (type == TokenType.True) literal = true;
         if (type == TokenType.False) literal = false;

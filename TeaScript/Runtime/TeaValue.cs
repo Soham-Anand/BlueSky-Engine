@@ -50,3 +50,9 @@ public class ReturnException : Exception
         Value = value;
     }
 }
+
+/// <summary>Special exception for break statements (caught by loops).</summary>
+public class BreakException : Exception { }
+
+/// <summary>Special exception for continue statements (caught by loops).</summary>
+public class ContinueException : Exception { }

@@ -1,6 +1,6 @@
 using System.Numerics;
 
-namespace BlueSky.Rendering.RHI;
+namespace BlueSky.BSR.RHI;
 
 internal sealed class ValidationCommandBuffer : IRHICommandBuffer, IRHIWrapped<IRHICommandBuffer>
 {
@@ -98,6 +98,12 @@ internal sealed class ValidationCommandBuffer : IRHICommandBuffer, IRHIWrapped<I
         Inner.SetScissor(scissor);
     }
 
+    public void SetDepthBias(float constantBias, float slopeScale, float clamp)
+    {
+        RequireNotDisposed();
+        Inner.SetDepthBias(constantBias, slopeScale, clamp);
+    }
+
     public void SetVertexBuffer(IRHIBuffer buffer, uint binding = 0, ulong offset = 0)
     {
         RequireNotDisposed();
@@ -133,6 +139,29 @@ internal sealed class ValidationCommandBuffer : IRHICommandBuffer, IRHIWrapped<I
         RHIValidation.Require((validated.Usage & (TextureUsage.Sampled | TextureUsage.Storage | TextureUsage.RenderTarget)) != 0,
             "Texture must be Sampled, Storage, or RenderTarget usage.");
         Inner.SetTexture(validated.Inner, binding, set);
+    }
+
+    public void SetSampler(IRHISampler sampler, uint binding, uint set = 0)
+    {
+        RequireNotDisposed();
+        var validated = Owner.ExpectSampler(sampler);
+        Inner.SetSampler(validated.Inner, binding, set);
+    }
+
+    public void CopyTexture(IRHITexture source, IRHITexture destination)
+    {
+        RequireNotDisposed();
+        RHIValidation.RequireState(!_inRenderPass, "CopyTexture must be called outside a render pass.");
+        var src = Owner.ExpectTexture(source);
+        var dst = Owner.ExpectTexture(destination);
+        RHIValidation.Require(src.Format == dst.Format, "Copied textures must have matching formats.");
+        RHIValidation.Require(src.Width == dst.Width && src.Height == dst.Height,
+            "Copied textures must have matching dimensions.");
+        RHIValidation.Require((src.Usage & TextureUsage.TransferSrc) != 0,
+            "Copy source must have TransferSrc usage.");
+        RHIValidation.Require((dst.Usage & TextureUsage.TransferDst) != 0,
+            "Copy destination must have TransferDst usage.");
+        Inner.CopyTexture(src.Inner, dst.Inner);
     }
 
     public void SetVertexUniforms(uint binding, ReadOnlySpan<byte> data)

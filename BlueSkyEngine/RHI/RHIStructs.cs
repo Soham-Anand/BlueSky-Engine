@@ -1,6 +1,6 @@
 using System.Numerics;
 
-namespace BlueSky.Rendering.RHI;
+namespace BlueSky.BSR.RHI;
 
 public struct BufferDesc
 {
@@ -19,6 +19,12 @@ public struct TextureDesc
     public uint ArrayLayers;
     public TextureFormat Format;
     public TextureUsage Usage;
+    /// <summary>
+    /// M5: TBDR memoryless attachment (tile memory only, no backing store).
+    /// Requires RenderTarget/DepthStencil usage WITHOUT Sampled/Storage/Transfer.
+    /// Honored on Metal (Apple Silicon); ignored elsewhere.
+    /// </summary>
+    public bool Memoryless;
     public string? DebugName;
 }
 
@@ -176,6 +182,58 @@ public struct Scissor
     public int Y;
     public uint Width;
     public uint Height;
+}
+
+public enum SamplerFilter
+{
+    Nearest,
+    Linear,
+    Anisotropic,
+}
+
+public enum SamplerAddressMode
+{
+    Repeat,
+    Mirror,
+    Clamp,
+    Border,
+}
+
+public struct SamplerDesc
+{
+    public SamplerFilter Filter;
+    public SamplerAddressMode AddressU;
+    public SamplerAddressMode AddressV;
+    public SamplerAddressMode AddressW;
+    public uint MaxAnisotropy;
+    public float MinLod;
+    public float MaxLod;
+    /// <summary>
+    /// Depth-compare sampler for shadow maps (compare_func::less). False = normal.
+    /// </summary>
+    public bool CompareLess;
+
+    public static SamplerDesc LinearClamp => new()
+    {
+        Filter = SamplerFilter.Linear,
+        AddressU = SamplerAddressMode.Clamp,
+        AddressV = SamplerAddressMode.Clamp,
+        AddressW = SamplerAddressMode.Clamp,
+        MaxAnisotropy = 1,
+        MinLod = 0,
+        MaxLod = 1000,
+    };
+
+    public static SamplerDesc NearestClamp => new()
+    {
+        Filter = SamplerFilter.Nearest,
+        AddressU = SamplerAddressMode.Clamp,
+        AddressV = SamplerAddressMode.Clamp,
+        AddressW = SamplerAddressMode.Clamp,
+        MaxAnisotropy = 1,
+        MinLod = 0,
+        MaxLod = 1000,
+    };
 }
 
 public struct ClearValue

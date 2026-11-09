@@ -1,16 +1,16 @@
 using System;
 using System.IO;
 using System.Linq;
-using BlueSky.Platform;
-using BlueSky.Platform.Input;
-using BlueSky.Core.ECS;
-using BlueSky.Core.ECS.Builtin;
-using BlueSky.Core.Scene;
+using BlueSky.Aegis;
+using BlueSky.Aegis.Input;
+using BlueSky.SkyCore;
+using BlueSky.SkyCore.Builtin;
+using BlueSky.Meridian;
 using BlueSky.Editor;
-using BlueSky.Networking;
-using BlueSky.Rendering;
+using BlueSky.LHO;
+using BlueSky.BSR;
 using BlueSky.Airborne;
-using BlueSky.Rendering.RHI;
+using BlueSky.BSR.RHI;
 using BlueSky.Editor.UI;
 
 namespace BlueSky.Runtime;
@@ -30,6 +30,10 @@ public class GameRuntime
     private IRHIDevice? _rhi;
     private IRHISwapchain? _swapchain;
     private IRHITexture? _depthTexture;
+    // The swapchain and depth buffer are measured in PIXELS (window points x backing scale); the HUD is laid out in
+    // window POINTS. On a Retina display the two differ by 2x, so they must never share one number.
+    private uint _depthW, _depthH;
+    private int _uiLogicalW, _uiLogicalH;
     
     // Game systems
     private World? _world;
@@ -37,9 +41,13 @@ public class GameRuntime
     private ViewportRenderer? _viewportRenderer;
     private TerrainSystem? _terrainSystem;
     private BlueSky.Airborne.IPhysicsWorld? _physicsWorld;
-    private BlueSky.Core.Gameplay.CarControllerSystem? _carControllerSystem;
+    private BlueSky.Airborne.CarControllerSystem? _carControllerSystem;
     private IMultiplayerService? _multiplayer;
-    private BlueSky.Networking.NetworkReplicationSystem? _replication;
+    private BlueSky.LHO.NetworkReplicationSystem? _replication;
+    private readonly BlueSky.BSR.Vectra.VectraSystem _vectraSystem = new();
+    private BlueSky.Echo.Echo? _echo;
+    private BlueSky.Echo.EchoSystem? _echoSystem;
+    private bool _showDiagnosticsHud;
 
     // ── Convenience helpers ────────────────────────────────────────────────────
     bool IsHost => _replication?.IsHost ?? (_config.Multiplayer.Mode == MultiplayerMode.Host);
@@ -68,7 +76,6 @@ public class GameRuntime
     private MultiplayerMode _pendingMultiplayerMode = MultiplayerMode.Offline;
     private string _pendingSessionName = "";
     private string _pendingJoinSessionId = "";
-    private string _authStatus = "LoggedOut";
     
     // The lobby key (UserId or DisplayName) that identifies THIS player in the lobby.
     // Set when hosting or joining. Used to match replicated entities to the local player.
@@ -77,6 +84,7 @@ public class GameRuntime
     public GameRuntime(RuntimeConfig config)
     {
         _config = config;
+        _showDiagnosticsHud = config.ShowDiagnosticsHud;
     }
     
     public void Run()
@@ -117,8 +125,17 @@ public class GameRuntime
     {
         // Initialize ECS world
         _world = new World();
+        _world.AddSystem(new BlueSky.SkyCore.HierarchySystem());
         _terrainSystem = new TerrainSystem(_world);
-        
+
+        // Initialize Echo audio (miniaudio backend; silent no-op if no device)
+        try
+        {
+            _echo = new BlueSky.Echo.Echo(new BlueSky.Echo.MiniAudioBackend());
+            _echoSystem = new BlueSky.Echo.EchoSystem(_echo, _world);
+            BlueSky.Echo.EchoTeaScriptBridge.Active = _echo;
+        }
+        catch (Exception ex) { Console.WriteLine($"[Echo] Failed to start audio: {ex.Message}"); }
     }
     
     void InitializeGameplaySystems()
@@ -128,8 +145,16 @@ public class GameRuntime
             return;
         }
         
+        // Initialize TeaScriptSystem (handles all entity TeaScripts using the unified engine API)
+        BlueSky.Core.Scripting.TeaScriptSystem.VectraParticles = _vectraSystem;
+        _teaScriptSystem = new BlueSky.Core.Scripting.TeaScriptSystem(_world);
+        _teaScriptSystem.SetInputProviders(
+            IsTeaScriptKeyDown,
+            IsTeaScriptMouseButtonDown,
+            () => _input?.MousePosition ?? System.Numerics.Vector2.Zero);
+
         // Initialize CarControllerSystem (handles car input, physics, and wheel animation)
-        _carControllerSystem = new BlueSky.Core.Gameplay.CarControllerSystem();
+        _carControllerSystem = new BlueSky.Airborne.CarControllerSystem();
         _carControllerSystem.Initialize(_world, _input, viewport: null);
         
         // Force an immediate update to initialize car controllers BEFORE the main game loop
@@ -141,7 +166,7 @@ public class GameRuntime
     {
         // Create window
         var options = WindowOptions.Default;
-        options.Title = $"BlueSky Game - {_config.Mode}";
+        options.Title = !string.IsNullOrWhiteSpace(_config.AppTitle) ? _config.AppTitle : $"BlueSky Game - {_config.Mode}";
         options.Width = _config.WindowWidth;
         options.Height = _config.WindowHeight;
         options.Resizable = true;
@@ -168,27 +193,23 @@ public class GameRuntime
         var presentMode = _config.VSync ? PresentMode.Vsync : PresentMode.Immediate;
         _swapchain = _rhi.CreateSwapchain(_window, presentMode);
         
-        // Create depth texture
-        _depthTexture = _rhi.CreateTexture(new TextureDesc
-        {
-            Width = (uint)_config.WindowWidth,
-            Height = (uint)_config.WindowHeight,
-            Depth = 1,
-            MipLevels = 1,
-            ArrayLayers = 1,
-            Format = TextureFormat.Depth32Float,
-            Usage = TextureUsage.DepthStencil,
-            DebugName = "Runtime.DepthBuffer"
-        });
+        // Create depth texture at the framebuffer's pixel size (it must match the swapchain's colour target).
+        var framebuffer = _window.FramebufferSize;
+        _depthW = (uint)MathF.Max(1, framebuffer.X);
+        _depthH = (uint)MathF.Max(1, framebuffer.Y);
+        _depthTexture = CreateDepthTexture(_depthW, _depthH);
+        Console.WriteLine($"[Runtime] Render targets: swapchain {_swapchain.Width}x{_swapchain.Height} px, depth {_depthW}x{_depthH} px, window {_window.Size.X:0}x{_window.Size.Y:0} pt");
         
         // Initialize viewport renderer (reuses editor rendering code!)
         if (_world != null)
         {
-            _viewportRenderer = new ViewportRenderer(_rhi, _world, terrainSystem: _terrainSystem, _swapchain.Format, showEditorGizmos: false);
+            _viewportRenderer = new ViewportRenderer(_rhi, _world, terrainSystem: _terrainSystem, _swapchain.Format, showEditorGizmos: false, vectraSystem: _vectraSystem);
         }
 
-        // Initialize UI system for HUD rendering
-        _ui = new EditorUI((uint)_config.WindowWidth, (uint)_config.WindowHeight);
+        // Initialize UI system for HUD rendering (laid out in window points)
+        _uiLogicalW = (int)MathF.Max(1, _window.Size.X);
+        _uiLogicalH = (int)MathF.Max(1, _window.Size.Y);
+        _ui = new EditorUI((uint)_uiLogicalW, (uint)_uiLogicalH);
         _uiRenderer = new EditorUIRenderer(_rhi);
         
         // Initialize font atlas for text rendering
@@ -200,9 +221,69 @@ public class GameRuntime
             _ui.MeasureTextWidth = text => _uiRenderer.FontAtlas.MeasureWidth(text.AsSpan());
             _ui.TextLineHeight = _uiRenderer.FontAtlas.LineHeight;
         }
-        // CRITICAL: Resize UI renderer to match window dimensions
-        _uiRenderer.Resize(_config.WindowWidth, _config.WindowHeight);
+        // The UI projection is in window points, matching the editor.
+        _uiRenderer.Resize(_uiLogicalW, _uiLogicalH);
         
+    }
+
+    IRHITexture CreateDepthTexture(uint width, uint height)
+    {
+        return _rhi!.CreateTexture(new TextureDesc
+        {
+            Width = width,
+            Height = height,
+            Depth = 1,
+            MipLevels = 1,
+            ArrayLayers = 1,
+            Format = TextureFormat.Depth32Float,
+            Usage = TextureUsage.DepthStencil,
+            DebugName = "Runtime.DepthBuffer"
+        });
+    }
+
+    /// <summary>
+    /// Keeps the swapchain, depth buffer and HUD matched to the window's current size, every frame, so fullscreen and
+    /// dragging the window edge work as well as the first frame does. Returns false when the window has no drawable
+    /// area (minimized), in which case the frame is skipped.
+    /// </summary>
+    bool EnsureRenderTargetSizes(out uint pixelW, out uint pixelH)
+    {
+        pixelW = 0;
+        pixelH = 0;
+        if (_window == null || _swapchain == null || _rhi == null)
+            return false;
+
+        var framebuffer = _window.FramebufferSize;
+        pixelW = (uint)MathF.Max(0, framebuffer.X);
+        pixelH = (uint)MathF.Max(0, framebuffer.Y);
+        if (pixelW == 0 || pixelH == 0)
+            return false;
+
+        if (_swapchain.Width != pixelW || _swapchain.Height != pixelH)
+            _swapchain.Resize(pixelW, pixelH);
+
+        if (_depthTexture == null || _depthW != pixelW || _depthH != pixelH)
+        {
+            // The old depth buffer may still be read by a frame in flight.
+            _rhi.WaitIdle();
+            _depthTexture?.Dispose();
+            _depthTexture = CreateDepthTexture(pixelW, pixelH);
+            _depthW = pixelW;
+            _depthH = pixelH;
+            Console.WriteLine($"[Runtime] Render size {pixelW}x{pixelH} px (window {_window.Size.X:0}x{_window.Size.Y:0} pt)");
+        }
+
+        int logicalW = (int)MathF.Max(1, _window.Size.X);
+        int logicalH = (int)MathF.Max(1, _window.Size.Y);
+        if (logicalW != _uiLogicalW || logicalH != _uiLogicalH)
+        {
+            _uiLogicalW = logicalW;
+            _uiLogicalH = logicalH;
+            _ui?.Resize((uint)logicalW, (uint)logicalH);
+            _uiRenderer?.Resize(logicalW, logicalH);
+        }
+
+        return true;
     }
     
     void InitializePhysics()
@@ -232,12 +313,16 @@ public class GameRuntime
         
         _input = _window.CreateInput();
         
-        // ESC to quit
+        // ESC to quit, F3 to toggle diagnostics HUD
         _input.KeyDown += (key, mods) =>
         {
             if (key == KeyCode.Escape)
             {
                 _isRunning = false;
+            }
+            else if (key == KeyCode.F3)
+            {
+                _showDiagnosticsHud = !_showDiagnosticsHud;
             }
         };
         
@@ -258,16 +343,27 @@ public class GameRuntime
         }
 
         // Set up the static bridge for TeaScript API
-        BlueSky.Networking.NetworkingTeaScriptBridge.Register(_multiplayer);
+        BlueSky.LHO.NetworkingTeaScriptBridge.Register(_multiplayer, (scenePath, modeStr, sessionName, joinSessionId) =>
+        {
+            _pendingScenePath = scenePath ?? "";
+            _pendingMultiplayerMode = MultiplayerMode.Offline;
+            if (!string.IsNullOrEmpty(modeStr))
+            {
+                Enum.TryParse(modeStr, true, out _pendingMultiplayerMode);
+            }
+            _pendingSessionName = sessionName ?? "";
+            _pendingJoinSessionId = joinSessionId ?? "";
+            _pendingSceneTransition = true;
+        });
 
         // Create the replication system and attach P2P transport
-        _replication = new BlueSky.Networking.NetworkReplicationSystem(_world, msg => Console.WriteLine(msg));
+        _replication = new BlueSky.LHO.NetworkReplicationSystem(_world, msg => Console.WriteLine(msg));
         _replication.AttachTransport(_multiplayer);
 
-        if (_config.Multiplayer.Mode == BlueSky.Networking.MultiplayerMode.Host ||
-            _config.Multiplayer.Mode == BlueSky.Networking.MultiplayerMode.Join)
+        if (_config.Multiplayer.Mode == BlueSky.LHO.MultiplayerMode.Host ||
+            _config.Multiplayer.Mode == BlueSky.LHO.MultiplayerMode.Join)
         {
-            if (_config.Multiplayer.Mode == BlueSky.Networking.MultiplayerMode.Host)
+            if (_config.Multiplayer.Mode == BlueSky.LHO.MultiplayerMode.Host)
             {
                 _replication.InitializeAsHost();
                 // Set host's own key from config/localname
@@ -284,10 +380,10 @@ public class GameRuntime
             // HOST: when lobby players update, spawn entities for new players, remove departed.
             // Players are sorted so the host is always assigned the first car (spawn point 0),
             // then joined clients in lobby order.
-            BlueSky.Networking.NetworkingTeaScriptBridge.Lobby!.OnPlayersUpdated += (players) =>
+            BlueSky.LHO.NetworkingTeaScriptBridge.Lobby!.OnPlayersUpdated += (players) =>
             {
                 if (_replication == null || _world == null) return;
-                if (!BlueSky.Networking.NetworkingTeaScriptBridge.IsLobbyHost()) return;
+                if (!BlueSky.LHO.NetworkingTeaScriptBridge.IsLobbyHost()) return;
 
                 string prefabPath = FindNetworkManagerPrefabPath();
                 if (string.IsNullOrEmpty(prefabPath)) return;
@@ -348,15 +444,15 @@ public class GameRuntime
         }
 
         // Wire lobby server travel
-        BlueSky.Networking.NetworkingTeaScriptBridge.Lobby!.OnServerTravel += () =>
+        BlueSky.LHO.NetworkingTeaScriptBridge.Lobby!.OnServerTravel += () =>
         {
-            string scenePath = BlueSky.Networking.NetworkingTeaScriptBridge.Lobby!.ScenePath;
+            string scenePath = BlueSky.LHO.NetworkingTeaScriptBridge.Lobby!.ScenePath;
             if (!string.IsNullOrEmpty(scenePath))
             {
-                bool isLobbyHost = BlueSky.Networking.NetworkingTeaScriptBridge.Lobby!.IsHost;
+                bool isLobbyHost = BlueSky.LHO.NetworkingTeaScriptBridge.Lobby!.IsHost;
                 _pendingMultiplayerMode = isLobbyHost
-                    ? BlueSky.Networking.MultiplayerMode.Host
-                    : BlueSky.Networking.MultiplayerMode.Join;
+                    ? BlueSky.LHO.MultiplayerMode.Host
+                    : BlueSky.LHO.MultiplayerMode.Join;
                 _pendingScenePath = scenePath;
                 _pendingSceneTransition = true;
                 _replication?.Pause(); // Buffer packets — world is about to be replaced
@@ -368,6 +464,7 @@ public class GameRuntime
     {
         if (string.IsNullOrEmpty(scenePath))
         {
+            Console.Error.WriteLine("[Runtime] ⚠️ No scene path was provided - loading the built-in test scene.");
             
             // Create a test scene with a simple cube
             CreateTestScene();
@@ -376,6 +473,7 @@ public class GameRuntime
         
         if (!File.Exists(scenePath))
         {
+            Console.Error.WriteLine($"[Runtime] ⚠️ Scene file not found: '{scenePath}' (mode: {_config.Mode}) - loading the built-in test scene instead.");
             
             // Create a test scene with a simple cube
             CreateTestScene();
@@ -388,17 +486,20 @@ public class GameRuntime
         
         if (_scene == null)
         {
+            Console.Error.WriteLine($"[Runtime] ⚠️ Scene file could not be parsed: '{scenePath}' - loading the built-in test scene instead.");
             CreateTestScene();
             return;
         }
         
         
+        Console.WriteLine($"[Runtime] Loaded scene '{_scene.Name}' ({_scene.Entities.Count} entities) from {scenePath}");
+
         // Instantiate entities in the world using SceneConverter
         if (_world != null)
         {
             try
             {
-                BlueSky.Core.Scene.SceneConverter.SceneDataToWorld(_scene, _world);
+                BlueSky.Meridian.SceneConverter.SceneDataToWorld(_scene, _world);
             }
             catch (Exception ex)
             {
@@ -432,8 +533,8 @@ public class GameRuntime
         
         // Register rigidbodies
         var physicsQuery = _world.CreateQuery()
-            .All<BlueSky.Core.ECS.Builtin.PhysicsComponent>()
-            .All<BlueSky.Core.ECS.Builtin.TransformComponent>()
+            .All<BlueSky.SkyCore.Builtin.PhysicsComponent>()
+            .All<BlueSky.SkyCore.Builtin.TransformComponent>()
             .Build();
         
         var chunks = _world.GetQueryChunks(physicsQuery);
@@ -442,14 +543,14 @@ public class GameRuntime
         foreach (var chunk in chunks)
         {
             var entities = chunk.GetEntities();
-            int physIdx = chunk.GetComponentIndex(typeof(BlueSky.Core.ECS.Builtin.PhysicsComponent));
-            int transIdx = chunk.GetComponentIndex(typeof(BlueSky.Core.ECS.Builtin.TransformComponent));
+            int physIdx = chunk.GetComponentIndex(typeof(BlueSky.SkyCore.Builtin.PhysicsComponent));
+            int transIdx = chunk.GetComponentIndex(typeof(BlueSky.SkyCore.Builtin.TransformComponent));
             
             for (int i = 0; i < chunk.Count; i++)
             {
                 var entity = entities[i];
-                var phys = chunk.GetComponent<BlueSky.Core.ECS.Builtin.PhysicsComponent>(i, physIdx);
-                var trans = chunk.GetComponent<BlueSky.Core.ECS.Builtin.TransformComponent>(i, transIdx);
+                var phys = chunk.GetComponent<BlueSky.SkyCore.Builtin.PhysicsComponent>(i, physIdx);
+                var trans = chunk.GetComponent<BlueSky.SkyCore.Builtin.TransformComponent>(i, transIdx);
                 
                 var pos = new System.Numerics.Vector3(trans.Position.X, trans.Position.Y, trans.Position.Z);
                 var rot = new System.Numerics.Quaternion(trans.Rotation.X, trans.Rotation.Y, trans.Rotation.Z, trans.Rotation.W);
@@ -472,8 +573,8 @@ public class GameRuntime
         {
             
             var terrainQuery = _world.CreateQuery()
-                .All<BlueSky.Core.ECS.Builtin.TerrainComponent>()
-                .All<BlueSky.Core.ECS.Builtin.TransformComponent>()
+                .All<BlueSky.SkyCore.Builtin.TerrainComponent>()
+                .All<BlueSky.SkyCore.Builtin.TransformComponent>()
                 .Build();
             
             var terrainChunks = _world.GetQueryChunks(terrainQuery);
@@ -483,13 +584,13 @@ public class GameRuntime
             foreach (var chunk in terrainChunks)
             {
                 var entities = chunk.GetEntities();
-                int terrainIdx = chunk.GetComponentIndex(typeof(BlueSky.Core.ECS.Builtin.TerrainComponent));
+                int terrainIdx = chunk.GetComponentIndex(typeof(BlueSky.SkyCore.Builtin.TerrainComponent));
                 
                 
                 for (int i = 0; i < chunk.Count; i++)
                 {
                     var entity = entities[i];
-                    var terrain = chunk.GetComponent<BlueSky.Core.ECS.Builtin.TerrainComponent>(i, terrainIdx);
+                    var terrain = chunk.GetComponent<BlueSky.SkyCore.Builtin.TerrainComponent>(i, terrainIdx);
                     
                     
                     if (!terrain.CollisionEnabled)
@@ -584,7 +685,7 @@ public class GameRuntime
         // If host with lobby players, the OnPlayersUpdated handler will spawn.
         // Only spawn directly if no lobby (offline mode or lobby has no players yet).
         if (_config.Multiplayer.Mode == MultiplayerMode.Host &&
-            BlueSky.Networking.NetworkingTeaScriptBridge.Lobby?.Players.Count > 0)
+            BlueSky.LHO.NetworkingTeaScriptBridge.Lobby?.Players.Count > 0)
         {
             return;
         }
@@ -622,10 +723,10 @@ public class GameRuntime
 
         // Fallback: load prefab directly
         if (!System.IO.File.Exists(prefabPath)) return;
-        var prefabData = BlueSky.Core.Scene.SceneSerializer.LoadScene(prefabPath);
+        var prefabData = BlueSky.Meridian.SceneSerializer.LoadScene(prefabPath);
         if (prefabData == null) return;
 
-        BlueSky.Core.Scene.SceneConverter.SceneDataToWorld(prefabData, _world, clearWorld: false);
+        BlueSky.Meridian.SceneConverter.SceneDataToWorld(prefabData, _world, clearWorld: false);
 
         // Position at spawn point
         var carQuery = _world.CreateQuery().All<CarControllerComponent>().All<TransformComponent>().Build();
@@ -636,7 +737,7 @@ public class GameRuntime
             for (int i = 0; i < chunk.Count; i++)
             {
                 ref var t = ref chunk.GetComponent<TransformComponent>(i, transIdx);
-                t.Position = new BlueSky.Core.Math.Vector3(
+                t.Position = new BlueSky.Ramanujan.Vector3(
                     t.Position.X + spawnPos.X, t.Position.Y + spawnPos.Y, t.Position.Z + spawnPos.Z);
                 RegisterSpawnedCarPhysics(entities[i].Id);
             }
@@ -699,8 +800,8 @@ public class GameRuntime
         
         // Find the first entity with CarControllerComponent
         var carQuery = _world.CreateQuery()
-            .All<BlueSky.Core.ECS.Builtin.CarControllerComponent>()
-            .All<BlueSky.Core.ECS.Builtin.TransformComponent>()
+            .All<BlueSky.SkyCore.Builtin.CarControllerComponent>()
+            .All<BlueSky.SkyCore.Builtin.TransformComponent>()
             .Build();
         
         var chunks = _world.GetQueryChunks(carQuery);
@@ -717,8 +818,8 @@ public class GameRuntime
         
         // If no car found, try to find any entity with a mesh (static or skeletal)
         var meshQuery = _world.CreateQuery()
-            .Any(typeof(BlueSky.Core.ECS.Builtin.StaticMeshComponent), typeof(BlueSky.Core.ECS.Builtin.SkeletalMeshComponent))
-            .All<BlueSky.Core.ECS.Builtin.TransformComponent>()
+            .Any(typeof(BlueSky.SkyCore.Builtin.StaticMeshComponent), typeof(BlueSky.SkyCore.Builtin.SkeletalMeshComponent))
+            .All<BlueSky.SkyCore.Builtin.TransformComponent>()
             .Build();
         
         chunks = _world.GetQueryChunks(meshQuery);
@@ -745,9 +846,9 @@ public class GameRuntime
         // Add Transform component
         var transform = new TransformComponent
         {
-            Position = new BlueSky.Core.Math.Vector3(0, 0, 0),
-            Rotation = new BlueSky.Core.Math.Quaternion(0, 0, 0, 1),
-            Scale = new BlueSky.Core.Math.Vector3(1, 1, 1)
+            Position = new BlueSky.Ramanujan.Vector3(0, 0, 0),
+            Rotation = new BlueSky.Ramanujan.Quaternion(0, 0, 0, 1),
+            Scale = new BlueSky.Ramanujan.Vector3(1, 1, 1)
         };
         _world.AddComponent(entity, transform);
         
@@ -808,8 +909,7 @@ public class GameRuntime
     //  GAME SYSTEMS
     // ══════════════════════════════════════════════════════════════════════════
     
-    // TeaScript engines per entity (keyed by entity ID)
-    private readonly Dictionary<uint, TeaScript.Bridge.TeaScriptEngine> _scriptEngines = new();
+    private BlueSky.Core.Scripting.TeaScriptSystem? _teaScriptSystem;
     
     void Update(double deltaTime)
     {
@@ -823,8 +923,8 @@ public class GameRuntime
         // Begin UI frame (clears previous frame's UI elements)
         BlueSky.Runtime.UI.RuntimeUI.BeginFrame();
         
-        // Draw Diagnostics HUD
-        if (_frameCount >= 60)
+        // Draw Diagnostics HUD (toggleable via F3 or --diagnostics-hud)
+        if (_showDiagnosticsHud && _frameCount >= 60)
         {
             BlueSky.Runtime.UI.RuntimeUI.Panel(10, 10, 480, 280);
             BlueSky.Runtime.UI.RuntimeUI.Label("=== BLUESKY ENGINE DIAGNOSTICS ===", 20, 20);
@@ -833,14 +933,14 @@ public class GameRuntime
             BlueSky.Runtime.UI.RuntimeUI.Label($"Physics Frame: {_physicsFrame}", 20, 95);
             
             // Find active car controller
-            BlueSky.Core.Gameplay.CarController? activeCar = null;
+            BlueSky.Airborne.CarController? activeCar = null;
             if (_carControllerSystem != null)
             {
                 foreach (var entity in _world.GetAllEntities())
                 {
-                    if (_world.HasComponent<BlueSky.Core.ECS.Builtin.CarControllerComponent>(entity))
+                    if (_world.HasComponent<BlueSky.SkyCore.Builtin.CarControllerComponent>(entity))
                     {
-                        var ctrl = BlueSky.Core.Gameplay.CarControllerSystem.GetController((uint)entity.Id);
+                        var ctrl = BlueSky.Airborne.CarControllerSystem.GetController((uint)entity.Id);
                         if (ctrl != null && ctrl.IsPossessed)
                         {
                             activeCar = ctrl;
@@ -903,7 +1003,7 @@ public class GameRuntime
         }
         
         // ── 2. Execute TeaScript ─────────────────────────────────────────────
-        UpdateTeaScripts(deltaTime);
+        _teaScriptSystem?.Update((float)deltaTime);
 
         // ── 3. Update Physics with FIXED TIMESTEP ────────────────────────────
         // Client: skip physics entirely — host runs it and sends positions via replication
@@ -927,7 +1027,7 @@ public class GameRuntime
             _physicsStepsThisFrame = 0;
             while (_physicsAccumulator >= FixedTimeStep)
             {
-                FixedUpdateTeaScripts(FixedTimeStep);
+                _teaScriptSystem?.FixedUpdate(FixedTimeStep);
                 if (_carControllerSystem != null)
                     _carControllerSystem.FixedUpdate(FixedTimeStep);
                 _physicsWorld.Step(FixedTimeStep);
@@ -945,20 +1045,41 @@ public class GameRuntime
         // has been synchronized. This prevents a one-fixed-step visual lag.
         _carControllerSystem?.Update((float)deltaTime);
 
+        // ── 3b. World systems (HierarchySystem: children follow parents) ─────
+        _world.Update((float)deltaTime);
+
         // ── 4. Camera (after physics/replication so positions are current) ───
         UpdateCamera(deltaTime);
+
+        // ── 4b. Echo audio (listener follows the game camera) ────────────────
+        if (_echo != null)
+        {
+            var forward = _cameraTarget - _cameraPos;
+            if (forward.LengthSquared() > 1e-6f)
+                forward = System.Numerics.Vector3.Normalize(forward);
+            else
+                forward = -System.Numerics.Vector3.UnitZ;
+
+            _echo.SetListenerPosition(_cameraPos, forward, System.Numerics.Vector3.UnitY);
+            _echoSystem?.Update((float)deltaTime);
+            _echo.Update((float)deltaTime);
+        }
 
         // ── 5. Update Multiplayer / EOS ──────────────────────────────────────
         _multiplayer?.Tick(deltaTime);
 
         // ── 6. Update Lobby (broadcast state, retry joins) ───────────────────
-        BlueSky.Networking.NetworkingTeaScriptBridge.UpdateLobby((float)deltaTime);
+        BlueSky.LHO.NetworkingTeaScriptBridge.UpdateLobby((float)deltaTime);
 
         // ── 7. Host: broadcast world state to all clients ────────────────────
         if (IsHost && _replication != null)
         {
             _replication.BroadcastWorldState();
         }
+
+        // ── 8. Update Vectra particles & terrain ─────────────────────────────
+        _terrainSystem?.Update();
+        _vectraSystem.Update((float)_lastFrameDeltaTime);
         
         _frameCount++;
     }
@@ -969,7 +1090,7 @@ public class GameRuntime
             return;
 
         var carQuery = _world.CreateQuery()
-            .All<BlueSky.Core.ECS.Builtin.CarControllerComponent>()
+            .All<BlueSky.SkyCore.Builtin.CarControllerComponent>()
             .Build();
 
         var chunks = _world.GetQueryChunks(carQuery);
@@ -981,7 +1102,7 @@ public class GameRuntime
             for (int i = 0; i < chunk.Count; i++)
             {
                 var entity = entities[i];
-                var controller = BlueSky.Core.Gameplay.CarControllerSystem.GetController((uint)entity.Id);
+                var controller = BlueSky.Airborne.CarControllerSystem.GetController((uint)entity.Id);
                 if (controller == null) continue;
 
                 // ── HOST: apply client input to remote entities ──────────────
@@ -993,7 +1114,7 @@ public class GameRuntime
                         var input = _replication.GetPendingInput(ownerKey);
                         if (input != null)
                         {
-                            var carInput = new BlueSky.Core.Gameplay.CarInput
+                            var carInput = new CarInput
                             {
                                 Throttle = input.Throttle,
                                 Steer = input.Steer,
@@ -1020,7 +1141,7 @@ public class GameRuntime
                 {
                     controller.OnPossessed(null!);
                     _cameraFollowTarget = entity;
-                    BlueSky.Core.Gameplay.CarControllerSystem.PossessedController = controller;
+                    BlueSky.Airborne.CarControllerSystem.PossessedController = controller;
                 }
 
                 if (IsClient && _replication != null)
@@ -1042,15 +1163,15 @@ public class GameRuntime
         throttle = 0f; steer = 0f; brake = 0f; handbrake = 0f;
         if (_input == null) return;
 
-        if (_input.IsKeyDown(BlueSky.Platform.Input.KeyCode.W) || _input.IsKeyDown(BlueSky.Platform.Input.KeyCode.Up))
+        if (_input.IsKeyDown(BlueSky.Aegis.Input.KeyCode.W) || _input.IsKeyDown(BlueSky.Aegis.Input.KeyCode.Up))
             throttle = 1f;
-        else if (_input.IsKeyDown(BlueSky.Platform.Input.KeyCode.S) || _input.IsKeyDown(BlueSky.Platform.Input.KeyCode.Down))
+        else if (_input.IsKeyDown(BlueSky.Aegis.Input.KeyCode.S) || _input.IsKeyDown(BlueSky.Aegis.Input.KeyCode.Down))
             brake = 1f;
-        if (_input.IsKeyDown(BlueSky.Platform.Input.KeyCode.A) || _input.IsKeyDown(BlueSky.Platform.Input.KeyCode.Left))
+        if (_input.IsKeyDown(BlueSky.Aegis.Input.KeyCode.A) || _input.IsKeyDown(BlueSky.Aegis.Input.KeyCode.Left))
             steer = -1f;
-        if (_input.IsKeyDown(BlueSky.Platform.Input.KeyCode.D) || _input.IsKeyDown(BlueSky.Platform.Input.KeyCode.Right))
+        if (_input.IsKeyDown(BlueSky.Aegis.Input.KeyCode.D) || _input.IsKeyDown(BlueSky.Aegis.Input.KeyCode.Right))
             steer = 1f;
-        if (_input.IsKeyDown(BlueSky.Platform.Input.KeyCode.Space))
+        if (_input.IsKeyDown(BlueSky.Aegis.Input.KeyCode.Space))
             handbrake = 1f;
     }
     
@@ -1062,7 +1183,7 @@ public class GameRuntime
         // Pull camera from the CarController's per-car ChaseCameraController
         if (_cameraFollowTarget.Id != 0)
         {
-            var controller = BlueSky.Core.Gameplay.CarControllerSystem.GetController((uint)_cameraFollowTarget.Id);
+            var controller = BlueSky.Airborne.CarControllerSystem.GetController((uint)_cameraFollowTarget.Id);
             if (controller != null)
             {
                 // ChaseCameraController updates inside CarControllerSystem.Update(),
@@ -1091,8 +1212,8 @@ public class GameRuntime
             return;
 
         var physicsQuery = _world.CreateQuery()
-            .All<BlueSky.Core.ECS.Builtin.PhysicsComponent>()
-            .All<BlueSky.Core.ECS.Builtin.TransformComponent>()
+            .All<BlueSky.SkyCore.Builtin.PhysicsComponent>()
+            .All<BlueSky.SkyCore.Builtin.TransformComponent>()
             .Build();
 
         foreach (var chunk in _world.GetQueryChunks(physicsQuery))
@@ -1125,8 +1246,8 @@ public class GameRuntime
         
         // Query all entities with physics + transform
         var physicsQuery = _world.CreateQuery()
-            .All<BlueSky.Core.ECS.Builtin.PhysicsComponent>()
-            .All<BlueSky.Core.ECS.Builtin.TransformComponent>()
+            .All<BlueSky.SkyCore.Builtin.PhysicsComponent>()
+            .All<BlueSky.SkyCore.Builtin.TransformComponent>()
             .Build();
         
         var chunks = _world.GetQueryChunks(physicsQuery);
@@ -1134,7 +1255,7 @@ public class GameRuntime
         foreach (var chunk in chunks)
         {
             var entities = chunk.GetEntities();
-            int transIdx = chunk.GetComponentIndex(typeof(BlueSky.Core.ECS.Builtin.TransformComponent));
+            int transIdx = chunk.GetComponentIndex(typeof(BlueSky.SkyCore.Builtin.TransformComponent));
             
             for (int i = 0; i < chunk.Count; i++)
             {
@@ -1144,7 +1265,7 @@ public class GameRuntime
                     continue;
 
                 // Skip per-wheel cars — CarController manages their transforms directly
-                var carCtrl = BlueSky.Core.Gameplay.CarControllerSystem.GetController((uint)entity.Id);
+                var carCtrl = BlueSky.Airborne.CarControllerSystem.GetController((uint)entity.Id);
                 if (carCtrl?.UsePerWheelPhysics == true)
                     continue;
 
@@ -1182,1279 +1303,158 @@ public class GameRuntime
                 }
                 
                 // Update transform with interpolated values
-                ref var transform = ref chunk.GetComponent<BlueSky.Core.ECS.Builtin.TransformComponent>(i, transIdx);
-                transform.Position = new BlueSky.Core.Math.Vector3(interpPos.X, interpPos.Y, interpPos.Z);
-                transform.Rotation = new BlueSky.Core.Math.Quaternion(interpRot.X, interpRot.Y, interpRot.Z, interpRot.W);
+                ref var transform = ref chunk.GetComponent<BlueSky.SkyCore.Builtin.TransformComponent>(i, transIdx);
+                transform.Position = new BlueSky.Ramanujan.Vector3(interpPos.X, interpPos.Y, interpPos.Z);
+                transform.Rotation = new BlueSky.Ramanujan.Quaternion(interpRot.X, interpRot.Y, interpRot.Z, interpRot.W);
             }
         }
     }
     
-    void UpdateTeaScripts(double deltaTime)
+    private bool IsTeaScriptKeyDown(string keyName)
     {
-        if (_world == null) return;
-        
-        // Query all entities with TeaScriptComponent
-        var query = _world.CreateQuery()
-            .All<BlueSky.Core.ECS.Builtin.TeaScriptComponent>()
-            .Build();
-        
-        var chunks = _world.GetQueryChunks(query);
-        
-        foreach (var chunk in chunks)
-        {
-            var entities = chunk.GetEntities();
-            int scriptIdx = chunk.GetComponentIndex(typeof(BlueSky.Core.ECS.Builtin.TeaScriptComponent));
-            
-            for (int i = 0; i < chunk.Count; i++)
-            {
-                var entity = entities[i];
-                ref var script = ref chunk.GetComponent<BlueSky.Core.ECS.Builtin.TeaScriptComponent>(i, scriptIdx);
-                
-                if (!script.IsEnabled || string.IsNullOrEmpty(script.ScriptAssetId))
-                    continue;
-                
-                // Initialize script engine if needed
-                if (!script.IsInitialized)
-                {
-                    if (!_scriptEngines.ContainsKey((uint)entity.Id))
-                    {
-                        try
-                        {
-                            var engine = new TeaScript.Bridge.TeaScriptEngine();
-                            
-                            // Register engine API functions that scripts can call
-                            RegisterScriptAPI(engine, entity);
-                            
-                            // Load the script
-                            if (System.IO.File.Exists(script.ScriptAssetId))
-                            {
-                                engine.LoadScript(script.ScriptAssetId);
-                                _scriptEngines[(uint)entity.Id] = engine;
-                                
-                                // Call start()
-                                engine.CallStart();
-                                script.IsInitialized = true;
-                                
-                            }
-                            else
-                            {
-                                script.IsEnabled = false;
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            Console.Error.WriteLine($"[Runtime][TeaScript] start() failed for entity {entity.Id}: {ex.Message}");
-                            script.IsEnabled = false;
-                        }
-                    }
-                }
-                
-                // Call update() every frame
-                if (script.IsInitialized && _scriptEngines.TryGetValue((uint)entity.Id, out var scriptEngine))
-                {
-                    try
-                    {
-                        scriptEngine.CallUpdate();
-                        
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.Error.WriteLine($"[Runtime][TeaScript] update() failed for entity {entity.Id}: {ex.Message}");
-                        script.IsEnabled = false;
-                    }
-                }
-            }
-        }
-    }
-
-    void FixedUpdateTeaScripts(double fixedDeltaTime)
-    {
-        if (_world == null) return;
-        
-        // Query all entities with TeaScriptComponent
-        var query = _world.CreateQuery()
-            .All<BlueSky.Core.ECS.Builtin.TeaScriptComponent>()
-            .Build();
-        
-        var chunks = _world.GetQueryChunks(query);
-        
-        foreach (var chunk in chunks)
-        {
-            var entities = chunk.GetEntities();
-            int scriptIdx = chunk.GetComponentIndex(typeof(BlueSky.Core.ECS.Builtin.TeaScriptComponent));
-            
-            for (int i = 0; i < chunk.Count; i++)
-            {
-                var entity = entities[i];
-                ref var script = ref chunk.GetComponent<BlueSky.Core.ECS.Builtin.TeaScriptComponent>(i, scriptIdx);
-                
-                if (!script.IsEnabled || string.IsNullOrEmpty(script.ScriptAssetId))
-                    continue;
-                
-                // Call fixedUpdate() in sync with physics step
-                if (script.IsInitialized && _scriptEngines.TryGetValue((uint)entity.Id, out var scriptEngine))
-                {
-                    try
-                    {
-                        scriptEngine.CallFunction("fixedUpdate");
-                    }
-                    catch (Exception ex)
-                    {
-                        // fixedUpdate is optional; only suppress the missing-function error.
-                        if (!ex.Message.Contains("Undefined variable", StringComparison.Ordinal) &&
-                            !(ex.InnerException?.Message.Contains("Undefined variable", StringComparison.Ordinal) ?? false))
-                            Console.Error.WriteLine($"[Runtime][TeaScript] fixedUpdate() failed for entity {entity.Id}: {ex.Message}");
-                    }
-                }
-            }
-        }
-    }
-    
-    void RegisterScriptAPI(TeaScript.Bridge.TeaScriptEngine engine, Entity entity)
-    {
-        // ═══════════════════════════════════════════════════════════════════════
-        //  DEBUG / LOGGING
-        // ═══════════════════════════════════════════════════════════════════════
-        
-        engine.RegisterFunction("print", (args) =>
-        {
-            Console.WriteLine(args.Count > 0 ? args[0]?.ToString() ?? string.Empty : string.Empty);
-            return null;
-        });
-        
-        engine.RegisterFunction("log", (args) =>
-        {
-            string message = args.Count > 0 ? args[0]?.ToString() ?? "" : "";
-            Console.WriteLine($"[TeaScript] {message}");
-            return null;
-        });
-        
-        // ═══════════════════════════════════════════════════════════════════════
-        //  TRANSFORM
-        // ═══════════════════════════════════════════════════════════════════════
-        
-        // Position getters (component-wise)
-        engine.RegisterFunction("getPositionX", (args) =>
-        {
-            if (_world != null && _world.TryGetComponent<PhysicsComponent>(entity, out var _))
-            {
-                return (double)BlueSky.Airborne.PhysicsTeaScriptBridge.GetPosition(entity).X;
-            }
-            if (_world != null && _world.TryGetComponent<TransformComponent>(entity, out var transform))
-            {
-                return (double)transform.Position.X;
-            }
-            return 0.0;
-        });
-        
-        engine.RegisterFunction("getPositionY", (args) =>
-        {
-            if (_world != null && _world.TryGetComponent<PhysicsComponent>(entity, out var _))
-            {
-                return (double)BlueSky.Airborne.PhysicsTeaScriptBridge.GetPosition(entity).Y;
-            }
-            if (_world != null && _world.TryGetComponent<TransformComponent>(entity, out var transform))
-            {
-                return (double)transform.Position.Y;
-            }
-            return 0.0;
-        });
-        
-        engine.RegisterFunction("getPositionZ", (args) =>
-        {
-            if (_world != null && _world.TryGetComponent<PhysicsComponent>(entity, out var _))
-            {
-                return (double)BlueSky.Airborne.PhysicsTeaScriptBridge.GetPosition(entity).Z;
-            }
-            if (_world != null && _world.TryGetComponent<TransformComponent>(entity, out var transform))
-            {
-                return (double)transform.Position.Z;
-            }
-            return 0.0;
-        });
-        
-        engine.RegisterFunction("getPosition", (args) =>
-        {
-            if (_world != null && _world.TryGetComponent<TransformComponent>(entity, out var transform))
-            {
-                var list = new List<object?> { (double)transform.Position.X, (double)transform.Position.Y, (double)transform.Position.Z };
-                return list;
-            }
-            return new List<object?> { 0.0, 0.0, 0.0 };
-        });
-        
-        engine.RegisterFunction("setPosition", (args) =>
-        {
-            if (args.Count >= 3 && _world != null && _world.TryGetComponent<TransformComponent>(entity, out var transform))
-            {
-                transform.Position = new BlueSky.Core.Math.Vector3(
-                    Convert.ToSingle(args[0]),
-                    Convert.ToSingle(args[1]),
-                    Convert.ToSingle(args[2])
-                );
-                _world.AddComponent(entity, transform);
-            }
-            return null;
-        });
-        
-        engine.RegisterFunction("getRotation", (args) =>
-        {
-            if (_world != null && _world.TryGetComponent<TransformComponent>(entity, out var transform))
-            {
-                return new List<object?> { 
-                    (double)transform.Rotation.X, 
-                    (double)transform.Rotation.Y, 
-                    (double)transform.Rotation.Z, 
-                    (double)transform.Rotation.W 
-                };
-            }
-            return new List<object?> { 0.0, 0.0, 0.0, 1.0 };
-        });
-        
-        engine.RegisterFunction("setRotation", (args) =>
-        {
-            if (args.Count >= 4 && _world != null && _world.TryGetComponent<TransformComponent>(entity, out var transform))
-            {
-                transform.Rotation = new BlueSky.Core.Math.Quaternion(
-                    Convert.ToSingle(args[0]),
-                    Convert.ToSingle(args[1]),
-                    Convert.ToSingle(args[2]),
-                    Convert.ToSingle(args[3])
-                );
-                _world.AddComponent(entity, transform);
-            }
-            return null;
-        });
-        
-        // ═══════════════════════════════════════════════════════════════════════
-        //  PHYSICS
-        // ═══════════════════════════════════════════════════════════════════════
-        
-        // Velocity getters (component-wise)
-        engine.RegisterFunction("getVelocityX", (args) =>
-        {
-            if (_world != null && _world.HasComponent<PhysicsComponent>(entity))
-            {
-                var velocity = BlueSky.Airborne.PhysicsTeaScriptBridge.GetVelocity(entity);
-                return (double)velocity.X;
-            }
-            return 0.0;
-        });
-        
-        engine.RegisterFunction("getVelocityY", (args) =>
-        {
-            if (_world != null && _world.HasComponent<PhysicsComponent>(entity))
-            {
-                var velocity = BlueSky.Airborne.PhysicsTeaScriptBridge.GetVelocity(entity);
-                return (double)velocity.Y;
-            }
-            return 0.0;
-        });
-        
-        engine.RegisterFunction("getVelocityZ", (args) =>
-        {
-            if (_world != null && _world.HasComponent<PhysicsComponent>(entity))
-            {
-                var velocity = BlueSky.Airborne.PhysicsTeaScriptBridge.GetVelocity(entity);
-                return (double)velocity.Z;
-            }
-            return 0.0;
-        });
-        
-        engine.RegisterFunction("getVelocity", (args) =>
-        {
-            var vel = BlueSky.Airborne.PhysicsTeaScriptBridge.GetVelocity(entity);
-            return new List<object?> { (double)vel.X, (double)vel.Y, (double)vel.Z };
-        });
-        
-        engine.RegisterFunction("setVelocity", (args) =>
-        {
-            if (args.Count >= 3)
-            {
-                var vel = new System.Numerics.Vector3(
-                    Convert.ToSingle(args[0]),
-                    Convert.ToSingle(args[1]),
-                    Convert.ToSingle(args[2])
-                );
-                BlueSky.Airborne.PhysicsTeaScriptBridge.SetVelocity(entity, vel);
-            }
-            return null;
-        });
-        
-        engine.RegisterFunction("addForce", (args) =>
-        {
-            if (args.Count >= 3)
-            {
-                var force = new System.Numerics.Vector3(
-                    Convert.ToSingle(args[0]),
-                    Convert.ToSingle(args[1]),
-                    Convert.ToSingle(args[2])
-                );
-                BlueSky.Airborne.PhysicsTeaScriptBridge.AddForce(entity, force);
-            }
-            return null;
-        });
-        
-        engine.RegisterFunction("addImpulse", (args) =>
-        {
-            if (args.Count >= 3)
-            {
-                var impulse = new System.Numerics.Vector3(
-                    Convert.ToSingle(args[0]),
-                    Convert.ToSingle(args[1]),
-                    Convert.ToSingle(args[2])
-                );
-                BlueSky.Airborne.PhysicsTeaScriptBridge.AddImpulse(entity, impulse);
-            }
-            return null;
-        });
-        
-        engine.RegisterFunction("raycast", (args) =>
-        {
-            if (args.Count >= 6)
-            {
-                var origin = new System.Numerics.Vector3(
-                    Convert.ToSingle(args[0]),
-                    Convert.ToSingle(args[1]),
-                    Convert.ToSingle(args[2])
-                );
-                var direction = new System.Numerics.Vector3(
-                    Convert.ToSingle(args[3]),
-                    Convert.ToSingle(args[4]),
-                    Convert.ToSingle(args[5])
-                );
-                float maxDistance = args.Count >= 7 ? Convert.ToSingle(args[6]) : 1000.0f;
-                
-                if (BlueSky.Airborne.PhysicsTeaScriptBridge.Raycast(origin, direction, maxDistance, out var hit))
-                {
-                    return new List<object?> {
-                        true,
-                        (double)hit.Point.X, (double)hit.Point.Y, (double)hit.Point.Z,
-                        (double)hit.Normal.X, (double)hit.Normal.Y, (double)hit.Normal.Z,
-                        (double)hit.Distance
-                    };
-                }
-            }
-            return new List<object?> { false };
-        });
-        
-        // ═══════════════════════════════════════════════════════════════════════
-        //  INPUT
-        // ═══════════════════════════════════════════════════════════════════════
-        
-        engine.RegisterFunction("getKey", (args) =>
-        {
-            if (args.Count > 0 && _input != null)
-            {
-                string keyName = args[0]?.ToString() ?? "";
-                if (Enum.TryParse<KeyCode>(keyName, true, out var keyCode))
-                {
-                    return _input.IsKeyDown(keyCode);
-                }
-            }
+        if (_input == null || string.IsNullOrWhiteSpace(keyName))
             return false;
-        });
-        
-        engine.RegisterFunction("getInput", (args) =>
-        {
-            if (args.Count > 0 && _input != null)
-            {
-                string keyName = args[0]?.ToString() ?? "";
-                
-                // Map string to KeyCode
-                if (Enum.TryParse<KeyCode>(keyName, true, out var keyCode))
-                {
-                    return _input.IsKeyDown(keyCode);
-                }
-            }
-            return false;
-        });
-        
-        engine.RegisterFunction("getMouseButton", (args) =>
-        {
-            if (args.Count > 0 && _input != null)
-            {
-                string buttonName = args[0]?.ToString() ?? "";
-                
-                if (Enum.TryParse<MouseButton>(buttonName, true, out var button))
-                {
-                    return _input.IsMouseButtonDown(button);
-                }
-            }
-            return false;
-        });
-        
-        engine.RegisterFunction("getMousePosition", (args) =>
-        {
-            if (_input != null)
-            {
-                var pos = _input.MousePosition;
-                return new List<object?> { (double)pos.X, (double)pos.Y };
-            }
-            return new List<object?> { 0.0, 0.0 };
-        });
-        
-        // ═══════════════════════════════════════════════════════════════════════
-        //  TIME
-        // ═══════════════════════════════════════════════════════════════════════
-        
-        engine.RegisterFunction("getDeltaTime", (args) =>
-        {
-            return _lastFrameDeltaTime;
-        });
-        
-        engine.RegisterFunction("getTime", (args) =>
-        {
-            return _elapsedTime;
-        });
-        
-        // ═══════════════════════════════════════════════════════════════════════
-        //  RUNTIME UI (HUD)
-        // ═══════════════════════════════════════════════════════════════════════
-        
-        engine.RegisterFunction("uiText", (args) =>
-        {
-            if (args.Count >= 3)
-            {
-                string text = args[0]?.ToString() ?? "";
-                float x = Convert.ToSingle(args[1]);
-                float y = Convert.ToSingle(args[2]);
-                
-                // Optional: anchor (args[3]) and color (args[4-7])
-                BlueSky.Runtime.UI.RuntimeUIAnchor anchor = BlueSky.Runtime.UI.RuntimeUIAnchor.TopLeft;
-                if (args.Count >= 4 && args[3] != null)
-                {
-                    string anchorStr = args[3]?.ToString() ?? "TopLeft";
-                    Enum.TryParse(anchorStr, true, out anchor);
-                }
-                
-                System.Numerics.Vector4? color = null;
-                if (args.Count >= 8)
-                {
-                    color = new System.Numerics.Vector4(
-                        Convert.ToSingle(args[4]),
-                        Convert.ToSingle(args[5]),
-                        Convert.ToSingle(args[6]),
-                        Convert.ToSingle(args[7])
-                    );
-                }
-                
-                BlueSky.Runtime.UI.RuntimeUI.Label(text, x, y, anchor, color);
-                
-            }
-            return null;
-        });
 
-        engine.RegisterFunction("uiButton", (args) =>
+        string normalized = keyName.Trim().Replace(" ", "", StringComparison.Ordinal).Replace("_", "", StringComparison.Ordinal);
+        normalized = normalized.ToLowerInvariant() switch
         {
-            if (args.Count >= 5)
-            {
-                string text = args[0]?.ToString() ?? "";
-                float x = Convert.ToSingle(args[1]);
-                float y = Convert.ToSingle(args[2]);
-                float w = Convert.ToSingle(args[3]);
-                float h = Convert.ToSingle(args[4]);
-                
-                BlueSky.Runtime.UI.RuntimeUIAnchor anchor = BlueSky.Runtime.UI.RuntimeUIAnchor.TopLeft;
-                if (args.Count >= 6 && args[5] != null)
-                {
-                    string anchorStr = args[5]?.ToString() ?? "TopLeft";
-                    Enum.TryParse(anchorStr, true, out anchor);
-                }
-                
-                uint id = 0;
-                if (args.Count >= 7 && args[6] != null)
-                {
-                    id = Convert.ToUInt32(args[6]);
-                }
-                
-                uint buttonId = id;
-                if (buttonId == 0 && !string.IsNullOrEmpty(text))
-                {
-                    buttonId = 5381;
-                    foreach (char c in text)
-                    {
-                        buttonId = ((buttonId << 5) + buttonId) + c;
-                    }
-                }
-                
-                BlueSky.Runtime.UI.RuntimeUI.Button(text, x, y, w, h, anchor, buttonId);
-                bool clicked = BlueSky.Runtime.UI.RuntimeUI.IsButtonClicked(buttonId);
-                return clicked;
-            }
-            return false;
-        });
-
-        engine.RegisterFunction("loadScene", (args) =>
-        {
-            if (args.Count >= 1)
-            {
-                _pendingScenePath = args[0]?.ToString() ?? "";
-                _pendingMultiplayerMode = MultiplayerMode.Offline;
-                _pendingSessionName = "";
-                _pendingJoinSessionId = "";
-
-                if (args.Count >= 2 && args[1] != null)
-                {
-                    string modeStr = args[1]?.ToString() ?? "offline";
-                    Enum.TryParse(modeStr, true, out _pendingMultiplayerMode);
-                }
-
-                if (args.Count >= 3 && args[2] != null)
-                {
-                    _pendingSessionName = args[2]?.ToString() ?? "";
-                }
-
-                if (args.Count >= 4 && args[3] != null)
-                {
-                    _pendingJoinSessionId = args[3]?.ToString() ?? "";
-                }
-
-                _pendingSceneTransition = true;
-            }
-            return null;
-        });
-
-        engine.RegisterFunction("setSpectatorMode", (args) =>
-        {
-            if (args.Count >= 1)
-            {
-                bool enabled = Convert.ToBoolean(args[0]);
-            }
-            return null;
-        });
-
-        engine.RegisterFunction("login", (args) =>
-        {
-            string playerName = args.Count > 0 ? args[0]?.ToString() ?? "Player" : "Player";
-            _authStatus = "LoggingIn";
-            
-            if (_multiplayer != null)
-            {
-                _multiplayer.Login(playerName, (success, message) =>
-                {
-                    if (success)
-                    {
-                        string displayName = _multiplayer.Config?.LocalPlayerName ?? playerName;
-                        _authStatus = $"LoggedIn ({displayName})";
-                    }
-                    else
-                    {
-                        _authStatus = "Failed: " + message;
-                    }
-                });
-            }
-            else
-            {
-                _authStatus = "Failed: Multiplayer not initialized";
-            }
-            return null;
-        });
-
-        engine.RegisterFunction("isLoggedIn", (args) =>
-        {
-            return _multiplayer?.IsLoggedIn ?? false;
-        });
-
-        engine.RegisterFunction("getAuthStatus", (args) =>
-        {
-            if (_multiplayer != null && _multiplayer.IsLoggedIn)
-            {
-                string displayName = "";
-                if (_multiplayer is EosMultiplayerService eosService)
-                {
-                    displayName = eosService.EosDisplayName;
-                }
-                if (string.IsNullOrEmpty(displayName))
-                {
-                    displayName = _multiplayer.Config?.LocalPlayerName ?? "Player";
-                }
-                _authStatus = $"LoggedIn ({displayName})";
-            }
-            return _authStatus;
-        });
-
-        engine.RegisterFunction("getDisplayName", (args) =>
-        {
-            // Try to get the real display name from the EOS manager
-            if (_multiplayer is EosMultiplayerService eosService)
-            {
-                string displayName = eosService.EosDisplayName;
-                if (!string.IsNullOrEmpty(displayName))
-                {
-                    return displayName;
-                }
-            }
-            // Fallback to config player name
-            return _multiplayer?.Config?.LocalPlayerName ?? "";
-        });
-
-        // ── Session Management (Host / Search / Join) ────────────────────────
-        // These delegate to NetworkingTeaScriptBridge.Session for local registry.
-        engine.RegisterFunction("host", (args) =>
-        {
-            if (args.Count < 3)
-            {
-                return false;
-            }
-            string sessionNameArg = args[0]?.ToString() ?? "Session";
-            string scenePathArg = args[1]?.ToString() ?? "";
-            int maxPlayers = Convert.ToInt32(args[2]);
-            _pendingSessionName = sessionNameArg;
-            _pendingScenePath = scenePathArg;
-            BlueSky.Networking.NetworkingTeaScriptBridge.Host(sessionNameArg, scenePathArg, maxPlayers, (result, msg) =>
-            {
-            });
-            return true;
-        });
-
-        engine.RegisterFunction("search", (args) =>
-        {
-            // Synchronous search: directly query the SessionManager's local registry
-            var session = BlueSky.Networking.NetworkingTeaScriptBridge.Session;
-            if (session == null)
-            {
-                return true;
-            }
-            // If we're hosting, register our own session so we can see it
-            session.Search();
-            return true;
-        });
-
-        engine.RegisterFunction("join", (args) =>
-        {
-            if (args.Count < 1)
-            {
-                return false;
-            }
-            int index = Convert.ToInt32(args[0]);
-            bool success = BlueSky.Networking.NetworkingTeaScriptBridge.Join(index);
-            return success;
-        });
-
-        engine.RegisterFunction("getSessionCount", (args) =>
-        {
-            return BlueSky.Networking.NetworkingTeaScriptBridge.GetSessionCount();
-        });
-
-        engine.RegisterFunction("getSessionName", (args) =>
-        {
-            int index = args.Count > 0 ? Convert.ToInt32(args[0]) : 0;
-            return BlueSky.Networking.NetworkingTeaScriptBridge.GetSessionName(index);
-        });
-
-        engine.RegisterFunction("getSessionHost", (args) =>
-        {
-            int index = args.Count > 0 ? Convert.ToInt32(args[0]) : 0;
-            return BlueSky.Networking.NetworkingTeaScriptBridge.GetSessionHost(index);
-        });
-
-        engine.RegisterFunction("getSessionPlayerCount", (args) =>
-        {
-            int index = args.Count > 0 ? Convert.ToInt32(args[0]) : 0;
-            return BlueSky.Networking.NetworkingTeaScriptBridge.GetSessionPlayerCount(index);
-        });
-
-        engine.RegisterFunction("getSessionMaxPlayers", (args) =>
-        {
-            int index = args.Count > 0 ? Convert.ToInt32(args[0]) : 0;
-            return BlueSky.Networking.NetworkingTeaScriptBridge.GetSessionMaxPlayers(index);
-        });
-
-        engine.RegisterFunction("getSessionId", (args) =>
-        {
-            int index = args.Count > 0 ? Convert.ToInt32(args[0]) : 0;
-            return BlueSky.Networking.NetworkingTeaScriptBridge.Session?.GetSessionId(index) ?? "";
-        });
-
-        // ── Lobby Management ──────────────────────────────────────────────────
-        engine.RegisterFunction("hostLobby", (args) =>
-        {
-            if (args.Count < 3)
-            {
-                return false;
-            }
-            string lobbyNameArg = args[0]?.ToString() ?? "Lobby";
-            string scenePathArg = args[1]?.ToString() ?? "";
-            int maxPlayers = Convert.ToInt32(args[2]);
-            string hostNameArg = "Host";
-            if (_multiplayer is EosMultiplayerService eosService && !string.IsNullOrEmpty(eosService.EosDisplayName))
-            {
-                hostNameArg = eosService.EosDisplayName;
-            }
-            else if (_multiplayer?.Config?.LocalPlayerName != null)
-            {
-                hostNameArg = _multiplayer.Config.LocalPlayerName;
-            }
-
-            // Refresh the session's HostUserId with the current P2P ID
-            // (may have changed since Host() was called if login completed after hosting)
-            var session = BlueSky.Networking.NetworkingTeaScriptBridge.Session;
-            string hostP2PId = _multiplayer?.LocalP2PId ?? BlueSky.Networking.NetworkingTeaScriptBridge.Session?.HostedSession?.HostUserId ?? "";
-
-            _pendingSessionName = lobbyNameArg;
-            _pendingScenePath = scenePathArg;
-            _pendingMultiplayerMode = BlueSky.Networking.MultiplayerMode.Host;
-            bool ok = BlueSky.Networking.NetworkingTeaScriptBridge.HostLobby(lobbyNameArg, scenePathArg, maxPlayers, hostNameArg, hostP2PId);
-            
-            // Store the local player's lobby key so we can match replicated entities later
-            _localPlayerKey = !string.IsNullOrEmpty(hostP2PId) ? hostP2PId : hostNameArg;
-            
-            return ok;
-        });
-
-        engine.RegisterFunction("joinLobby", (args) =>
-        {
-            if (args.Count < 3)
-            {
-                return false;
-            }
-            string lobbyNameArg = args[0]?.ToString() ?? "";
-            string scenePathArg = args[1]?.ToString() ?? "";
-            string playerNameArg = args[2]?.ToString() ?? "Player";
-
-            // Ensure we search for sessions first so JoinLobby can find the host
-            BlueSky.Networking.NetworkingTeaScriptBridge.Session?.Search();
-
-            _pendingScenePath = scenePathArg;
-            _pendingMultiplayerMode = BlueSky.Networking.MultiplayerMode.Join;
-            _pendingJoinSessionId = "";
-            bool ok = BlueSky.Networking.NetworkingTeaScriptBridge.JoinLobby(lobbyNameArg, scenePathArg, playerNameArg, playerNameArg);
-            
-            // Set local player key to OUR P2P ID — this is what the host will use
-            // as the key in GetStablePlayerKey(player) when spawning our entity.
-            _localPlayerKey = _multiplayer?.LocalP2PId ?? playerNameArg;
-            
-            return ok;
-        });
-
-        engine.RegisterFunction("leaveLobby", (args) =>
-        {
-            BlueSky.Networking.NetworkingTeaScriptBridge.LeaveLobby();
-            return null;
-        });
-
-        engine.RegisterFunction("startCountdown", (args) =>
-        {
-            float seconds = args.Count > 0 ? Convert.ToSingle(args[0]) : 10f;
-            BlueSky.Networking.NetworkingTeaScriptBridge.StartCountdown(seconds);
-            return null;
-        });
-
-        engine.RegisterFunction("getLobbyPlayerCount", (args) =>
-        {
-            return BlueSky.Networking.NetworkingTeaScriptBridge.GetLobbyPlayerCount();
-        });
-
-        engine.RegisterFunction("getLobbyPlayerName", (args) =>
-        {
-            int index = args.Count > 0 ? Convert.ToInt32(args[0]) : 0;
-            return BlueSky.Networking.NetworkingTeaScriptBridge.GetLobbyPlayerName(index);
-        });
-
-        engine.RegisterFunction("getLobbyCountdown", (args) =>
-        {
-            return (double)BlueSky.Networking.NetworkingTeaScriptBridge.GetLobbyCountdown();
-        });
-
-        engine.RegisterFunction("getLobbyCountdownProgress", (args) =>
-        {
-            return (double)BlueSky.Networking.NetworkingTeaScriptBridge.GetLobbyCountdownProgress();
-        });
-
-        engine.RegisterFunction("isInLobby", (args) =>
-        {
-            return BlueSky.Networking.NetworkingTeaScriptBridge.IsInLobby();
-        });
-
-        engine.RegisterFunction("isLobbyHost", (args) =>
-        {
-            return BlueSky.Networking.NetworkingTeaScriptBridge.IsLobbyHost();
-        });
-
-        engine.RegisterFunction("uiPanel", (args) =>
-        {
-            if (args.Count >= 4)
-            {
-                float x = Convert.ToSingle(args[0]);
-                float y = Convert.ToSingle(args[1]);
-                float width = Convert.ToSingle(args[2]);
-                float height = Convert.ToSingle(args[3]);
-                
-                // Optional: anchor (args[4]) and color (args[5-8])
-                BlueSky.Runtime.UI.RuntimeUIAnchor anchor = BlueSky.Runtime.UI.RuntimeUIAnchor.TopLeft;
-                if (args.Count >= 5 && args[4] != null)
-                {
-                    string anchorStr = args[4]?.ToString() ?? "TopLeft";
-                    Enum.TryParse(anchorStr, true, out anchor);
-                }
-                
-                System.Numerics.Vector4? color = null;
-                if (args.Count >= 9)
-                {
-                    color = new System.Numerics.Vector4(
-                        Convert.ToSingle(args[5]),
-                        Convert.ToSingle(args[6]),
-                        Convert.ToSingle(args[7]),
-                        Convert.ToSingle(args[8])
-                    );
-                }
-                
-                BlueSky.Runtime.UI.RuntimeUI.Panel(x, y, width, height, anchor, color);
-            }
-            return null;
-        });
-        
-        engine.RegisterFunction("uiProgressBar", (args) =>
-        {
-            if (args.Count >= 5)
-            {
-                float x = Convert.ToSingle(args[0]);
-                float y = Convert.ToSingle(args[1]);
-                float width = Convert.ToSingle(args[2]);
-                float height = Convert.ToSingle(args[3]);
-                float value = Convert.ToSingle(args[4]);
-                
-                // Optional: anchor (args[5])
-                BlueSky.Runtime.UI.RuntimeUIAnchor anchor = BlueSky.Runtime.UI.RuntimeUIAnchor.TopLeft;
-                if (args.Count >= 6 && args[5] != null)
-                {
-                    string anchorStr = args[5]?.ToString() ?? "TopLeft";
-                    Enum.TryParse(anchorStr, true, out anchor);
-                }
-                
-                BlueSky.Runtime.UI.RuntimeUI.ProgressBar(x, y, width, height, value, anchor);
-            }
-            return null;
-        });
-        
-        // ═══════════════════════════════════════════════════════════════════════
-        //  MATH FUNCTIONS
-        // ═══════════════════════════════════════════════════════════════════════
-        
-        engine.RegisterFunction("sin", (args) =>
-        {
-            if (args.Count >= 1)
-            {
-                double value = Convert.ToDouble(args[0]);
-                return System.Math.Sin(value);
-            }
-            return 0.0;
-        });
-        
-        engine.RegisterFunction("cos", (args) =>
-        {
-            if (args.Count >= 1)
-            {
-                double value = Convert.ToDouble(args[0]);
-                return System.Math.Cos(value);
-            }
-            return 0.0;
-        });
-        
-        engine.RegisterFunction("sqrt", (args) =>
-        {
-            if (args.Count >= 1)
-            {
-                double value = Convert.ToDouble(args[0]);
-                return System.Math.Sqrt(value);
-            }
-            return 0.0;
-        });
-        
-        engine.RegisterFunction("abs", (args) =>
-        {
-            if (args.Count >= 1)
-            {
-                double value = Convert.ToDouble(args[0]);
-                return System.Math.Abs(value);
-            }
-            return 0.0;
-        });
-
-        engine.RegisterFunction("ceil", (args) =>
-        {
-            if (args.Count >= 1)
-            {
-                double value = Convert.ToDouble(args[0]);
-                return System.Math.Ceiling(value);
-            }
-            return 0.0;
-        });
-
-        engine.RegisterFunction("floor", (args) =>
-        {
-            if (args.Count >= 1)
-            {
-                double value = Convert.ToDouble(args[0]);
-                return System.Math.Floor(value);
-            }
-            return 0.0;
-        });
-        
-        engine.RegisterFunction("min", (args) =>
-        {
-            if (args.Count >= 2)
-            {
-                double a = Convert.ToDouble(args[0]);
-                double b = Convert.ToDouble(args[1]);
-                return System.Math.Min(a, b);
-            }
-            return 0.0;
-        });
-        
-        engine.RegisterFunction("max", (args) =>
-        {
-            if (args.Count >= 2)
-            {
-                double a = Convert.ToDouble(args[0]);
-                double b = Convert.ToDouble(args[1]);
-                return System.Math.Max(a, b);
-            }
-            return 0.0;
-        });
-        
-        // ═══════════════════════════════════════════════════════════════════════
-        //  RIGIDBODY PROPERTY SETTERS
-        // ═══════════════════════════════════════════════════════════════════════
-        
-        engine.RegisterFunction("getMass", (args) =>
-        {
-            if (_world != null && _world.TryGetComponent<PhysicsComponent>(entity, out var phys))
-            {
-                return (double)phys.Mass;
-            }
-            return 1.0;
-        });
-        
-        engine.RegisterFunction("setMass", (args) =>
-        {
-            if (args.Count >= 1 && _world != null && _world.HasComponent<PhysicsComponent>(entity))
-            {
-                ref var phys = ref _world.GetComponent<PhysicsComponent>(entity);
-                phys.Mass = Convert.ToSingle(args[0]);
-                BlueSky.Airborne.PhysicsTeaScriptBridge.SetMass(entity, phys.Mass);
-            }
-            return null;
-        });
-        
-        engine.RegisterFunction("setGravity", (args) =>
-        {
-            if (args.Count >= 1 && _world != null && _world.HasComponent<PhysicsComponent>(entity))
-            {
-                ref var phys = ref _world.GetComponent<PhysicsComponent>(entity);
-                phys.UseGravity = Convert.ToBoolean(args[0]);
-                BlueSky.Airborne.PhysicsTeaScriptBridge.SetUseGravity(entity, phys.UseGravity);
-            }
-            return null;
-        });
-        
-        engine.RegisterFunction("setKinematic", (args) =>
-        {
-            if (args.Count >= 1 && _world != null && _world.HasComponent<PhysicsComponent>(entity))
-            {
-                ref var phys = ref _world.GetComponent<PhysicsComponent>(entity);
-                phys.IsKinematic = Convert.ToBoolean(args[0]);
-                BlueSky.Airborne.PhysicsTeaScriptBridge.SetKinematic(entity, phys.IsKinematic);
-            }
-            return null;
-        });
-        
-        engine.RegisterFunction("rotate", (args) =>
-        {
-            if (args.Count >= 3 && _world != null && _world.HasComponent<TransformComponent>(entity))
-            {
-                ref var transform = ref _world.GetComponent<TransformComponent>(entity);
-                float x = Convert.ToSingle(args[0]);
-                float y = Convert.ToSingle(args[1]);
-                float z = Convert.ToSingle(args[2]);
-                
-                // Simple euler angle rotation (degrees)
-                transform.Rotation = BlueSky.Core.Math.Quaternion.Euler(x, y, z);
-                BlueSky.Airborne.PhysicsTeaScriptBridge.SetRotation(entity, new System.Numerics.Quaternion(
-                    transform.Rotation.X,
-                    transform.Rotation.Y,
-                    transform.Rotation.Z,
-                    transform.Rotation.W));
-            }
-            return null;
-        });
-        
-        // ═══════════════════════════════════════════════════════════════════════
-        //  VEHICLE PHYSICS API (Car Controller)
-        // ═══════════════════════════════════════════════════════════════════════
-        
-        Func<int, BlueSky.Core.Gameplay.CarController?> getController = (entityId) =>
-            BlueSky.Core.Gameplay.CarControllerSystem.GetController((uint)entityId);
-
-        Func<int, int, BlueSky.Core.Gameplay.WheelState?> getWheel = (entityId, wheelIndex) =>
-        {
-            var ctrl = getController(entityId);
-            return ctrl?.GetWheelState(wheelIndex);
+            "leftshift" or "shift" => nameof(KeyCode.LeftShift),
+            "rightshift" => nameof(KeyCode.RightShift),
+            "ctrl" or "control" or "leftcontrol" => nameof(KeyCode.LeftControl),
+            "rightcontrol" => nameof(KeyCode.RightControl),
+            "alt" or "leftalt" => nameof(KeyCode.LeftAlt),
+            "rightalt" => nameof(KeyCode.RightAlt),
+            "cmd" or "super" or "windows" or "leftsuper" => nameof(KeyCode.LeftSuper),
+            "rightsuper" => nameof(KeyCode.RightSuper),
+            "spacebar" => nameof(KeyCode.Space),
+            "return" => nameof(KeyCode.Enter),
+            "esc" => nameof(KeyCode.Escape),
+            "uparrow" => nameof(KeyCode.Up),
+            "downarrow" => nameof(KeyCode.Down),
+            "leftarrow" => nameof(KeyCode.Left),
+            "rightarrow" => nameof(KeyCode.Right),
+            "0" => nameof(KeyCode.D0),
+            "1" => nameof(KeyCode.D1),
+            "2" => nameof(KeyCode.D2),
+            "3" => nameof(KeyCode.D3),
+            "4" => nameof(KeyCode.D4),
+            "5" => nameof(KeyCode.D5),
+            "6" => nameof(KeyCode.D6),
+            "7" => nameof(KeyCode.D7),
+            "8" => nameof(KeyCode.D8),
+            "9" => nameof(KeyCode.D9),
+            _ => normalized.Length == 1 && char.IsLetter(normalized[0])
+                ? normalized.ToUpperInvariant()
+                : keyName.Trim()
         };
 
-        engine.RegisterFunction("getWheelGrounded", (args) =>
-        {
-            if (args.Count >= 1)
-            {
-                int wheelIndex = Convert.ToInt32(args[0]);
-                var w = getWheel(entity.Id, wheelIndex);
-                return w?.IsGrounded ?? false;
-            }
-            return false;
-        });
-
-        engine.RegisterFunction("getWheelSuspension", (args) =>
-        {
-            if (args.Count >= 1)
-            {
-                int wheelIndex = Convert.ToInt32(args[0]);
-                var w = getWheel(entity.Id, wheelIndex);
-                return (double)(w?.SuspensionCompression ?? 0.0);
-            }
-            return 0.0;
-        });
-
-        engine.RegisterFunction("getWheelSlip", (args) =>
-        {
-            if (args.Count >= 2)
-            {
-                int wheelIndex = Convert.ToInt32(args[0]);
-                bool isLongitudinal = Convert.ToBoolean(args[1]);
-                var w = getWheel(entity.Id, wheelIndex);
-                if (w == null) return 0.0;
-                return isLongitudinal ? (double)w.SlipRatio : (double)w.SlipAngle;
-            }
-            return 0.0;
-        });
-
-        engine.RegisterFunction("getWheelSteerAngle", (args) =>
-        {
-            if (args.Count >= 1)
-            {
-                int wheelIndex = Convert.ToInt32(args[0]);
-                var w = getWheel(entity.Id, wheelIndex);
-                return (double)(w?.SteerAngle ?? 0.0);
-            }
-            return 0.0;
-        });
-
-        engine.RegisterFunction("getWheelAngularVelocity", (args) =>
-        {
-            if (args.Count >= 1)
-            {
-                int wheelIndex = Convert.ToInt32(args[0]);
-                var w = getWheel(entity.Id, wheelIndex);
-                return (double)(w?.AngularVelocity ?? 0.0);
-            }
-            return 0.0;
-        });
-
-        engine.RegisterFunction("getWheelContactNormalX", (args) =>
-        {
-            if (args.Count >= 1)
-            {
-                int wheelIndex = Convert.ToInt32(args[0]);
-                var w = getWheel(entity.Id, wheelIndex);
-                return (double)(w?.ContactNormal.X ?? 0.0);
-            }
-            return 0.0;
-        });
-
-        engine.RegisterFunction("getWheelContactNormalY", (args) =>
-        {
-            if (args.Count >= 1)
-            {
-                int wheelIndex = Convert.ToInt32(args[0]);
-                var w = getWheel(entity.Id, wheelIndex);
-                return (double)(w?.ContactNormal.Y ?? 0.0);
-            }
-            return 0.0;
-        });
-
-        engine.RegisterFunction("getWheelContactNormalZ", (args) =>
-        {
-            if (args.Count >= 1)
-            {
-                int wheelIndex = Convert.ToInt32(args[0]);
-                var w = getWheel(entity.Id, wheelIndex);
-                return (double)(w?.ContactNormal.Z ?? 0.0);
-            }
-            return 0.0;
-        });
-
-        // ═══════════════════════════════════════════════════════════════════════
-        //  BONE MAPPING API (for skeletal mesh vehicle configuration)
-        // ═══════════════════════════════════════════════════════════════════════
-
-        engine.RegisterFunction("setWheelBone", (args) =>
-        {
-            if (args.Count >= 2)
-            {
-                int slot = Convert.ToInt32(args[0]);
-                string boneName = args[1]?.ToString() ?? "";
-                uint eid = (uint)entity.Id;
-                BlueSky.Core.Gameplay.CarController.SetBoneOverride(eid, slot, boneName);
-            }
-            return null;
-        });
-
-        engine.RegisterFunction("setBodyBone", (args) =>
-        {
-            if (args.Count >= 1)
-            {
-                string boneName = args[0]?.ToString() ?? "";
-                uint eid = (uint)entity.Id;
-                BlueSky.Core.Gameplay.CarController.SetBodyBoneOverride(eid, boneName);
-            }
-            return null;
-        });
-
-        engine.RegisterFunction("refreshBones", (args) =>
-        {
-            var ctrl = getController(entity.Id);
-            if (ctrl != null)
-            {
-                ctrl.RefreshBoneMapping();
-            }
-            return null;
-        });
-
-        engine.RegisterFunction("debugWheelAnimation", (args) =>
-        {
-            var ctrl = getController(entity.Id);
-            if (ctrl == null)
-            {
-                return null;
-            }
-
-            string report = $"SkeletalMesh: {ctrl.SkeletalMesh != null}; " +
-                $"Bones: {ctrl.SkeletalMesh?.Bones?.Length ?? 0}";
-            Console.WriteLine($"[TeaScript:{entity.Id}] {report}");
-            return report;
-        });
-
-        engine.RegisterFunction("setWheelPosition", (args) =>
-        {
-            if (args.Count >= 4)
-            {
-                var ctrl = getController(entity.Id);
-                if (ctrl != null)
-                {
-                    int slot = Convert.ToInt32(args[0]);
-                    float x = Convert.ToSingle(args[1]);
-                    float y = Convert.ToSingle(args[2]);
-                    float z = Convert.ToSingle(args[3]);
-                    ctrl.SetWheelLocalPosition(slot, x, y, z);
-                }
-            }
-            return null;
-        });
-
-        engine.RegisterFunction("setDriveWheels", (args) =>
-        {
-            if (args.Count >= 4)
-            {
-                var ctrl = getController(entity.Id);
-                if (ctrl != null)
-                {
-                    ctrl.SetDriveWheels(
-                        Convert.ToBoolean(args[0]),
-                        Convert.ToBoolean(args[1]),
-                        Convert.ToBoolean(args[2]),
-                        Convert.ToBoolean(args[3]));
-                }
-            }
-            return null;
-        });
-
-        engine.RegisterFunction("setSteerWheels", (args) =>
-        {
-            if (args.Count >= 4)
-            {
-                var ctrl = getController(entity.Id);
-                if (ctrl != null)
-                {
-                    ctrl.SetSteerWheels(
-                        Convert.ToBoolean(args[0]),
-                        Convert.ToBoolean(args[1]),
-                        Convert.ToBoolean(args[2]),
-                        Convert.ToBoolean(args[3]));
-                }
-            }
-            return null;
-        });
-        
+        return Enum.TryParse<KeyCode>(normalized, ignoreCase: true, out var key)
+            && _input.IsKeyDown(key);
     }
+
+    private bool IsTeaScriptMouseButtonDown(int button)
+    {
+        if (_input == null || button < 0 || button > (int)MouseButton.X2)
+            return false;
+
+        return _input.IsMouseButtonDown((MouseButton)button);
+    }
+
     
     private ulong _frameCount = 0;
     private double _lastFrameDeltaTime = 0.016;
     private double _elapsedTime;
     
+    [System.Runtime.InteropServices.DllImport("/usr/lib/libobjc.A.dylib")]
+    private static extern IntPtr objc_autoreleasePoolPush();
+
+    [System.Runtime.InteropServices.DllImport("/usr/lib/libobjc.A.dylib")]
+    private static extern void objc_autoreleasePoolPop(IntPtr pool);
+
     void Render()
     {
-        if (_swapchain == null || _rhi == null || _depthTexture == null)
+        if (_swapchain == null || _rhi == null)
             return;
-        
-        // Acquire next image from swapchain
-        _swapchain.AcquireNextImage();
-        
-        // Get command buffer
-        var cmd = _rhi.CreateCommandBuffer();
-        
-        // Set up camera matrices
-        var view = System.Numerics.Matrix4x4.CreateLookAt(_cameraPos, _cameraTarget, System.Numerics.Vector3.UnitY);
-        var proj = System.Numerics.Matrix4x4.CreatePerspectiveFieldOfView(
-            60.0f * MathF.PI / 180.0f,  // FOV
-            (float)_config.WindowWidth / _config.WindowHeight,  // Aspect
-            0.1f,  // Near
-            1000.0f  // Far
-        );
-        
-        
-        
-        // Begin render pass with clear
-        var clearColor = ClearValue.FromColor(0.39f, 0.58f, 0.93f, 1.0f);
-        cmd.BeginRenderPass(new[] { _swapchain.CurrentRenderTarget }, _depthTexture, clearColor);
-        
-        // Render scene using ViewportRenderer if available
-        if (_viewportRenderer != null && _world != null)
+
+        if (!EnsureRenderTargetSizes(out uint pixelW, out uint pixelH) || _depthTexture == null)
+            return;
+
+        IntPtr autoreleasePool = OperatingSystem.IsMacOS() ? objc_autoreleasePoolPush() : IntPtr.Zero;
+        try
         {
-            _viewportRenderer.Render(
-                cmd,
-                view,
-                proj,
-                _cameraPos,
-                viewportX: 0,
-                viewportY: 0,
-                viewportW: _config.WindowWidth,
-                viewportH: _config.WindowHeight,
-                deltaTime: 0.016f
+            // Acquire next image from swapchain
+            _swapchain.AcquireNextImage();
+            
+            // Get command buffer
+            using var cmd = _rhi.CreateCommandBuffer();
+            
+            // Set up camera matrices
+            var view = System.Numerics.Matrix4x4.CreateLookAt(_cameraPos, _cameraTarget, System.Numerics.Vector3.UnitY);
+            var proj = System.Numerics.Matrix4x4.CreatePerspectiveFieldOfView(
+                60.0f * MathF.PI / 180.0f,  // FOV
+                (float)pixelW / pixelH,  // Aspect
+                0.1f,  // Near
+                1000.0f  // Far
             );
+
+            // Render shadow map pass BEFORE main render pass so standalone runtime has live shadows
+            if (_viewportRenderer != null && _world != null)
+            {
+                _viewportRenderer.PreRender(cmd, BlueSky.Meridian.GlobalEnvironment.SunDirection, _cameraPos);
+            }
+
+            // Begin render pass with clear
+            var clearColor = ClearValue.FromColor(0.39f, 0.58f, 0.93f, 1.0f);
+            cmd.BeginRenderPass(new[] { _swapchain.CurrentRenderTarget }, _depthTexture, clearColor);
+            
+            // Render scene using ViewportRenderer if available
+            if (_viewportRenderer != null && _world != null)
+            {
+                _viewportRenderer.Render(
+                    cmd,
+                    view,
+                    proj,
+                    _cameraPos,
+                    viewportX: 0,
+                    viewportY: 0,
+                    viewportW: (int)pixelW,
+                    viewportH: (int)pixelH,
+                    deltaTime: (float)Math.Max(0.0001, _lastFrameDeltaTime)
+                );
+            }
+            // Render UI overlay (HUD from TeaScript) BEFORE ending render pass
+            if (_ui != null && _uiRenderer != null && _input != null)
+            {
+                var mousePos = _input.MousePosition;
+                bool mouseDown = _input.IsMouseButtonDown(MouseButton.Left);
+                
+                _ui.BeginFrame(mousePos, mouseDown, "", false, _input.ScrollDelta.Y);
+                BlueSky.Runtime.UI.RuntimeUI.Render(_ui, _uiLogicalW, _uiLogicalH, (float)_lastFrameDeltaTime);
+                _uiRenderer.Render(cmd, _ui);
+            }
+            
+            cmd.EndRenderPass();
+            
+            // Submit and present (CRITICAL: must pass swapchain for presentation!)
+            _rhi.Submit(cmd, _swapchain);
+            _swapchain.Present();
         }
-        // Render UI overlay (HUD from TeaScript) BEFORE ending render pass
-        if (_ui != null && _uiRenderer != null && _input != null)
+        finally
         {
-            var mousePos = _input.MousePosition;
-            bool mouseDown = _input.IsMouseButtonDown(Platform.Input.MouseButton.Left);
-            
-            
-            _ui.BeginFrame(mousePos, mouseDown, "", false, _input.ScrollDelta.Y);
-            BlueSky.Runtime.UI.RuntimeUI.Render(_ui, _config.WindowWidth, _config.WindowHeight, (float)_lastFrameDeltaTime);
-            _uiRenderer.Render(cmd, _ui);
+            if (autoreleasePool != IntPtr.Zero)
+                objc_autoreleasePoolPop(autoreleasePool);
         }
-        
-        cmd.EndRenderPass();
-        
-        // Submit and present (CRITICAL: must pass swapchain for presentation!)
-        _rhi.Submit(cmd, _swapchain);
-        _swapchain.Present();
     }
     
     void Shutdown()
     {
         
         // Cleanup in reverse order
+        _echoSystem?.Dispose();
+        _echoSystem = null;
+        BlueSky.Echo.EchoTeaScriptBridge.Active = null;
+        _echo?.Dispose();
+        _echo = null;
         _uiRenderer?.Dispose();
         _carControllerSystem?.Cleanup();
         _viewportRenderer?.Dispose();
@@ -2508,7 +1508,7 @@ public class GameRuntime
             for (int i = 0; i < chunk.Count; i++)
             {
                 var nm = chunk.GetComponent<NetworkManagerComponent>(i, nmIdx);
-                string path = BlueSky.Core.ECS.Builtin.NetworkManagerStorage.GetPrefabPath(nm.StorageIndex);
+                string path = BlueSky.SkyCore.Builtin.NetworkManagerStorage.GetPrefabPath(nm.StorageIndex);
                 if (!string.IsNullOrEmpty(path))
                 {
                     return path;
@@ -2521,7 +1521,7 @@ public class GameRuntime
 
     void ReloadSceneAndMultiplayer(string scenePath, MultiplayerMode mpMode, string sessionName, string joinSessionId)
     {
-        var travelPlayers = BlueSky.Networking.NetworkingTeaScriptBridge.Lobby?.Players.ToList() ?? new System.Collections.Generic.List<LobbyPlayer>();
+        var travelPlayers = BlueSky.LHO.NetworkingTeaScriptBridge.Lobby?.Players.ToList() ?? new System.Collections.Generic.List<LobbyPlayer>();
 
         // 1. Shutdown car system + reset replication (keep multiplayer service alive)
         _carControllerSystem?.Cleanup();
@@ -2536,11 +1536,13 @@ public class GameRuntime
             _physicsWorld = null;
         }
 
-        _scriptEngines.Clear();
+        _teaScriptSystem?.Cleanup();
+        _teaScriptSystem = null;
 
         // Dispose old world + recreate
         _world?.Dispose();
         _world = new World();
+        _world.AddSystem(new BlueSky.SkyCore.HierarchySystem());
         _replication?.SetWorld(_world);
         _terrainSystem = new TerrainSystem(_world);
 
@@ -2548,7 +1550,7 @@ public class GameRuntime
         _viewportRenderer?.Dispose();
         _viewportRenderer = null;
         if (_swapchain != null && _rhi != null)
-            _viewportRenderer = new ViewportRenderer(_rhi, _world, terrainSystem: _terrainSystem, _swapchain.Format, showEditorGizmos: false);
+            _viewportRenderer = new ViewportRenderer(_rhi, _world, terrainSystem: _terrainSystem, _swapchain.Format, showEditorGizmos: false, vectraSystem: _vectraSystem);
 
         InitializePhysics();
 
@@ -2576,7 +1578,7 @@ public class GameRuntime
 
         // Re-join lobby players after scene reload
         foreach (var player in travelPlayers)
-            BlueSky.Networking.NetworkingTeaScriptBridge.AddLobbyPlayer(player.UserId, player.DisplayName);
+            BlueSky.LHO.NetworkingTeaScriptBridge.AddLobbyPlayer(player.UserId, player.DisplayName);
 
         // Reset camera/possession state
         _cameraFollowTarget = default;
@@ -2602,7 +1604,7 @@ public class GameRuntime
             string prefabPath = FindNetworkManagerPrefabPath();
             if (!string.IsNullOrEmpty(prefabPath))
             {
-                var currentPlayers = BlueSky.Networking.NetworkingTeaScriptBridge.Lobby?.Players;
+                var currentPlayers = BlueSky.LHO.NetworkingTeaScriptBridge.Lobby?.Players;
                 if (currentPlayers != null)
                 {
                     var sortedPlayers = currentPlayers

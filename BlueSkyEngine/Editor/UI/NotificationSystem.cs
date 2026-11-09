@@ -1,7 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Numerics;
-using BlueSky.Rendering.RHI;
+using BlueSky.BSR.RHI;
 
 namespace BlueSky.Editor.UI;
 
@@ -121,24 +121,24 @@ public class NotificationSystem
             switch (notif.Type)
             {
                 case NotificationType.Success:
-                    bgColor = ModernTheme.WithAlpha(ModernTheme.Green, 0.15f * alpha);
-                    borderColor = ModernTheme.WithAlpha(ModernTheme.Green, 0.6f * alpha);
-                    iconColor = ModernTheme.WithAlpha(ModernTheme.Green, alpha);
+                    bgColor = EditorTheme.WithAlpha(EditorTheme.Green, 0.15f * alpha);
+                    borderColor = EditorTheme.WithAlpha(EditorTheme.Green, 0.6f * alpha);
+                    iconColor = EditorTheme.WithAlpha(EditorTheme.Green, alpha);
                     break;
                 case NotificationType.Warning:
-                    bgColor = ModernTheme.WithAlpha(ModernTheme.Orange, 0.15f * alpha);
-                    borderColor = ModernTheme.WithAlpha(ModernTheme.Orange, 0.6f * alpha);
-                    iconColor = ModernTheme.WithAlpha(ModernTheme.Orange, alpha);
+                    bgColor = EditorTheme.WithAlpha(EditorTheme.Orange, 0.15f * alpha);
+                    borderColor = EditorTheme.WithAlpha(EditorTheme.Orange, 0.6f * alpha);
+                    iconColor = EditorTheme.WithAlpha(EditorTheme.Orange, alpha);
                     break;
                 case NotificationType.Error:
-                    bgColor = ModernTheme.WithAlpha(ModernTheme.Red, 0.15f * alpha);
-                    borderColor = ModernTheme.WithAlpha(ModernTheme.Red, 0.6f * alpha);
-                    iconColor = ModernTheme.WithAlpha(ModernTheme.Red, alpha);
+                    bgColor = EditorTheme.WithAlpha(EditorTheme.Red, 0.15f * alpha);
+                    borderColor = EditorTheme.WithAlpha(EditorTheme.Red, 0.6f * alpha);
+                    iconColor = EditorTheme.WithAlpha(EditorTheme.Red, alpha);
                     break;
                 default: // Info
-                    bgColor = ModernTheme.WithAlpha(ModernTheme.Accent, 0.15f * alpha);
-                    borderColor = ModernTheme.WithAlpha(ModernTheme.Accent, 0.6f * alpha);
-                    iconColor = ModernTheme.WithAlpha(ModernTheme.Accent, alpha);
+                    bgColor = EditorTheme.WithAlpha(EditorTheme.Accent, 0.15f * alpha);
+                    borderColor = EditorTheme.WithAlpha(EditorTheme.Accent, 0.6f * alpha);
+                    iconColor = EditorTheme.WithAlpha(EditorTheme.Accent, alpha);
                     break;
             }
             
@@ -150,12 +150,12 @@ public class NotificationSystem
             
             // Border
             EditorChrome.Stroke(ui, x, y, notifWidth, notifHeight, borderColor);
-            ui.Panel(x + 1, y + 1, notifWidth - 2, 1, ModernTheme.WithAlpha(ModernTheme.TextPrimary, 0.08f * alpha));
+            ui.Panel(x + 1, y + 1, notifWidth - 2, 1, EditorTheme.WithAlpha(EditorTheme.TextPrimary, 0.08f * alpha));
             
             // Icon
             if (!string.IsNullOrEmpty(notif.Icon))
             {
-                ui.Circle(x + 22, y + notifHeight * 0.5f, 10, ModernTheme.WithAlpha(iconColor, 0.18f), true);
+                ui.Circle(x + 22, y + notifHeight * 0.5f, 10, EditorTheme.WithAlpha(iconColor, 0.18f), true);
                 ui.TextCentered(x + 12, y + notifHeight * 0.5f - 10, 20, 20, notif.Icon, iconColor);
             }
             
@@ -168,12 +168,12 @@ public class NotificationSystem
             if (displayMsg.Length > maxChars)
                 displayMsg = displayMsg[..(maxChars - 3)] + "...";
             
-            ui.Text(displayMsg, ModernTheme.WithAlpha(ModernTheme.TextPrimary, alpha));
+            ui.Text(displayMsg, EditorTheme.WithAlpha(EditorTheme.TextPrimary, alpha));
             
             // Progress bar
             float progress = notif.Elapsed / notif.Duration;
             float progressWidth = notifWidth * (1f - progress);
-            ui.Panel(x, y + notifHeight - 3, progressWidth, 3, ModernTheme.WithAlpha(borderColor, 0.5f * alpha));
+            ui.Panel(x, y + notifHeight - 3, progressWidth, 3, EditorTheme.WithAlpha(borderColor, 0.5f * alpha));
         }
     }
     

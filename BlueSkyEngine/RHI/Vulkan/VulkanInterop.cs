@@ -1,7 +1,7 @@
 using System;
 using System.Runtime.InteropServices;
 
-namespace BlueSky.Rendering.RHI.Vulkan;
+namespace BlueSky.BSR.RHI.Vulkan;
 
 /// <summary>
 /// Vulkan P/Invoke declarations and function pointer loader.
@@ -1001,6 +1001,22 @@ internal static unsafe class VulkanInterop
     }
 
     [StructLayout(LayoutKind.Sequential)]
+    public struct VkOffset3D
+    {
+        public int x, y, z;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct VkImageCopy
+    {
+        public VkImageSubresourceLayers srcSubresource;
+        public VkOffset3D srcOffset;
+        public VkImageSubresourceLayers dstSubresource;
+        public VkOffset3D dstOffset;
+        public VkExtent3D extent;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
     public struct VkImageSubresourceLayers
     {
         public uint aspectMask;
@@ -1494,6 +1510,10 @@ internal static unsafe class VulkanInterop
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     public delegate void PFN_vkCmdCopyBufferToImage(IntPtr commandBuffer, IntPtr srcBuffer, IntPtr dstImage, uint dstImageLayout, uint regionCount, IntPtr pRegions);
 
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    public delegate void PFN_vkCmdCopyImage(IntPtr commandBuffer, IntPtr srcImage, uint srcImageLayout,
+        IntPtr dstImage, uint dstImageLayout, uint regionCount, IntPtr pRegions);
+
     // Synchronization
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     public delegate int PFN_vkCreateSemaphore(IntPtr device, ref VkSemaphoreCreateInfo pCreateInfo, IntPtr pAllocator, out IntPtr pSemaphore);
@@ -1653,6 +1673,7 @@ internal static unsafe class VulkanInterop
     public static PFN_vkCmdPipelineBarrier vkCmdPipelineBarrier = null!;
     public static PFN_vkCmdCopyBuffer vkCmdCopyBuffer = null!;
     public static PFN_vkCmdCopyBufferToImage vkCmdCopyBufferToImage = null!;
+    public static PFN_vkCmdCopyImage vkCmdCopyImage = null!;
     public static PFN_vkCreateSemaphore vkCreateSemaphore = null!;
     public static PFN_vkDestroySemaphore vkDestroySemaphore = null!;
     public static PFN_vkCreateFence vkCreateFence = null!;
@@ -1793,6 +1814,7 @@ internal static unsafe class VulkanInterop
         vkCmdPipelineBarrier = LoadDeviceFunc<PFN_vkCmdPipelineBarrier>(device, "vkCmdPipelineBarrier");
         vkCmdCopyBuffer = LoadDeviceFunc<PFN_vkCmdCopyBuffer>(device, "vkCmdCopyBuffer");
         vkCmdCopyBufferToImage = LoadDeviceFunc<PFN_vkCmdCopyBufferToImage>(device, "vkCmdCopyBufferToImage");
+        vkCmdCopyImage = LoadDeviceFunc<PFN_vkCmdCopyImage>(device, "vkCmdCopyImage");
 
         // Synchronization
         vkCreateSemaphore = LoadDeviceFunc<PFN_vkCreateSemaphore>(device, "vkCreateSemaphore");

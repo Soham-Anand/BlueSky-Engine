@@ -40,8 +40,12 @@ cbuffer AstraSurface : register(b2) {
 };
 
 // ── Textures / Samplers ────────────────────────────────────────────────────
+Texture2D VectraSprite : register(t0);
 Texture2D ShadowMap        : register(t1);
 SamplerState ShadowSampler : register(s1);
+Texture2D VectraLightMapA : register(t10); // +X, -X, +Y transmission occlusion
+Texture2D VectraLightMapB : register(t11); // -Y, +Z, -Z transmission occlusion
+Texture2D VectraSceneDepth : register(t12);
 
 // Strata Tier-1 surface textures (bound per-draw; defaults when absent)
 Texture2D AlbedoTex    : register(t2);
@@ -51,6 +55,11 @@ Texture2D DetailNormal : register(t7);
 Texture2D GradeLUT : register(t8);
 Texture2D BentTex : register(t9); // world-space bent RGB (Ease "world" encoding)
 SamplerState SurfSampler : register(s0);
+
+cbuffer VectraDepthParams : register(b11) {
+    float4x4 VectraInverseProjection;
+    float4 VectraDepth; // x=fade distance
+};
 
 // ── Slot 13: Light data array ─────────────────────────────────────────────
 struct LightData {
@@ -801,6 +810,22 @@ float4 fs_mesh(VS_MESH_OUTPUT input, bool isFrontFace : SV_IsFrontFace) : SV_Tar
         return float4(shadow, shadow, shadow, 1.0);
     }
     float3 finalColor = ambient + directLight * shadow;
+
+    // ── Prism Analytical Height Fog + Henyey-Greenstein Mie Sun In-Scattering ──
+    // Zero-branch atmospheric depth & golden horizon sun scatter optimized for Intel HD 3000.
+    float outdoorWeight = saturate(1.0 - SkyPreset);
+    float3 camToFrag = input.worldPos - CameraPos.xyz;
+    float viewDist = length(camToFrag);
+    float3 viewRay = camToFrag / max(viewDist, 1e-4);
+    float heightFalloff = exp(-max(0.0, input.worldPos.y) * 0.025);
+    float fogOpticalDepth = max(0.0, viewDist - 12.0) * 0.0018 * heightFalloff * outdoorWeight;
+    float fogFactor = 1.0 - exp(-fogOpticalDepth);
+    float sunCos = saturate(dot(viewRay, L));
+    float sunCos2 = sunCos * sunCos;
+    float mieScatter = (sunCos2 * sunCos2 * sunCos2) * 0.45;
+    float3 fogHorizon = lerp(float3(0.58, 0.78, 0.96), float3(1.0, 0.88, 0.68), mieScatter);
+    finalColor = lerp(finalColor, fogHorizon, saturate(fogFactor * 0.75));
+
     finalColor *= Exposure;
     finalColor = PBRNeutral(finalColor);
     finalColor = LinearToSRGB(finalColor);
@@ -813,6 +838,163 @@ float4 fs_mesh(VS_MESH_OUTPUT input, bool isFrontFace : SV_IsFrontFace) : SV_Tar
 
     // Draw alpha: opaque pipeline ignores it (blend off), transparent blends it.
     return float4(finalColor, Alpha);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// VECTRA — billboard particles (CPU sim, GPU quads). Same contract as the
+// Metal vs_vectra/fs_smoke pair: corner from SV_VertexID, sway by seed+time,
+// radial falloff x noise erosion, sun-facing warmth, near-fade.
+// ═════════════════════════════════════════════════════════════════════════════
+struct VS_VECTRA_INPUT {
+    float2 corner : POSITION;
+    float3 center : NORMAL;
+    float4 color  : TEXCOORD0;
+    float4 params : COLOR; // x=size, y=age01, z=seed, w=alpha
+};
+
+struct VS_VECTRA_OUTPUT {
+    float4 position : SV_POSITION;
+    float2 uv       : TEXCOORD0;
+    float4 color    : COLOR;
+    float  age01    : TEXCOORD1;
+    float  seed     : TEXCOORD2;
+    float3 worldPos : TEXCOORD3;
+};
+
+VS_VECTRA_OUTPUT vs_vectra(VS_VECTRA_INPUT input) {
+    VS_VECTRA_OUTPUT output;
+    float2 corner = input.corner;
+    float3 center = input.center;
+    float ph = input.params.z * 6.2831853;
+    float swayAmp = input.params.y * input.params.y * 0.48;
+    float freq = 0.85 + frac(input.params.z * 5.13) * 0.65;
+    center.x += sin(Time * freq + ph) * swayAmp;
+    center.z += cos(Time * (freq * 0.88) + ph * 1.7) * swayAmp;
+    float3 right = float3(View._11, View._12, View._13);
+    float3 up    = float3(View._21, View._22, View._23);
+    float3 world = center + (right * corner.x + up * corner.y) * (input.params.x * 0.5);
+    output.worldPos = world;
+    output.position = mul(ViewProj, float4(world, 1.0));
+    output.uv = corner * 0.5 + 0.5;
+    output.color = input.color;
+    output.age01 = input.params.y;
+    output.seed = input.params.z;
+    return output;
+}
+
+float4 fs_smoke(VS_VECTRA_OUTPUT input) : SV_Target0 {
+    float2 c = input.uv - 0.5;
+    float gd2 = dot(c, c) * 4.0;
+    if (gd2 >= 0.85) return float4(0.0, 0.0, 0.0, 0.0);
+    float gd = sqrt(gd2);
+
+    float baseAngle = frac(input.seed * 7.31) * 6.2831853;
+    float spinAngle = (frac(input.seed * 7.7) - 0.5) * input.age01 * 2.2;
+    float totalAngle = baseAngle + spinAngle;
+    float ca = cos(totalAngle), sa = sin(totalAngle);
+    float2 q = float2(c.x * ca + c.y * sa, -c.x * sa + c.y * ca);
+
+    float sm = 0.06 + 0.14 * frac(input.seed * 3.7);
+    q.x *= 1.0 + sm * 0.28;
+    q.y *= 1.0 - sm * 0.18;
+
+    float r = max(gd, length(q) * 2.0);
+    if (r >= 0.90) return float4(0.0, 0.0, 0.0, 0.0);
+
+    float warpMask = 1.0 - smoothstep(0.22, 0.78, r);
+    float tFlow = Time * 0.65 + input.age01 * 2.1 + input.seed * 6.2831853;
+    float2 swirl = float2(
+        sin(q.y * 7.5 + tFlow) + 0.45 * cos(q.x * 13.0 - tFlow * 1.3),
+        cos(q.x * 7.5 - tFlow * 0.9) - 0.45 * sin(q.y * 13.0 + tFlow * 1.1)
+    ) * (0.042 * warpMask);
+
+    float2 suv = clamp(q * 0.86 + swirl + 0.5, 0.03, 0.97);
+    float4 tex = VectraSprite.SampleLevel(SurfSampler, suv, 0);
+    float3 occA = VectraLightMapA.SampleLevel(SurfSampler, suv, 0).rgb;
+    float3 occB = VectraLightMapB.SampleLevel(SurfSampler, suv, 0).rgb;
+
+    float cavityAO    = tex.r;
+    float detailNoise = tex.g;
+    float wispNoise   = tex.b;
+
+    float radialWindow = 1.0 - smoothstep(0.28, 0.88, r);
+    radialWindow *= radialWindow;
+
+    float ageDissolve = smoothstep(0.22, 1.0, input.age01);
+    float erosion = lerp(0.04, 0.42, ageDissolve) * (1.0 - (detailNoise * 0.65 + wispNoise * 0.35) * 0.78);
+    float sculptedDensity = tex.a * (0.68 + 0.46 * detailNoise);
+    float rawDensity = smoothstep(erosion, 0.84, sculptedDensity) * radialWindow;
+
+    float a = (1.0 - exp(-rawDensity * 2.65)) * radialWindow * input.color.a;
+    if (a < 0.002) return float4(0.0, 0.0, 0.0, 0.0);
+
+    float3 camRight = float3(View._11, View._12, View._13);
+    float3 camUp    = float3(View._21, View._22, View._23);
+    float3 camFwd   = float3(View._31, View._32, View._33);
+
+    float3 lightDir = normalize(SunDirection.xyz + float3(0.0, 1e-5, 0.0));
+    float2 lightViewXY = float2(dot(lightDir, camRight), dot(lightDir, camUp));
+    float2 lightSpriteXY = float2(
+        lightViewXY.x * ca + lightViewXY.y * sa,
+       -lightViewXY.x * sa + lightViewXY.y * ca
+    );
+    float lightSpriteZ = dot(lightDir, -camFwd);
+    float3 spriteLight = normalize(float3(lightSpriteXY, lightSpriteZ) + float3(0.0, 0.0, 1e-5));
+    float3 absLight = abs(spriteLight);
+    float occX = spriteLight.x >= 0.0 ? occA.r : occA.g;
+    float occY = spriteLight.y >= 0.0 ? occA.b : occB.r;
+    float occZ = spriteLight.z >= 0.0 ? occB.g : occB.b;
+    float directionalOcclusion = dot(float3(occX, occY, occZ), absLight) /
+        max(absLight.x + absLight.y + absLight.z, 1e-4);
+
+    float2 gradSprite = float2(occA.g - occA.r, occB.r - occA.b) + float2(detailNoise - 0.5, wispNoise - 0.5) * 0.45;
+    float2 gradView = float2(
+        gradSprite.x * ca - gradSprite.y * sa,
+        gradSprite.x * sa + gradSprite.y * ca
+    );
+    float2 puffXY = c * 1.40 + gradView * 0.85;
+    float puffZ = sqrt(max(0.06, 1.0 - dot(puffXY, puffXY)));
+    float3 puffNormal = normalize(camRight * puffXY.x - camUp * puffXY.y - camFwd * puffZ);
+    float billowWrap = saturate(dot(puffNormal, lightDir) * 0.55 + 0.45);
+
+    float beer = exp(-directionalOcclusion * 2.15);
+    float powder = 1.0 - 0.52 * exp(-rawDensity * 3.4);
+    float creaseRelief = lerp(0.48, 1.08, cavityAO);
+    float directLit = saturate(beer * powder * billowWrap * creaseRelief);
+
+    float3 vdir = normalize(input.worldPos - CameraPos.xyz);
+    float cosTheta = dot(vdir, lightDir);
+    const float g = 0.38;
+    float hgDenom = max(1.0 + g * g - 2.0 * g * cosTheta, 0.05);
+    float hg = (1.0 - g * g) / (4.0 * 3.14159265 * hgDenom * sqrt(hgDenom));
+    float rimScatter = saturate(hg * 1.85) * (1.0 - rawDensity * 0.60) * beer;
+
+    float3 young = input.color.rgb * float3(0.56, 0.53, 0.52);
+    float3 old   = input.color.rgb * float3(1.10, 1.12, 1.16);
+    float3 base  = lerp(young, old, smoothstep(0.02, 0.65, input.age01));
+
+    float3 shadowAmb = float3(0.36, 0.40, 0.48) * lerp(0.75, 1.0, cavityAO);
+    float3 sunHighlight = float3(1.18, 1.10, 1.00);
+    float heightGrad = lerp(0.76, 1.10, smoothstep(-0.42, 0.42, -c.y));
+    float3 lighting = lerp(shadowAmb, sunHighlight, directLit) + sunHighlight * (rimScatter * 0.28);
+    float3 col = base * lighting * heightGrad;
+
+    float dist = length(input.worldPos - CameraPos.xyz);
+    a *= smoothstep(1.6, 4.8, dist);
+    uint depthWidth, depthHeight;
+    VectraSceneDepth.GetDimensions(depthWidth, depthHeight);
+    uint2 depthPixel = min(uint2(input.position.xy), uint2(depthWidth - 1, depthHeight - 1));
+    float deviceDepth = VectraSceneDepth.Load(int3(depthPixel, 0)).r;
+    float4 sceneView = mul(VectraInverseProjection, float4(0.0, 0.0, deviceDepth, 1.0));
+    float sceneZ = abs(sceneView.z / max(abs(sceneView.w), 1e-6));
+    float particleZ = abs(mul(View, float4(input.worldPos, 1.0)).z);
+    float puffDepthOffset = puffZ * 0.35;
+    float softFade = smoothstep(0.0, max(VectraDepth.x, 1e-4), (sceneZ - (particleZ - puffDepthOffset)));
+    a *= softFade;
+
+    float ign = frac(52.9829189 * frac(dot(floor(input.position.xy), float2(0.06711056, 0.00583715))));
+    a = saturate(a + (ign - 0.5) * (1.0 / 255.0));
+    return float4(LinearToSRGB(col), a);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

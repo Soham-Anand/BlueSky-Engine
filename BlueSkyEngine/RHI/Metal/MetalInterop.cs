@@ -1,7 +1,7 @@
 using System.Runtime.InteropServices;
 using System.Collections.Concurrent;
 
-namespace BlueSky.Rendering.RHI.Metal;
+namespace BlueSky.BSR.RHI.Metal;
 
 internal static class MetalInterop
 {

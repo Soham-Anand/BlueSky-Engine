@@ -2,9 +2,9 @@ using System;
 using System.Collections.Generic;
 using System.Numerics;
 using JoltPhysicsSharp;
-using BlueSky.Core.ECS;
-using BlueSky.Core.ECS.Builtin;
-using BlueSky.Core.Diagnostics;
+using BlueSky.SkyCore;
+using BlueSky.SkyCore.Builtin;
+using BlueSky.Pulse;
 
 namespace BlueSky.Airborne;
 

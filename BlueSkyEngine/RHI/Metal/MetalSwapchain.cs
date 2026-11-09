@@ -1,8 +1,8 @@
-using BlueSky.Platform;
+using BlueSky.Aegis;
 using System.Runtime.InteropServices;
-using static BlueSky.Rendering.RHI.Metal.MetalInterop;
+using static BlueSky.BSR.RHI.Metal.MetalInterop;
 
-namespace BlueSky.Rendering.RHI.Metal;
+namespace BlueSky.BSR.RHI.Metal;
 
 internal class MetalSwapchain : IRHISwapchain
 {
@@ -12,6 +12,7 @@ internal class MetalSwapchain : IRHISwapchain
     private IntPtr _currentDrawable;
     private MetalTexture? _currentRenderTarget;
     private bool _disposed;
+    private readonly PresentMode _presentMode;
     
     public uint Width { get; private set; }
     public uint Height { get; private set; }
@@ -23,8 +24,9 @@ internal class MetalSwapchain : IRHISwapchain
     {
         _device = device;
         _window = window;
-        Width = (uint)window.Size.X;
-        Height = (uint)window.Size.Y;
+        _presentMode = presentMode;
+        Width = (uint)window.FramebufferSize.X;
+        Height = (uint)window.FramebufferSize.Y;
         Format = TextureFormat.BGRA8Unorm;
         
         // Get the NSWindow from the window
@@ -54,22 +56,38 @@ internal class MetalSwapchain : IRHISwapchain
         var setFramebufferOnlySel = GetSelector("setFramebufferOnly:");
         SetBoolNative(_metalLayer, setFramebufferOnlySel, false);
         
-        // Set displaySyncEnabled based on presentMode (VSync or Immediate)
+        // Set displaySyncEnabled based on presentMode (VSync or Immediate).
+        // M1: Mailbox behaves like Vsync on Metal (no tearing API); triple-buffer
+        // via maximumDrawableCount below keeps latency down.
         var setDisplaySyncEnabledSel = GetSelector("setDisplaySyncEnabled:");
         SetBoolNative(_metalLayer, setDisplaySyncEnabledSel, presentMode != PresentMode.Immediate);
+
+        // M1: allow up to 3 drawables in flight (P0 will actually use them).
+        var setMaxDrawablesSel = GetSelector("setMaximumDrawableCount:");
+        objc_msgSend_void_ulong(_metalLayer, setMaxDrawablesSel, 3);
+
+        // Keep the drawable in pixels even before the first resize event.
+        Resize(Width, Height);
     }
     
     public void AcquireNextImage()
     {
+        // Release previous drawable texture BEFORE requesting nextDrawable so the
+        // 3-drawable pool in CAMetalLayer is never starved at high framerates.
+        _currentRenderTarget?.Dispose();
+        _currentRenderTarget = null;
+        if (_currentDrawable != IntPtr.Zero)
+        {
+            Release(_currentDrawable);
+            _currentDrawable = IntPtr.Zero;
+        }
+
         var nextDrawableSel = GetSelector("nextDrawable");
         var drawable        = objc_msgSend(_metalLayer, nextDrawableSel);
 
         if (drawable == IntPtr.Zero)
         {
             // Can happen if the window is minimised / occluded — just skip the frame.
-            _currentRenderTarget?.Dispose();
-            _currentRenderTarget = null;
-            _currentDrawable     = IntPtr.Zero;
             return;
         }
 
@@ -79,13 +97,14 @@ internal class MetalSwapchain : IRHISwapchain
         if (texture == IntPtr.Zero)
             throw new Exception("Failed to get texture from drawable.");
 
-        _currentRenderTarget?.Dispose();
         _currentRenderTarget = new MetalTexture(texture, Width, Height, Format, TextureUsage.RenderTarget);
         _currentDrawable     = Retain(drawable);
     }
     
     public void Resize(uint width, uint height)
     {
+        if (width == 0 || height == 0)
+            return; // minimized — keep last valid size, skip drawable resize
         Width = width;
         Height = height;
         
@@ -96,6 +115,9 @@ internal class MetalSwapchain : IRHISwapchain
     
     public void Present()
     {
+        _currentRenderTarget?.Dispose();
+        _currentRenderTarget = null;
+
         if (_currentDrawable == IntPtr.Zero)
             return;
 

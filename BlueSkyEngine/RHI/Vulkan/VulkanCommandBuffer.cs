@@ -3,7 +3,7 @@ using System.Numerics;
 using System.Runtime.InteropServices;
 using System.Collections.Generic;
 
-namespace BlueSky.Rendering.RHI.Vulkan;
+namespace BlueSky.BSR.RHI.Vulkan;
 
 /// <summary>
 /// Vulkan command buffer implementation. Records GPU commands into a VkCommandBuffer.
@@ -28,6 +28,7 @@ internal sealed class VulkanCommandBuffer : IRHICommandBuffer
     private readonly List<IntPtr> _transientFramebuffers = new();
     private readonly List<IntPtr> _transientRenderPasses = new();
     private readonly Dictionary<ulong, BoundDescriptor> _boundDescriptors = new();
+    private readonly Dictionary<ulong, IntPtr> _boundSamplers = new();
     private readonly List<VulkanBuffer> _inlineUniformBuffers = new();
 
     internal IntPtr Handle => _commandBuffer;
@@ -301,6 +302,12 @@ internal sealed class VulkanCommandBuffer : IRHICommandBuffer
         VulkanInterop.vkCmdSetScissor(_commandBuffer, 0, 1, ref vkScissor);
     }
 
+    public void SetDepthBias(float constantBias, float slopeScale, float clamp)
+    {
+        // Needs depthBiasEnable dynamic state in VulkanPipeline — unwired.
+        throw new NotSupportedException("[Vulkan] SetDepthBias is not implemented yet.");
+    }
+
     // ── Resource Binding ─────────────────────────────────────────────
 
     public void SetVertexBuffer(IRHIBuffer buffer, uint binding = 0, ulong offset = 0)
@@ -346,6 +353,100 @@ internal sealed class VulkanCommandBuffer : IRHICommandBuffer
         _boundDescriptors[VulkanPipeline.DescriptorKey(set, binding)] =
             new BoundDescriptor(VulkanInterop.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, vkTex);
         BindDescriptorSets();
+    }
+
+    public void SetSampler(IRHISampler sampler, uint binding, uint set = 0)
+    {
+        if (sampler is not VulkanSampler vkSampler)
+            throw new ArgumentException("Sampler must be a Vulkan sampler");
+        _boundSamplers[VulkanPipeline.DescriptorKey(set, binding)] = vkSampler.Handle;
+        BindDescriptorSets();
+    }
+
+    public void CopyTexture(IRHITexture source, IRHITexture destination)
+    {
+        if (_inRenderPass)
+            throw new InvalidOperationException("CopyTexture must be called outside a render pass.");
+        if (source is not VulkanTexture src || destination is not VulkanTexture dst)
+            throw new ArgumentException("Textures must belong to the Vulkan device.");
+        if (src.Width != dst.Width || src.Height != dst.Height || src.Format != dst.Format)
+            throw new ArgumentException("CopyTexture requires matching dimensions and formats.");
+        if (!src.Usage.HasFlag(TextureUsage.TransferSrc) || !dst.Usage.HasFlag(TextureUsage.TransferDst))
+            throw new InvalidOperationException("CopyTexture requires TransferSrc and TransferDst usage.");
+
+        uint sourceLayout = src.CurrentLayout;
+        uint destinationLayout = dst.CurrentLayout;
+        bool isDepth = VulkanInterop.IsDepthFormat(src.VkFormat);
+        uint aspect = isDepth ? VulkanInterop.VK_IMAGE_ASPECT_DEPTH_BIT : VulkanInterop.VK_IMAGE_ASPECT_COLOR_BIT;
+
+        TransitionImageLayout(src,
+            VulkanInterop.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VulkanInterop.VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VulkanInterop.VK_ACCESS_TRANSFER_READ_BIT);
+        TransitionImageLayout(dst,
+            VulkanInterop.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VulkanInterop.VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VulkanInterop.VK_ACCESS_TRANSFER_WRITE_BIT);
+
+        var region = new VulkanInterop.VkImageCopy
+        {
+            srcSubresource = new VulkanInterop.VkImageSubresourceLayers
+            {
+                aspectMask = aspect, mipLevel = 0, baseArrayLayer = 0, layerCount = 1,
+            },
+            srcOffset = new VulkanInterop.VkOffset3D(),
+            dstSubresource = new VulkanInterop.VkImageSubresourceLayers
+            {
+                aspectMask = aspect, mipLevel = 0, baseArrayLayer = 0, layerCount = 1,
+            },
+            dstOffset = new VulkanInterop.VkOffset3D(),
+            extent = new VulkanInterop.VkExtent3D { width = src.Width, height = src.Height, depth = 1 },
+        };
+        var pin = GCHandle.Alloc(region, GCHandleType.Pinned);
+        try
+        {
+            VulkanInterop.vkCmdCopyImage(_commandBuffer,
+                src.ImageHandle, VulkanInterop.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                dst.ImageHandle, VulkanInterop.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                1, pin.AddrOfPinnedObject());
+        }
+        finally
+        {
+            pin.Free();
+        }
+
+        if (sourceLayout != VulkanInterop.VK_IMAGE_LAYOUT_UNDEFINED)
+        {
+            uint sourceStage = sourceLayout == VulkanInterop.VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+                ? VulkanInterop.VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
+                : sourceLayout == VulkanInterop.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+                    ? VulkanInterop.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                    : VulkanInterop.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+            uint sourceAccess = sourceLayout == VulkanInterop.VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+                ? VulkanInterop.VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VulkanInterop.VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
+                : sourceLayout == VulkanInterop.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+                    ? VulkanInterop.VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VulkanInterop.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+                    : VulkanInterop.VK_ACCESS_SHADER_READ_BIT;
+            TransitionImageLayout(src, sourceLayout, sourceStage, sourceAccess);
+        }
+
+        uint finalDestinationLayout = dst.Usage.HasFlag(TextureUsage.Sampled)
+            ? VulkanInterop.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+            : destinationLayout;
+        if (finalDestinationLayout != VulkanInterop.VK_IMAGE_LAYOUT_UNDEFINED)
+        {
+            uint finalStage = finalDestinationLayout == VulkanInterop.VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+                ? VulkanInterop.VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
+                : finalDestinationLayout == VulkanInterop.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+                    ? VulkanInterop.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                    : VulkanInterop.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+            uint finalAccess = finalDestinationLayout == VulkanInterop.VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+                ? VulkanInterop.VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VulkanInterop.VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
+                : finalDestinationLayout == VulkanInterop.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+                    ? VulkanInterop.VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VulkanInterop.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+                    : VulkanInterop.VK_ACCESS_SHADER_READ_BIT;
+            TransitionImageLayout(dst, finalDestinationLayout, finalStage, finalAccess);
+        }
     }
 
     public void SetStorageBuffer(IRHIBuffer buffer, uint binding, uint set = 0)
@@ -537,7 +638,7 @@ internal sealed class VulkanCommandBuffer : IRHICommandBuffer
                     new VulkanInterop.VkDescriptorImageInfo
                     {
                         sampler = descriptor.DescriptorType == VulkanInterop.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
-                            ? _owner.DefaultSampler
+                            ? (_boundSamplers.TryGetValue(key, out var customSampler) ? customSampler : _owner.DefaultSampler)
                             : IntPtr.Zero,
                         imageView = bound.Texture.ViewHandle,
                         imageLayout = imageLayout
@@ -664,7 +765,7 @@ internal sealed class VulkanCommandBuffer : IRHICommandBuffer
         if (texture.CurrentLayout == newLayout) return;
 
         uint srcStageMask = VulkanInterop.VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-        uint srcAccessMask = VulkanInterop.VK_ACCESS_MEMORY_WRITE_BIT;
+        uint srcAccessMask = VulkanInterop.VK_ACCESS_MEMORY_READ_BIT | VulkanInterop.VK_ACCESS_MEMORY_WRITE_BIT;
 
         bool isDepth = VulkanInterop.IsDepthFormat(texture.VkFormat);
 
@@ -784,6 +885,10 @@ internal sealed class VulkanCommandBuffer : IRHICommandBuffer
             dstSubpass = 0,
             srcStageMask = VulkanInterop.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
                           VulkanInterop.VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+            srcAccessMask = clearValue.LoadInsteadOfClear
+                ? VulkanInterop.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                  VulkanInterop.VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
+                : 0,
             dstStageMask = VulkanInterop.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
                           VulkanInterop.VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
             dstAccessMask = VulkanInterop.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |

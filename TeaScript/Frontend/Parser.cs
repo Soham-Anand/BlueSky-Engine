@@ -19,6 +19,8 @@ public class Parser
         
         while (!IsAtEnd())
         {
+            // Top-level stray semicolons are empty statements.
+            if (Match(TokenType.Semicolon)) continue;
             statements.Add(ParseStatement());
         }
         
@@ -31,6 +33,9 @@ public class Parser
         if (Match(TokenType.Fn)) return ParseFunctionDeclaration();
         if (Match(TokenType.If)) return ParseIfStatement();
         if (Match(TokenType.While)) return ParseWhileStatement();
+        if (Match(TokenType.For)) return ParseForStatement();
+        if (Match(TokenType.Break)) return new BreakStatement();
+        if (Match(TokenType.Continue)) return new ContinueStatement();
         if (Match(TokenType.Return)) return ParseReturnStatement();
         
         return ParseExpressionStatement();
@@ -120,6 +125,43 @@ public class Parser
         Consume(TokenType.RightBrace, "Expected '}' after loop body");
         
         return new WhileStatement(condition, body);
+    }
+
+    private Statement ParseForStatement()
+    {
+        Consume(TokenType.LeftParen, "Expected '(' after 'for'");
+
+        // Initializer: `let ...`, an expression, or empty.
+        Statement? initializer = null;
+        if (!Check(TokenType.Semicolon))
+        {
+            if (Match(TokenType.Let)) initializer = ParseLetStatement();
+            else initializer = new ExpressionStatement(ParseExpression());
+        }
+        Consume(TokenType.Semicolon, "Expected ';' after for initializer");
+
+        // Condition: expression or empty (empty = always true).
+        Expression? condition = null;
+        if (!Check(TokenType.Semicolon))
+            condition = ParseExpression();
+        Consume(TokenType.Semicolon, "Expected ';' after for condition");
+
+        // Increment: expression or empty.
+        Expression? increment = null;
+        if (!Check(TokenType.RightParen))
+            increment = ParseExpression();
+        Consume(TokenType.RightParen, "Expected ')' after for clauses");
+        Consume(TokenType.LeftBrace, "Expected '{' before for body");
+
+        var body = new List<Statement>();
+        while (!Check(TokenType.RightBrace) && !IsAtEnd())
+        {
+            body.Add(ParseStatement());
+        }
+
+        Consume(TokenType.RightBrace, "Expected '}' after for body");
+
+        return new ForStatement(initializer, condition, increment, body);
     }
     
     private Statement ParseReturnStatement()

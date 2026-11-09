@@ -1,19 +1,19 @@
 using System;
+using BlueSky.Airborne;
 using System.Diagnostics;
 using System.IO;
 using System.Numerics;
 using BlueSky.Editor.UI;
-using BlueSky.Platform;
-using BlueSky.Platform.Input;
-using BlueSky.Core.ECS;
-using BlueSky.Core.ECS.Builtin;
-using BlueSky.Core.Math;
-using BlueSky.Rendering;
+using BlueSky.Aegis;
+using BlueSky.Aegis.Input;
+using BlueSky.SkyCore;
+using BlueSky.SkyCore.Builtin;
+using BlueSky.BSR;
 using BlueSky.Core.Scripting;
-using BlueSky.Core.Scene;
+using BlueSky.Meridian;
 using BlueSky.Runtime.UI;
-using BlueSky.Networking;
-using BlueSky.Rendering.RHI;
+using BlueSky.LHO;
+using BlueSky.BSR.RHI;
 using BlueSky.Editor.Services;
 
 namespace BlueSky.Editor;
@@ -34,6 +34,10 @@ partial class Program
     private static IRHISwapchain?    _swapchain;
     private static EditorUI?          _ui;
     private static EditorUIRenderer?  _uiRenderer;
+    internal static BlueSky.Echo.Echo? _echo;
+    private static BlueSky.Echo.EchoSystem? _echoSystem;
+    private static BlueSky.SkyCore.World? _echoSystemWorld;
+    private static bool _echoGameAudioActive;
 
     // ── Editor state ──────────────────────────────────────────────────────
     internal static EditorState _state = EditorState.ProjectBrowser;
@@ -110,7 +114,7 @@ partial class Program
     internal static string[] _importMeshPreviewNames = Array.Empty<string>();
 
     // ── Viewport 3D rendering ─────────────────────────────────────────
-    internal static BlueSky.Rendering.Viewport? _viewport { get => ViewportSvc.Viewport; set => ViewportSvc.Viewport = value; }
+    internal static BlueSky.BSR.Viewport? _viewport { get => ViewportSvc.Viewport; set => ViewportSvc.Viewport = value; }
     internal static BlueSky.Editor.ViewportRenderer? _editorViewportRenderer { get => ViewportSvc.EditorViewportRenderer; set => ViewportSvc.EditorViewportRenderer = value; }
     internal static IRHITexture? _depthTexture { get => ViewportSvc.DepthTexture; set => ViewportSvc.DepthTexture = value; }
     internal static uint _depthW { get => ViewportSvc.DepthW; set => ViewportSvc.DepthW = value; }
@@ -121,12 +125,12 @@ partial class Program
     // ── Gizmo Interaction State ─────────────────────────────────────────
     internal static bool _isDraggingGizmo = false;
     internal static int  _draggedGizmoAxis = -1; // 0=X, 1=Y, 2=Z, 3=Center
-    internal static BlueSky.Core.Math.Vector3 _gizmoDragStartEntityPos;
-    internal static BlueSky.Core.Math.Vector3 _gizmoDragAxisDir;
+    internal static BlueSky.Ramanujan.Vector3 _gizmoDragStartEntityPos;
+    internal static BlueSky.Ramanujan.Vector3 _gizmoDragAxisDir;
     internal static float _gizmoDragDistanceOffset = 0f;
-    internal static BlueSky.Core.Math.Quaternion _gizmoDragStartRot;
-    internal static BlueSky.Core.Math.Vector3 _gizmoDragStartScale;
-    internal static BlueSky.Core.Math.Vector3 _gizmoDragStartHitVec;
+    internal static BlueSky.Ramanujan.Quaternion _gizmoDragStartRot;
+    internal static BlueSky.Ramanujan.Vector3 _gizmoDragStartScale;
+    internal static BlueSky.Ramanujan.Vector3 _gizmoDragStartHitVec;
     internal static System.Numerics.Vector2 _gizmoDragStartMouse;
 
     // ── Timing ────────────────────────────────────────────────────────
@@ -152,16 +156,18 @@ partial class Program
     internal static string _frameTypedText = "";
     internal static bool _frameBackspacePressed = false;
 
-    // ── UI Enhancement Systems ────────────────────────────────────────
+    // ── UI Enhancement & Developer Tools ──────────────────────────────
     internal static NotificationSystem? _notificationSystem;
     internal static UIPerformanceMonitor? _perfMonitor;
+    internal static BlueSky.Core.Scripting.TeaScriptHotReloader? _scriptHotReloader;
+    internal static float _hotReloadPollAccumulator;
     internal static bool _showPerformanceOverlay = false;
 
     // ── Physics Systems ───────────────────────────────────────────────
     internal static BlueSky.Airborne.IPhysicsWorld? _physicsWorld => PlayMode.PhysicsWorld;
 
     // ── Terrain System ────────────────────────────────────────────────
-    internal static BlueSky.Rendering.TerrainSystem? _terrainSystem;
+    internal static BlueSky.BSR.TerrainSystem? _terrainSystem;
     internal static bool _terrainEditMode;
     internal static BrushMode _terrainBrushMode = BrushMode.Raise;
     internal static float _terrainBrushRadius = 5.0f;
@@ -170,7 +176,13 @@ partial class Program
     internal static int _terrainPaintLayer = 0;
 
     // ── Car Controller System ─────────────────────────────────────────
-    internal static BlueSky.Core.Gameplay.CarControllerSystem? _carControllerSystem;
+    internal static BlueSky.Airborne.CarControllerSystem? _carControllerSystem;
+
+    // ── Vectra Particles ──────────────────────────────────────────────
+    internal static readonly BlueSky.BSR.Vectra.VectraSystem _vectraSystem = new();
+    private static bool _vectraDemoSpawned;
+    internal static BlueSky.BSR.Vectra.VectraEmitter? _vectraDemoEmitter;
+    internal static string _vectraSpritePath = "";
 
     // ─────────────────────────────────────────────────────────────────────
     private static void Run(string[] args)
@@ -197,16 +209,42 @@ partial class Program
             return;
         }
 
+        // Headless Avalanche macOS .app packager CLI: --package-macos <outputDir> [appName] [scenePath] [signingMode] [signingIdentity]
+        if (args.Length > 1 && args[0] == "--package-macos")
+        {
+            string outDir = args[1];
+            string appName = args.Length > 2 ? args[2] : "BlueSkyGame";
+            string scenePath = args.Length > 3 ? args[3] : "";
+            string signingModeStr = args.Length > 4 ? args[4] : "Auto";
+            string signingIdentity = args.Length > 5 ? args[5] : "";
+            Enum.TryParse<AvalancheSigningMode>(signingModeStr, true, out var mode);
+            var report = AvalanchePackager.BuildMacOSApp(new AvalancheBuildSettings
+            {
+                OutputDirectory = outDir,
+                AppName = appName,
+                StartupScenePath = scenePath,
+                ProjectDirectory = Directory.GetCurrentDirectory(),
+                SigningMode = mode,
+                SigningIdentity = signingIdentity
+            }, null, Console.WriteLine);
+            Environment.Exit(report.Success ? 0 : 1);
+            return;
+        }
+
         if (args.Length > 0 && args[0] == "--reflect-jolt")
         {
             DumpJoltReflection();
             return;
         }
 
-        // ── Show native splash window FIRST ───────────────────────────────
-        using (var splash = new NativeSplashWindow())
+        // No blocking splash by default — straight into the editor.
+        // Opt-in brand moment: launch with --splash.
+        if (args.Contains("--splash"))
         {
-            splash.ShowAndWait(2000); // Show for 2 seconds
+            using (var splash = new NativeSplashWindow())
+            {
+                splash.ShowAndWait(2000);
+            }
         }
         
         // ── window ────────────────────────────────────────────────────────
@@ -274,6 +312,14 @@ partial class Program
         _skeletalMeshEditor = new SkeletalMeshEditor();
         _standalonePlay = new StandalonePlayController(Log);
 
+        // ── Echo audio ────────────────────────────────────────────────────
+        try
+        {
+            _echo = new BlueSky.Echo.Echo(new BlueSky.Echo.MiniAudioBackend());
+            BlueSky.Echo.EchoTeaScriptBridge.Active = _echo;
+        }
+        catch (Exception ex) { Console.WriteLine($"[Echo] Failed to start audio: {ex.Message}"); }
+
         // Immediately resize swapchain to actual pixel dimensions (Retina)
         var fbSize = _window.FramebufferSize;
         _swapchain.Resize((uint)fbSize.X, (uint)fbSize.Y);
@@ -289,27 +335,35 @@ partial class Program
             {
                 _frameBackspacePressed = true;
             }
-            
-            if (k == KeyCode.W) { if (_editorViewportRenderer != null) _editorViewportRenderer.CurrentGizmoMode = ViewportRenderer.GizmoMode.Translate; }
-            if (k == KeyCode.E) { if (_editorViewportRenderer != null) _editorViewportRenderer.CurrentGizmoMode = ViewportRenderer.GizmoMode.Rotate; }
-            if (k == KeyCode.R) { if (_editorViewportRenderer != null) _editorViewportRenderer.CurrentGizmoMode = ViewportRenderer.GizmoMode.Scale; }
+
+            if (HandleMenuAndPaletteKeyDown(k, m))
+                return;
+
+            bool hasCmdOrCtrl = m.HasFlag(ModifierKeys.Super) || m.HasFlag(ModifierKeys.Control);
+            bool textModalOpen = _showScriptEditor || _showRenameDialog || _showCommandPalette || _showAvalancheDialog;
+            if (!hasCmdOrCtrl && !textModalOpen && (_input == null || !_input.IsMouseButtonDown(MouseButton.Right)))
+            {
+                if (k == KeyCode.W) { if (_editorViewportRenderer != null) _editorViewportRenderer.CurrentGizmoMode = ViewportRenderer.GizmoMode.Translate; }
+                if (k == KeyCode.E) { if (_editorViewportRenderer != null) _editorViewportRenderer.CurrentGizmoMode = ViewportRenderer.GizmoMode.Rotate; }
+                if (k == KeyCode.R) { if (_editorViewportRenderer != null) _editorViewportRenderer.CurrentGizmoMode = ViewportRenderer.GizmoMode.Scale; }
+            }
 
             if (k == KeyCode.I && m.HasFlag(ModifierKeys.Super)) ImportFilesDialog();
             if (k == KeyCode.F3) _showPerformanceOverlay = !_showPerformanceOverlay;
             // Benchmark: F12 (via Fn on MacBooks) or Cmd+B (no Fn needed).
             if (k == KeyCode.F12 || (k == KeyCode.B && m.HasFlag(ModifierKeys.Super)))
             {
-                BlueSky.Rendering.Strata.StrataBenchmark.LogReport("F12-manual");
+                BlueSky.BSR.Strata.StrataBenchmark.LogReport("F12-manual");
                 string shotPath = System.IO.Path.Combine(
                     System.IO.Directory.GetCurrentDirectory(), "Benchmarks",
                     $"strata_{DateTime.UtcNow:yyyyMMdd_HHmmss}.bmp");
-                BlueSky.Rendering.Strata.StrataBenchmark.RequestScreenshot(shotPath);
+                BlueSky.BSR.Strata.StrataBenchmark.RequestScreenshot(shotPath);
                 _notificationSystem?.ShowInfo("Bench logged. Capturing screenshot…", 2.5f);
             }
             // Strata studio sky: F8 toggles the day/studio environment preset.
             if (k == KeyCode.F8)
             {
-                ref float preset = ref BlueSky.Core.WorldEnvironment.GlobalEnvironment.SkyPreset;
+                ref float preset = ref BlueSky.Meridian.GlobalEnvironment.SkyPreset;
                 preset = preset < 0.5f ? 1f : 0f;
                 _notificationSystem?.ShowInfo(preset > 0.5f
                     ? "Studio sky ON (dark environment)." : "Studio sky OFF (day).", 2.5f);
@@ -320,7 +374,7 @@ partial class Program
                 if (_editorViewportRenderer.StrataOverride == null)
                 {
                     _editorViewportRenderer.StrataOverride =
-                        BlueSky.Rendering.Strata.StrataSurfaceUpload.BuildDemoVehicleMaterial();
+                        BlueSky.BSR.Strata.StrataSurfaceUpload.BuildDemoVehicleMaterial();
                     _notificationSystem?.ShowInfo("Strata demo vehicle paint ON (Tier-1 lobes).", 2.5f);
                 }
                 else
@@ -330,7 +384,7 @@ partial class Program
                 }
             }
             if (k == KeyCode.K && (m.HasFlag(ModifierKeys.Control) || m.HasFlag(ModifierKeys.Super)))
-                BlueSky.Runtime.PhysicsDebugVisualizer.Toggle();
+                BlueSky.Pulse.PhysicsDebugVisualizer.Toggle();
         };
 
         // ── resize handler ────────────────────────────────────────────────
@@ -345,14 +399,14 @@ partial class Program
         };
 
         // ── Drag and drop for asset import ────────────────────────────────
-        if (_window is Platform.macOS.CocoaWindow cocoaWindow)
+        if (_window is Aegis.macOS.CocoaWindow cocoaWindow)
         {
             cocoaWindow.FilesDropped += files =>
             {
                 HandleFilesDropped(files);
             };
         }
-        else if (_window is Platform.Windows.Win32Window win32Window)
+        else if (_window is Aegis.Windows.Win32Window win32Window)
         {
             win32Window.FilesDropped += files =>
             {
@@ -406,7 +460,9 @@ partial class Program
             _frameIndex++;
 
             _input.BeginFrame();
+            _echoWindowHost?.BeginFrame();
             _window.ProcessEvents();
+            _echoWindowHost?.ProcessEvents();
             RuntimeUI.BeginFrame();
 
             if (PlayMode.IsPlaying)
@@ -419,14 +475,14 @@ partial class Program
                 RuntimeUI.Label($"Physics Frame: {_physicsFrame}", 20, 95);
                 
                 // Find active car controller
-                BlueSky.Core.Gameplay.CarController? activeCar = null;
+                BlueSky.Airborne.CarController? activeCar = null;
                 if (_carControllerSystem != null && _world != null)
                 {
                     foreach (var entity in _world.GetAllEntities())
                     {
-                        if (_world.HasComponent<BlueSky.Core.ECS.Builtin.CarControllerComponent>(entity))
+                        if (_world.HasComponent<BlueSky.SkyCore.Builtin.CarControllerComponent>(entity))
                         {
-                            var ctrl = BlueSky.Core.Gameplay.CarControllerSystem.GetController((uint)entity.Id);
+                            var ctrl = BlueSky.Airborne.CarControllerSystem.GetController((uint)entity.Id);
                             if (ctrl != null && ctrl.IsPossessed)
                             {
                                 activeCar = ctrl;
@@ -472,7 +528,7 @@ partial class Program
             if (_physicsWorld != null && _world != null && _viewport != null)
             {
                 var viewProj = _viewport.GetViewMatrixNumerics() * _viewport.GetProjectionMatrixNumerics();
-                BlueSky.Runtime.PhysicsDebugVisualizer.Draw(
+                BlueSky.Pulse.PhysicsDebugVisualizer.Draw(
                     _physicsWorld, _world, viewProj, _viewport.Width, _viewport.Height, _deltaTime);
             }
 
@@ -489,6 +545,18 @@ partial class Program
             }
 
             HandleTerrainSculpting();
+
+            // Poll live TeaScript hot-reloader (~2x/sec)
+            if (_state == EditorState.Workspace && _world != null)
+            {
+                _scriptHotReloader ??= new BlueSky.Core.Scripting.TeaScriptHotReloader(ProjectManager.CurrentProjectDir);
+                _hotReloadPollAccumulator += _deltaTime;
+                if (_hotReloadPollAccumulator >= 0.5f)
+                {
+                    _hotReloadPollAccumulator = 0f;
+                    _scriptHotReloader.PollAndReload(_world, _teaScriptSystem, Log);
+                }
+            }
 
             // Update TeaScript system
             if (_state == EditorState.Workspace && _teaScriptSystem != null && PlayMode.IsPlaying && !PlayMode.IsPaused)
@@ -554,10 +622,74 @@ partial class Program
                 _carControllerSystem.Update(_deltaTime);
             }
 
+            // Tick World systems (HierarchySystem) after physics and cars have moved
+            // the parents. Play mode only: in edit mode the gizmo writes a child's
+            // world transform directly, and the hierarchy would overwrite it.
+            if (_state == EditorState.Workspace && PlayMode.IsPlaying && !PlayMode.IsPaused)
+            {
+                _world?.Update(_deltaTime);
+            }
+
             // Update Terrain system (always, not just in play mode)
             if (_state == EditorState.Workspace && _terrainSystem != null)
             {
                 _terrainSystem.Update();
+            }
+
+            // Update Vectra particles (frozen while paused; demo smoke emitter
+            // so the milestone build shows something before editor UI lands)
+            if (_state == EditorState.Workspace && !PlayMode.IsPaused)
+            {
+                if (!_vectraDemoSpawned)
+                {
+                    _vectraDemoSpawned = true;
+                    _vectraDemoEmitter = new BlueSky.BSR.Vectra.VectraEmitter(
+                        BlueSky.BSR.Vectra.VectraEmitterConfig.Smoke(),
+                        new System.Numerics.Vector3(0f, 2.5f, 0f));
+                    _vectraSystem.AddEmitter(_vectraDemoEmitter);
+                }
+                _vectraSystem.Update(_deltaTime);
+            }
+
+            // Update Echo audio (listener follows the viewport camera)
+            if (_echo != null)
+            {
+                if (_viewport != null)
+                {
+                    var p = _viewport.GetCameraPositionNumerics();
+                    var f = _viewport.GetCameraTransform().Forward;
+                    _echo.SetListenerPosition(p, new System.Numerics.Vector3(f.X, f.Y, f.Z), System.Numerics.Vector3.UnitY);
+                }
+
+                bool inPlayMode = _state == EditorState.Workspace && PlayMode.IsPlaying;
+                if (inPlayMode && _world != null)
+                {
+                    if (_echoSystem == null || !ReferenceEquals(_echoSystemWorld, _world))
+                    {
+                        _echoSystem?.Dispose();
+                        _echoSystem = new BlueSky.Echo.EchoSystem(_echo, _world);
+                        _echoSystemWorld = _world;
+                    }
+
+                    // Pause holds every game sound where it is; Resume continues from the same point.
+                    _echo.SetGamePaused(PlayMode.IsPaused);
+                    if (!PlayMode.IsPaused)
+                        _echoSystem.Update(_deltaTime);
+                    _echoGameAudioActive = true;
+                }
+                else
+                {
+                    // Leaving Play mode: stop scene voices (re-arming Play On Start for next time), then any
+                    // sounds scripts started. Editor previews keep playing.
+                    _echoSystem?.StopAll();
+                    if (_echoGameAudioActive)
+                    {
+                        _echo.StopGameSounds();
+                        _echoGameAudioActive = false;
+                    }
+                }
+
+                _echo.Update(_deltaTime);
             }
 
             // Update Static Mesh Editor
@@ -574,6 +706,10 @@ partial class Program
 
             RenderFrame();
 
+            // The Echo window renders after the main frame; it must not start a
+            // second Metal frame, so it only draws into its own swapchain.
+            _echoWindowHost?.Render(_deltaTime);
+
             // Clear input state AFTER rendering (so modals can use it)
             _frameTypedText = "";
             _frameBackspacePressed = false;
@@ -584,11 +720,11 @@ partial class Program
 
     public static string[]? ShowOpenFileDialog()
     {
-        if (_window is Platform.macOS.CocoaWindow cocoaWindow)
+        if (_window is Aegis.macOS.CocoaWindow cocoaWindow)
         {
             return cocoaWindow.ShowOpenFileDialog();
         }
-        else if (_window is Platform.Windows.Win32Window win32Window)
+        else if (_window is Aegis.Windows.Win32Window win32Window)
         {
             return win32Window.ShowOpenFileDialog();
         }
@@ -678,6 +814,8 @@ partial class Program
     {
         if (_depthTexture != null && _depthW == width && _depthH == height)
             return;
+        // M4b: the old depth may be read by in-flight frames — drain first.
+        DrainMetalFrame();
         _depthTexture?.Dispose();
         _depthTexture = _rhi!.CreateTexture(new TextureDesc
         {
@@ -691,14 +829,63 @@ partial class Program
         _depthH = height;
     }
 
+    // ── M4: async frame overlap (Metal) ──────────────────────────────────
+    private static BlueSky.BSR.RHI.Metal.MetalDevice? MetalDevice =>
+        (_rhi as BlueSky.BSR.RHI.IRHIWrapped<BlueSky.BSR.RHI.IRHIDevice>)?.Inner
+            as BlueSky.BSR.RHI.Metal.MetalDevice;
+
+    private static void BeginMetalFrame()
+    {
+        // Throttles only when the GPU is 3 frames behind; otherwise free.
+        var metal = MetalDevice;
+        metal?.BeginFrame();
+        // M5: feed GPU clocks into the benchmark log.
+        if (metal != null)
+            BlueSky.BSR.Strata.StrataBenchmark.GpuMsProvider = () => metal.LastFrameGpuMs;
+    }
+
+    private static void SubmitFrame(BlueSky.BSR.RHI.IRHICommandBuffer cmd,
+        BlueSky.BSR.RHI.IRHISwapchain swapchain)
+    {
+        var metal = MetalDevice;
+        if (metal != null)
+        {
+            var inner = (cmd as BlueSky.BSR.RHI.IRHIWrapped<BlueSky.BSR.RHI.IRHICommandBuffer>)?.Inner ?? cmd;
+            var innerSwap = (swapchain as BlueSky.BSR.RHI.IRHIWrapped<BlueSky.BSR.RHI.IRHISwapchain>)?.Inner ?? swapchain;
+            metal.SubmitNoWait(inner, innerSwap);
+            return;
+        }
+        _rhi!.Submit(cmd, swapchain);
+    }
+
+    private static void DrainMetalFrame()
+    {
+        MetalDevice?.DrainPending();
+    }
+
+    private static void EncodeWaitForScene(BlueSky.BSR.RHI.IRHICommandBuffer cmd)
+    {
+        var metal = MetalDevice;
+        if (metal == null) return;
+        var inner = (cmd as BlueSky.BSR.RHI.IRHIWrapped<BlueSky.BSR.RHI.IRHICommandBuffer>)?.Inner ?? cmd;
+        metal.EncodeWaitForScene(inner);
+    }
+
+    [System.Runtime.InteropServices.DllImport("/usr/lib/libobjc.A.dylib")]
+    private static extern IntPtr objc_autoreleasePoolPush();
+
+    [System.Runtime.InteropServices.DllImport("/usr/lib/libobjc.A.dylib")]
+    private static extern void objc_autoreleasePoolPop(IntPtr pool);
+
     private static void RenderFrame()
     {
+        IntPtr autoreleasePool = OperatingSystem.IsMacOS() ? objc_autoreleasePoolPush() : IntPtr.Zero;
+        try
+        {
         _perfMonitor?.BeginFrame();
-        BlueSky.Rendering.Strata.StrataBenchmark.BeginFrame();
-        
-        _swapchain!.AcquireNextImage();
+        BlueSky.BSR.Strata.StrataBenchmark.BeginFrame();
 
-        var cmd = _rhi!.CreateCommandBuffer();
+        BeginMetalFrame();
 
         if (_state == EditorState.Workspace && _viewport != null)
         {
@@ -731,9 +918,9 @@ partial class Program
         // Update animation systems
         AnimatedButton.UpdateGlobalTime(_deltaTime);
         _notificationSystem?.Update(_deltaTime);
-        // Don't pass input to UI while a text-editing modal is open.
-        string uiTypedText = (_showScriptEditor || _showRenameDialog) ? "" : _frameTypedText;
-        bool uiBackspace = (_showScriptEditor || _showRenameDialog) ? false : _frameBackspacePressed;
+        // Don't pass input to UI while a text-editing modal or Command Palette is open.
+        string uiTypedText = (_showScriptEditor || _showRenameDialog || _showCommandPalette) ? "" : _frameTypedText;
+        bool uiBackspace = (_showScriptEditor || _showRenameDialog || _showCommandPalette) ? false : _frameBackspacePressed;
         
         _ui!.BeginFrame(mousePos, mouseDown, uiTypedText, uiBackspace, _input.ScrollDelta.Y);
         
@@ -748,7 +935,7 @@ partial class Program
                 _nmPrefabDropZone.Z > 0 && _nmPrefabDropZone.W > 0 &&
                 mousePos.X >= _nmPrefabDropZone.X && mousePos.X <= _nmPrefabDropZone.X + _nmPrefabDropZone.Z &&
                 mousePos.Y >= _nmPrefabDropZone.Y && mousePos.Y <= _nmPrefabDropZone.Y + _nmPrefabDropZone.W &&
-                _world != null && _selectedEntityId > 0 && _selectedEntityId < 200)
+                _world != null && _selectedEntityId > 0 && _selectedEntityId < EditorOnlyTagComponent.EditorSystemIdBase)
             {
                 if (!_world.TryResolveEntity(_selectedEntityId, out var entity) || !_world.TryGetComponent<NetworkManagerComponent>(entity, out var nmComp))
                 {
@@ -766,7 +953,7 @@ partial class Program
                 _bsphyDropZone.Z > 0 && _bsphyDropZone.W > 0 &&
                 mousePos.X >= _bsphyDropZone.X && mousePos.X <= _bsphyDropZone.X + _bsphyDropZone.Z &&
                 mousePos.Y >= _bsphyDropZone.Y && mousePos.Y <= _bsphyDropZone.Y + _bsphyDropZone.W &&
-                _world != null && _selectedEntityId > 0 && _selectedEntityId < 200)
+                _world != null && _selectedEntityId > 0 && _selectedEntityId < EditorOnlyTagComponent.EditorSystemIdBase)
             {
                 if (_world.TryResolveEntity(_selectedEntityId, out var bsphyEntity) && _world.HasComponent<PhysicsComponent>(bsphyEntity))
                 {
@@ -793,8 +980,8 @@ partial class Program
         bool isSkeletalMeshEditorOpen = _skeletalMeshEditor != null && _skeletalMeshEditor.IsOpen;
         bool isAnyMeshEditorOpen = isStaticMeshEditorOpen || isSkeletalMeshEditorOpen;
         
-        // Disable input for the background UI if a modal is open
-        _ui!.InputEnabled = !(fullscreenModalOpen || isAnyMeshEditorOpen);
+        // Disable input for the background UI if a modal, menu dropdown, or Command Palette is open
+        _ui!.InputEnabled = !(fullscreenModalOpen || isAnyMeshEditorOpen || IsMenuOrPaletteOpen);
 
         if (_state == EditorState.ProjectBrowser)
         {
@@ -847,13 +1034,21 @@ partial class Program
             }
         }
 
+        // Acquire swapchain drawable and create UI/composite command buffer AFTER
+        // _viewport.Render() has created and committed the offscreen scene command buffer.
+        // Creating cmd BEFORE _viewport.Render() inverted MTLCommandQueue creation order
+        // so Command Buffer #1 waited on a SharedEvent signaled by Command Buffer #2!
+        _swapchain!.AcquireNextImage();
+        var cmd = _rhi!.CreateCommandBuffer();
+
+        // M4b: order the composite after the async scene pass (no CPU wait).
+        EncodeWaitForScene(cmd);
         cmd.BeginRenderPass(
             new[] { _swapchain.CurrentRenderTarget },
             _depthTexture,
             new ClearValue { Color = EditorTheme.Bg0, Depth = 1.0f }
         );
-
-        cmd.SetViewport(new BlueSky.Rendering.RHI.Viewport { X = 0, Y = 0, Width = w, Height = h, MinDepth = 0, MaxDepth = 1 });
+        cmd.SetViewport(new BlueSky.BSR.RHI.Viewport { X = 0, Y = 0, Width = w, Height = h, MinDepth = 0, MaxDepth = 1 });
         cmd.SetScissor(new Scissor  { X = 0, Y = 0, Width = w, Height = h });
 
         // ── Composite 3D viewport content first so editor chrome draws above it ───────────
@@ -909,29 +1104,29 @@ partial class Program
         
         if (_showPerformanceOverlay && _perfMonitor != null)
         {
-            // Performance overlay in top-right corner
-            float overlayW = 400f;
-            float overlayH = 120f;
+            var skyCoreStats = BlueSky.Pulse.SkyCoreDiagnostics.Capture(_world);
+            float overlayW = 430f;
+            float overlayH = 148f;
             float overlayX = logW - overlayW - 10f;
             float overlayY = 10f;
             
-            _ui.Panel(overlayX, overlayY, overlayW, overlayH, ModernTheme.WithAlpha(ModernTheme.Bg2, 0.9f));
-            _ui.Panel(overlayX, overlayY, overlayW, 2, ModernTheme.Accent);
+            _ui.Panel(overlayX, overlayY, overlayW, overlayH, EditorTheme.WithAlpha(EditorTheme.Bg2, 0.9f));
+            _ui.Panel(overlayX, overlayY, overlayW, 2, EditorTheme.Accent);
             
             _ui.SetCursor(overlayX + 10, overlayY + 10);
-            _ui.Text($"FPS: {_perfMonitor.FPS:F1}", ModernTheme.Green);
+            _ui.Text($"FPS: {_perfMonitor.FPS:F1} | Frame: {_perfMonitor.CurrentFrameTime:F2}ms (avg: {_perfMonitor.AverageFrameTime:F2}ms)", EditorTheme.Green);
             
-            _ui.SetCursor(overlayX + 10, overlayY + 30);
-            _ui.Text($"Frame: {_perfMonitor.CurrentFrameTime:F2}ms (avg: {_perfMonitor.AverageFrameTime:F2}ms)", ModernTheme.TextSecondary);
+            _ui.SetCursor(overlayX + 10, overlayY + 32);
+            _ui.Text($"SkyCore: {skyCoreStats.EntityCount} entities | {skyCoreStats.NonEmptyChunkCount} chunks ({skyCoreStats.AllocatedChunkBytes / 1024} KB)", EditorTheme.AccentCyan);
+
+            _ui.SetCursor(overlayX + 10, overlayY + 54);
+            _ui.Text($"HotReloads: {_scriptHotReloader?.ReloadCount ?? 0} (Last: {_scriptHotReloader?.LastReloadedScript ?? "None"})", EditorTheme.TextSecondary);
             
-            _ui.SetCursor(overlayX + 10, overlayY + 50);
-            _ui.Text($"Draw Calls: {_perfMonitor.DrawCallCount}", ModernTheme.TextSecondary);
+            _ui.SetCursor(overlayX + 10, overlayY + 76);
+            _ui.Text($"UI Draw Calls: {_perfMonitor.DrawCallCount} | Panels: {_perfMonitor.PanelCount} | Text: {_perfMonitor.TextCount}", EditorTheme.TextMuted);
             
-            _ui.SetCursor(overlayX + 10, overlayY + 70);
-            _ui.Text($"Panels: {_perfMonitor.PanelCount} | Text: {_perfMonitor.TextCount}", ModernTheme.TextMuted);
-            
-            _ui.SetCursor(overlayX + 10, overlayY + 90);
-            _ui.Text("Press F3 to hide", ModernTheme.TextDisabled);
+            _ui.SetCursor(overlayX + 10, overlayY + 100);
+            _ui.Text($"World Version: v{skyCoreStats.WorldVersion} | Press F3 to hide", EditorTheme.TextDisabled);
         }
 
         _uiRenderer!.Render(cmd, _ui!);
@@ -946,7 +1141,7 @@ partial class Program
         }
         
         // ── Handle Gizmo Interaction ──────────────────────────────────────
-        if (_state == EditorState.Workspace && _viewport != null && !fullscreenModalOpen && !_terrainEditMode)
+        if (_state == EditorState.Workspace && _viewport != null && !fullscreenModalOpen && !IsMenuOrPaletteOpen && !_terrainEditMode)
         {
             UpdateGizmoInteraction();
         }
@@ -954,13 +1149,13 @@ partial class Program
         cmd.EndRenderPass();
         // Strata benchmark screenshot (Metal blit-capture; other backends log + skip).
         // NOTE: the RHI wraps devices in Validation* decorators — unwrap first.
-        string? benchShot = BlueSky.Rendering.Strata.StrataBenchmark.ConsumeScreenshotRequest();
+        string? benchShot = BlueSky.BSR.Strata.StrataBenchmark.ConsumeScreenshotRequest();
         IntPtr benchStaging = IntPtr.Zero;
         uint benchW = 0, benchH = 0;
-        var benchCmd = (cmd as BlueSky.Rendering.RHI.IRHIWrapped<BlueSky.Rendering.RHI.IRHICommandBuffer>)?.Inner ?? cmd;
-        var benchSwap = (_swapchain as BlueSky.Rendering.RHI.IRHIWrapped<BlueSky.Rendering.RHI.IRHISwapchain>)?.Inner ?? _swapchain;
-        if (benchShot != null && benchCmd is BlueSky.Rendering.RHI.Metal.MetalCommandBuffer metalCmd
-            && benchSwap is BlueSky.Rendering.RHI.Metal.MetalSwapchain metalSwap)
+        var benchCmd = (cmd as BlueSky.BSR.RHI.IRHIWrapped<BlueSky.BSR.RHI.IRHICommandBuffer>)?.Inner ?? cmd;
+        var benchSwap = (_swapchain as BlueSky.BSR.RHI.IRHIWrapped<BlueSky.BSR.RHI.IRHISwapchain>)?.Inner ?? _swapchain;
+        if (benchShot != null && benchCmd is BlueSky.BSR.RHI.Metal.MetalCommandBuffer metalCmd
+            && benchSwap is BlueSky.BSR.RHI.Metal.MetalSwapchain metalSwap)
         {
             benchStaging = metalCmd.EncodeScreenshotBlit(metalSwap, out benchW, out benchH);
             if (benchStaging == IntPtr.Zero) benchShot = null;
@@ -970,12 +1165,14 @@ partial class Program
             Console.WriteLine($"[Screenshot] Capture supported on Metal only (cmd={benchCmd?.GetType().Name}, swap={benchSwap?.GetType().Name}) — request skipped.");
             benchShot = null;
         }
-        BlueSky.Rendering.Strata.StrataBenchmark.BeginSection("submit");
-        _rhi.Submit(cmd, _swapchain);
-        BlueSky.Rendering.Strata.StrataBenchmark.EndSection("submit");
+        BlueSky.BSR.Strata.StrataBenchmark.BeginSection("submit");
+        SubmitFrame(cmd, _swapchain);
+        BlueSky.BSR.Strata.StrataBenchmark.EndSection("submit");
         if (benchShot != null)
         {
-            BlueSky.Rendering.RHI.Metal.MetalCommandBuffer.CompleteScreenshot(benchStaging, benchW, benchH, benchShot);
+            // M4: the frame commit was async — drain before CPU readback.
+            DrainMetalFrame();
+            BlueSky.BSR.RHI.Metal.MetalCommandBuffer.CompleteScreenshot(benchStaging, benchW, benchH, benchShot);
             if (System.IO.File.Exists(benchShot))
                 _notificationSystem?.ShowInfo($"Screenshot saved → {benchShot}", 2.5f);
             else
@@ -985,7 +1182,13 @@ partial class Program
         cmd.Dispose();
         
         _perfMonitor?.EndFrame();
-        BlueSky.Rendering.Strata.StrataBenchmark.EndFrame();
+        BlueSky.BSR.Strata.StrataBenchmark.EndFrame();
+        }
+        finally
+        {
+            if (autoreleasePool != IntPtr.Zero)
+                objc_autoreleasePoolPop(autoreleasePool);
+        }
     }
 
     private static void ImportStratapackHeadless(string packPath, string outDir)
@@ -1072,9 +1275,17 @@ partial class Program
     private static void Cleanup()
     {
         AnimatedButton.ClearStates();
+        _echoWindowHost?.Dispose();
+        _echoWindowHost = null;
         Assets.Dispose();
         _notificationSystem?.Clear();
         _standalonePlay?.Dispose();
+        _echoSystem?.Dispose();
+        _echoSystem = null;
+        _echoSystemWorld = null;
+        BlueSky.Echo.EchoTeaScriptBridge.Active = null;
+        _echo?.Dispose();
+        _echo = null;
         _viewport?.Dispose();
         _depthTexture?.Dispose();
         _world?.Dispose();

@@ -63,6 +63,8 @@ namespace BlueSky.Editor
                 }
 
                 CurrentProjectDir = dirPath;
+                // Let asset resolution find project-relative paths (Assets/...) in the editor.
+                BlueSky.Core.Assets.AssetPathResolver.RegisterSearchRoot(dirPath);
                 ProjectConfig.AddOrUpdateProject(dirPath);
                 return true;
             }
@@ -84,6 +86,8 @@ namespace BlueSky.Editor
                 if (!hasProj) return false;
 
                 CurrentProjectDir = dirPath;
+                // Let asset resolution find project-relative paths (Assets/...) in the editor.
+                BlueSky.Core.Assets.AssetPathResolver.RegisterSearchRoot(dirPath);
                 ProjectConfig.AddOrUpdateProject(dirPath);
                 return true;
             }

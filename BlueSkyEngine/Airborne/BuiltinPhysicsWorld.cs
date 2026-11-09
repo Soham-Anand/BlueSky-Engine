@@ -1,9 +1,9 @@
 using System;
 using System.Collections.Generic;
 using System.Numerics;
-using BlueSky.Core.ECS;
-using BlueSky.Core.ECS.Builtin;
-using BlueSky.Core.Diagnostics;
+using BlueSky.SkyCore;
+using BlueSky.SkyCore.Builtin;
+using BlueSky.Pulse;
 using BlueSky.Airborne.Collision;
 
 namespace BlueSky.Airborne;
@@ -145,8 +145,8 @@ public class BuiltinPhysicsWorld : IPhysicsWorld
             // Do not resolve if velocities are separating
             if (velAlongNormal > 0) continue;
 
-            // Calculate restitution (bounciness)
-            float restitution = 0.2f; // Could get from colliders later
+            // Calculate restitution (bounciness) from colliding bodies
+            float restitution = MathF.Max(bodyA.Restitution, bodyB.Restitution);
             float j = -(1 + restitution) * velAlongNormal;
             j /= totalInvMass;
 
@@ -630,7 +630,7 @@ public class BuiltinPhysicsWorld : IPhysicsWorld
     {
         if (body.Collider == null) return;
 
-        body.Collider.Position = body.Position + body.ColliderCenter;
+        body.Collider.Position = body.Position + Vector3.Transform(body.ColliderCenter, body.Rotation);
         body.Collider.Rotation = body.Rotation;
         body.Collider.UpdateBounds();
     }

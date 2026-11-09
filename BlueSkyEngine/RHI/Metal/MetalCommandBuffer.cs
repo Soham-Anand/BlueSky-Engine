@@ -1,8 +1,8 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
-using static BlueSky.Rendering.RHI.Metal.MetalInterop;
+using static BlueSky.BSR.RHI.Metal.MetalInterop;
 
-namespace BlueSky.Rendering.RHI.Metal;
+namespace BlueSky.BSR.RHI.Metal;
 
 internal class MetalCommandBuffer : IRHICommandBuffer
 {
@@ -184,6 +184,9 @@ internal class MetalCommandBuffer : IRHICommandBuffer
         var setFillModeSel = GetSelector("setTriangleFillMode:");
         objc_msgSend_void_ulong(_renderEncoder, setFillModeSel, metalPipeline.FillMode);
 
+        var setWindingSel = GetSelector("setFrontFacingWinding:");
+        objc_msgSend_void_ulong(_renderEncoder, setWindingSel, metalPipeline.FrontWinding);
+
         if (metalPipeline.DepthStencilState != IntPtr.Zero)
         {
             var setDepthStencilStateSel = GetSelector("setDepthStencilState:");
@@ -209,6 +212,15 @@ internal class MetalCommandBuffer : IRHICommandBuffer
 
         var setScissorSel = GetSelector("setScissorRect:");
         SetScissorNative(_renderEncoder, setScissorSel, scissor);
+    }
+
+    public void SetDepthBias(float constantBias, float slopeScale, float clamp)
+    {
+        if (_renderEncoder == IntPtr.Zero)
+            throw new InvalidOperationException("No active render pass");
+
+        SetDepthBiasNative(_renderEncoder, GetSelector("setDepthBias:slopeScale:clamp:"),
+            constantBias, slopeScale, clamp);
     }
 
     // ── Resource Binding (Slot-Based — works on all Metal GPUs) ──
@@ -261,6 +273,52 @@ internal class MetalCommandBuffer : IRHICommandBuffer
 
         var setTextureSel = GetSelector("setFragmentTexture:atIndex:");
         objc_msgSend_void_ptr_ulong(_renderEncoder, setTextureSel, metalTexture.Handle, binding);
+    }
+
+    public void SetSampler(IRHISampler sampler, uint binding, uint set = 0)
+    {
+        if (_renderEncoder == IntPtr.Zero)
+            throw new InvalidOperationException("No active render pass");
+
+        if (sampler is not MetalSampler metalSampler)
+            throw new ArgumentException("Sampler must be a Metal sampler");
+
+        var setFragSamplerSel = GetSelector("setFragmentSamplerState:atIndex:");
+        SetSamplerNative(_renderEncoder, setFragSamplerSel, metalSampler.Handle, binding);
+        var setVertSamplerSel = GetSelector("setVertexSamplerState:atIndex:");
+        SetSamplerNative(_renderEncoder, setVertSamplerSel, metalSampler.Handle, binding);
+    }
+
+    public void CopyTexture(IRHITexture source, IRHITexture destination)
+    {
+        if (source is not MetalTexture src || destination is not MetalTexture dst)
+            throw new ArgumentException("Textures must belong to the Metal device.");
+        if (src.Width != dst.Width || src.Height != dst.Height || src.Format != dst.Format)
+            throw new ArgumentException("CopyTexture requires matching dimensions and formats.");
+        if (!src.Usage.HasFlag(TextureUsage.TransferSrc) || !dst.Usage.HasFlag(TextureUsage.TransferDst))
+            throw new InvalidOperationException("CopyTexture requires TransferSrc and TransferDst usage.");
+        if (_renderEncoder != IntPtr.Zero)
+            throw new InvalidOperationException("CopyTexture must be called outside a render pass.");
+
+        EndComputeEncoderIfNeeded();
+        IntPtr blit = objc_msgSend(_commandBuffer, GetSelector("blitCommandEncoder"));
+        if (blit == IntPtr.Zero)
+            throw new InvalidOperationException("Failed to create Metal blit encoder.");
+
+        Retain(blit);
+        try
+        {
+            var origin = new MTLOrigin { x = 0, y = 0, z = 0 };
+            var size = new MTLSize { width = src.Width, height = src.Height, depth = 1 };
+            CopyFromTextureNative(blit,
+                GetSelector("copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:"),
+                src.Handle, 0, 0, origin, size, dst.Handle, 0, 0, origin);
+        }
+        finally
+        {
+            objc_msgSend_void(blit, GetSelector("endEncoding"));
+            Release(blit);
+        }
     }
 
     // ── Storage Buffers/Textures (compute shader resource binding) ──
@@ -479,6 +537,22 @@ internal class MetalCommandBuffer : IRHICommandBuffer
         if (_renderEncoder != IntPtr.Zero)
             throw new InvalidOperationException("Render pass still active — call EndRenderPass first.");
 
+        CommitNoWait();
+
+        var waitSel = GetSelector("waitUntilCompleted");
+        objc_msgSend_void(_commandBuffer, waitSel);
+    }
+
+    /// <summary>
+    /// M4: commit without waiting — the GPU runs while the CPU continues.
+    /// Caller must guarantee in-flight safety (versioned buffers) and either
+    /// throttle via MetalDevice.BeginFrame or drain via DrainPending.
+    /// </summary>
+    internal void CommitNoWait()
+    {
+        if (_renderEncoder != IntPtr.Zero)
+            throw new InvalidOperationException("Render pass still active — call EndRenderPass first.");
+
         if (_currentDrawable != IntPtr.Zero)
         {
             var presentDrawableSel = GetSelector("presentDrawable:");
@@ -487,10 +561,24 @@ internal class MetalCommandBuffer : IRHICommandBuffer
 
         var commitSel = GetSelector("commit");
         objc_msgSend_void(_commandBuffer, commitSel);
+    }
 
+    internal void WaitForCompletion()
+    {
         var waitSel = GetSelector("waitUntilCompleted");
         objc_msgSend_void(_commandBuffer, waitSel);
     }
+
+    internal ulong Status
+    {
+        get
+        {
+            var statusSel = GetSelector("status");
+            return objc_msgSend_ret_ulong(_commandBuffer, statusSel);
+        }
+    }
+
+    internal IntPtr NativeHandle => _commandBuffer;
 
     internal void SetDrawable(IntPtr drawable)
     {
@@ -558,6 +646,10 @@ internal class MetalCommandBuffer : IRHICommandBuffer
     private static extern void SetScissorNative(IntPtr receiver, IntPtr selector, MTLScissorRect rect);
 
     [System.Runtime.InteropServices.DllImport("/usr/lib/libobjc.A.dylib", EntryPoint = "objc_msgSend")]
+    private static extern void SetDepthBiasNative(IntPtr receiver, IntPtr selector,
+        float depthBias, float slopeScale, float clamp);
+
+    [System.Runtime.InteropServices.DllImport("/usr/lib/libobjc.A.dylib", EntryPoint = "objc_msgSend")]
     private static extern void SetVertexBufferNative(IntPtr receiver, IntPtr selector,
         IntPtr buffer, ulong offset, ulong index);
 
@@ -570,6 +662,28 @@ internal class MetalCommandBuffer : IRHICommandBuffer
         IntPtr buffer, ulong offset, ulong index);
 
     [System.Runtime.InteropServices.DllImport("/usr/lib/libobjc.A.dylib", EntryPoint = "objc_msgSend")]
+    private static extern void SetSamplerNative(IntPtr receiver, IntPtr selector,
+        IntPtr sampler, ulong index);
+
+    [System.Runtime.InteropServices.DllImport("/usr/lib/libobjc.A.dylib", EntryPoint = "objc_msgSend")]
+    private static extern void EncodeEventNative(IntPtr receiver, IntPtr selector,
+        IntPtr ev, ulong value);
+
+    /// <summary>M4b: signal cross-command-buffer dependency (before commit).</summary>
+    internal void EncodeSignalEvent(IntPtr ev, ulong value)
+    {
+        if (_renderEncoder != IntPtr.Zero || _computeEncoder != IntPtr.Zero)
+            throw new InvalidOperationException("EncodeSignalEvent must be called outside an encoder.");
+        EncodeEventNative(_commandBuffer, GetSelector("encodeSignalEvent:value:"), ev, value);
+    }
+
+    /// <summary>M4b: wait for a signal from another command buffer (before use).</summary>
+    internal void EncodeWaitEvent(IntPtr ev, ulong value)
+    {
+        if (_renderEncoder != IntPtr.Zero || _computeEncoder != IntPtr.Zero)
+            throw new InvalidOperationException("EncodeWaitEvent must be called outside an encoder.");
+        EncodeEventNative(_commandBuffer, GetSelector("encodeWaitForEvent:value:"), ev, value);
+    }    [System.Runtime.InteropServices.DllImport("/usr/lib/libobjc.A.dylib", EntryPoint = "objc_msgSend")]
     private static extern void SetBytesNative(IntPtr receiver, IntPtr selector, IntPtr bytes, ulong length, ulong index);
 
     [System.Runtime.InteropServices.DllImport("/usr/lib/libobjc.A.dylib", EntryPoint = "objc_msgSend")]
@@ -718,6 +832,8 @@ internal class MetalCommandBuffer : IRHICommandBuffer
             }
             IntPtr blit = objc_msgSend(_commandBuffer, GetSelector("blitCommandEncoder"));
             if (blit == IntPtr.Zero) { Console.WriteLine("[Screenshot] Blit encoder creation failed."); Release(staging); return IntPtr.Zero; }
+            // The encoder is autoreleased. Retain it so the Release below is balanced.
+            Retain(blit);
 
             var origin = new MTLOrigin { x = 0, y = 0, z = 0 };
             var size = new MTLSize { width = width, height = height, depth = 1 };
@@ -760,7 +876,7 @@ internal class MetalCommandBuffer : IRHICommandBuffer
             {
                 handle.Free();
             }
-            BlueSky.Rendering.Strata.StrataBenchmark.WriteBmp32(path, pixels, width, height);
+            BlueSky.BSR.Strata.StrataBenchmark.WriteBmp32(path, pixels, width, height);
             Console.WriteLine($"[Screenshot] Saved {path} ({width}x{height})");
         }
         catch (Exception ex)

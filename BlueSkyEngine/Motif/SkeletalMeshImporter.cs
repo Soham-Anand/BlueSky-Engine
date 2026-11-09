@@ -2,7 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Numerics;
-using BlueSky.Rendering.Strata;
+using BlueSky.BSR.Strata;
 
 namespace BlueSky.Motif;
 

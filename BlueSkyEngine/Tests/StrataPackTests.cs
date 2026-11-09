@@ -1,6 +1,6 @@
 using System;
 using System.Text;
-using BlueSky.Rendering.Strata;
+using BlueSky.BSR.Strata;
 
 namespace BlueSky.Tests;
 
@@ -424,7 +424,7 @@ public static class StrataPackTests
             bool mat = false;
             if (links)
             {
-                var m = BlueSky.Rendering.Strata.StrataMaterial.Load(link!);
+                var m = BlueSky.BSR.Strata.StrataMaterial.Load(link!);
                 mat = Math.Abs(m.Metallic - 0.5f) < 1e-6f
                     && Math.Abs(m.Roughness - 0.25f) < 1e-6f
                     && m.Textures.Count >= 2;
@@ -510,7 +510,7 @@ public static class StrataPackTests
             bool decodable = links.Count == 1;
             foreach (var link in links)
             {
-                var m = BlueSky.Rendering.Strata.StrataMaterial.Load(link);
+                var m = BlueSky.BSR.Strata.StrataMaterial.Load(link);
                 decodable &= m.Textures.Count == 1 && m.Payload.Length == 16;
             }
             // Mesh payload: [vLen][vData][iLen][iData][nSub][offset,count,slot]
@@ -632,14 +632,14 @@ public static class StrataPackTests
             pack.Header.Surfaces[0].Clearcoat = 1f;
             var decoded = StrataPack.Decode(StrataPack.Encode(pack));
             var surf = decoded.Header.Surfaces[0];
-            var mat = BlueSky.Rendering.Strata.StrataImporter.Assemble(
+            var mat = BlueSky.BSR.Strata.StrataImporter.Assemble(
                 "Coated", new System.Numerics.Vector3(0.5f, 0.5f, 0.5f),
                 0f, 0.5f, 1f, System.Numerics.Vector3.Zero, 0f,
                 clearcoat: surf.Clearcoat);
             var legacy = System.Text.Json.JsonSerializer.Deserialize<StrataPack.PackSurface>(
                 "{\"Slot\":0,\"Metallic\":0,\"Roughness\":0.6}");
             bool valid = Math.Abs(surf.Clearcoat - 1f) < 1e-6f
-                && mat.Features.HasFlag(BlueSky.Rendering.Strata.StrataFeature.Clearcoat)
+                && mat.Features.HasFlag(BlueSky.BSR.Strata.StrataFeature.Clearcoat)
                 && legacy != null && Math.Abs(legacy.Clearcoat) < 1e-6f;
             Console.WriteLine($"  ✓ Pack clearcoat survives (bit set, legacy defaults 0): {(valid ? "PASSED" : "FAILED")}");
             return valid;
@@ -661,14 +661,14 @@ public static class StrataPackTests
             pack.Header.Surfaces[0].Alpha = 0.15f;
             var decoded = StrataPack.Decode(StrataPack.Encode(pack));
             var surf = decoded.Header.Surfaces[0];
-            var mat = BlueSky.Rendering.Strata.StrataImporter.Assemble(
+            var mat = BlueSky.BSR.Strata.StrataImporter.Assemble(
                 "Glass", new System.Numerics.Vector3(0.1f, 0.1f, 0.12f),
                 0f, 0.05f, 1f, System.Numerics.Vector3.Zero, 0f,
                 alpha: surf.Alpha);
             var legacy = System.Text.Json.JsonSerializer.Deserialize<StrataPack.PackSurface>(
                 "{\"Slot\":0,\"Metallic\":0,\"Roughness\":0.6}");
             bool valid = Math.Abs(surf.Alpha - 0.15f) < 1e-6f
-                && mat.Features.HasFlag(BlueSky.Rendering.Strata.StrataFeature.Transparent)
+                && mat.Features.HasFlag(BlueSky.BSR.Strata.StrataFeature.Transparent)
                 && Math.Abs(mat.Alpha - 0.15f) < 1e-6f
                 && legacy != null && Math.Abs(legacy.Alpha - 1f) < 1e-6f;
             Console.WriteLine($"  ✓ Pack alpha survives (bit set, legacy defaults 1): {(valid ? "PASSED" : "FAILED")}");
@@ -691,14 +691,14 @@ public static class StrataPackTests
             pack.Header.Surfaces[0].Sheen = 1f;
             var decoded = StrataPack.Decode(StrataPack.Encode(pack));
             var surf = decoded.Header.Surfaces[0];
-            var mat = BlueSky.Rendering.Strata.StrataImporter.Assemble(
+            var mat = BlueSky.BSR.Strata.StrataImporter.Assemble(
                 "Cloth", new System.Numerics.Vector3(0.5f, 0.5f, 0.5f),
                 0f, 0.5f, 1f, System.Numerics.Vector3.Zero, 0f,
                 sheen: surf.Sheen);
             var legacy = System.Text.Json.JsonSerializer.Deserialize<StrataPack.PackSurface>(
                 "{\"Slot\":0,\"Metallic\":0,\"Roughness\":0.6}");
             bool valid = Math.Abs(surf.Sheen - 1f) < 1e-6f
-                && mat.Features.HasFlag(BlueSky.Rendering.Strata.StrataFeature.Sheen)
+                && mat.Features.HasFlag(BlueSky.BSR.Strata.StrataFeature.Sheen)
                 && legacy != null && Math.Abs(legacy.Sheen) < 1e-6f;
             Console.WriteLine($"  ✓ Pack sheen survives (bit set, legacy defaults 0): {(valid ? "PASSED" : "FAILED")}");
             return valid;
@@ -720,14 +720,14 @@ public static class StrataPackTests
             pack.Header.Surfaces[0].Anisotropy = 1f;
             var decoded = StrataPack.Decode(StrataPack.Encode(pack));
             var surf = decoded.Header.Surfaces[0];
-            var mat = BlueSky.Rendering.Strata.StrataImporter.Assemble(
+            var mat = BlueSky.BSR.Strata.StrataImporter.Assemble(
                 "Brushed", new System.Numerics.Vector3(0.5f, 0.5f, 0.5f),
                 1f, 0.4f, 1f, System.Numerics.Vector3.Zero, 0f,
                 anisotropy: surf.Anisotropy);
             var legacy = System.Text.Json.JsonSerializer.Deserialize<StrataPack.PackSurface>(
                 "{\"Slot\":0,\"Metallic\":0,\"Roughness\":0.6}");
             bool valid = Math.Abs(surf.Anisotropy - 1f) < 1e-6f
-                && mat.Features.HasFlag(BlueSky.Rendering.Strata.StrataFeature.Anisotropy)
+                && mat.Features.HasFlag(BlueSky.BSR.Strata.StrataFeature.Anisotropy)
                 && legacy != null && Math.Abs(legacy.Anisotropy) < 1e-6f;
             Console.WriteLine($"  ✓ Pack anisotropy survives (bit set, legacy defaults 0): {(valid ? "PASSED" : "FAILED")}");
             return valid;
@@ -937,8 +937,8 @@ public static class StrataPackTests
         var result = new BlueSky.Core.Assets.StratapackImportHandler().Import(packPath, asset, options);
         if (!result.Success || !asset.Metadata.TryGetValue("strataSlot0", out var link))
             return false;
-        var m = BlueSky.Rendering.Strata.StrataMaterial.Load(link);
-        return m.Features.HasFlag(BlueSky.Rendering.Strata.StrataFeature.BentNormal);
+        var m = BlueSky.BSR.Strata.StrataMaterial.Load(link);
+        return m.Features.HasFlag(BlueSky.BSR.Strata.StrataFeature.BentNormal);
     }
 
     private static bool TestDeadKeysRejected()

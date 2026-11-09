@@ -1,7 +1,7 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
 
-namespace BlueSky.Rendering.RHI.DirectX11;
+namespace BlueSky.BSR.RHI.DirectX11;
 
 /// <summary>
 /// DirectX 11 command buffer wrapping ID3D11DeviceContext (immediate context).
@@ -11,6 +11,7 @@ internal sealed class D3D11CommandBuffer : IRHICommandBuffer
 {
     private readonly IntPtr _context;  // ID3D11DeviceContext* (not owned)
     private readonly IntPtr _device;   // ID3D11Device* (not owned)
+    private readonly IntPtr _defaultSampler;
     private D3D11Pipeline? _currentPipeline;
 
     // Precomputed vtable function pointers — resolved ONCE at construction to detect corruption early
@@ -41,10 +42,11 @@ internal sealed class D3D11CommandBuffer : IRHICommandBuffer
     private readonly IntPtr _fnMap; // Map (slot 14)
     private readonly IntPtr _fnUnmap; // Unmap (slot 15)
 
-    internal D3D11CommandBuffer(IntPtr device, IntPtr context)
+    internal D3D11CommandBuffer(IntPtr device, IntPtr context, IntPtr defaultSampler)
     {
         _device = device;
         _context = context;
+        _defaultSampler = defaultSampler;
 
         // Resolve ALL vtable pointers upfront — if context or vtable is corrupt, we catch it here
         if (context != IntPtr.Zero)
@@ -211,6 +213,12 @@ internal sealed class D3D11CommandBuffer : IRHICommandBuffer
         }
     }
 
+    public void SetDepthBias(float constantBias, float slopeScale, float clamp)
+    {
+        // DX11 bias lives in the rasterizer desc at creation — dynamic path unwired.
+        throw new NotSupportedException("[DX11] SetDepthBias is not implemented yet.");
+    }
+
     // ── Resource binding ─────────────────────────────────────────────────
 
     public void SetVertexBuffer(IRHIBuffer buffer, uint binding = 0, ulong offset = 0)
@@ -336,6 +344,40 @@ internal sealed class D3D11CommandBuffer : IRHICommandBuffer
             IntPtr fnPtr = *((IntPtr*)vtable + 8);
             var fn = (delegate* unmanaged[Stdcall]<IntPtr, uint, uint, IntPtr*, void>)fnPtr;
             fn(_context, binding, 1, &srv);
+        }
+        // DX11 texture bindings do not include a sampler. Supply a shared
+        // linear clamp sampler so shader paths such as Vectra have deterministic
+        // filtering even before the editor UI has rendered in this frame.
+        SetSampler(_defaultSampler, 0);
+        if (binding == 1)
+            SetSampler(_defaultSampler, 1);
+    }
+
+    public void CopyTexture(IRHITexture source, IRHITexture destination)
+    {
+        if (source is not D3D11Texture src || destination is not D3D11Texture dst)
+            throw new ArgumentException("Textures must belong to the DirectX 11 device.");
+        if (src.Width != dst.Width || src.Height != dst.Height || src.Format != dst.Format)
+            throw new ArgumentException("CopyTexture requires matching dimensions and formats.");
+        if (!src.Usage.HasFlag(TextureUsage.TransferSrc) || !dst.Usage.HasFlag(TextureUsage.TransferDst))
+            throw new InvalidOperationException("CopyTexture requires TransferSrc and TransferDst usage.");
+        if (_context == IntPtr.Zero) return;
+
+        unsafe
+        {
+            IntPtr vtable = *(IntPtr*)_context;
+            // Unbind output attachments and pixel SRVs first; D3D11 rejects
+            // copies that overlap resources still bound to the pipeline.
+            var setTargets = (delegate* unmanaged[Stdcall]<IntPtr, uint, IntPtr*, IntPtr, void>)(*((IntPtr*)vtable + 33));
+            setTargets(_context, 0, null, IntPtr.Zero);
+
+            IntPtr* nullViews = stackalloc IntPtr[16];
+            new Span<IntPtr>(nullViews, 16).Clear();
+            var setResources = (delegate* unmanaged[Stdcall]<IntPtr, uint, uint, IntPtr*, void>)(*((IntPtr*)vtable + 8));
+            setResources(_context, 0, 16, nullViews);
+
+            var copyResource = (delegate* unmanaged[Stdcall]<IntPtr, IntPtr, IntPtr, void>)(*((IntPtr*)vtable + 47));
+            copyResource(_context, dst.NativeTexture, src.NativeTexture);
         }
     }
 
@@ -542,6 +584,13 @@ internal sealed class D3D11CommandBuffer : IRHICommandBuffer
             var vsSet = (delegate* unmanaged[Stdcall]<IntPtr, uint, uint, IntPtr*, void>)fnVS;
             vsSet(_context, slot, 1, &sampler);
         }
+    }
+
+    public void SetSampler(IRHISampler sampler, uint binding, uint set = 0)
+    {
+        if (sampler is not D3D11Sampler d3dSampler)
+            throw new ArgumentException("Sampler must be a DirectX 11 sampler");
+        SetSampler(d3dSampler.Handle, binding);
     }
 
     // ── Barriers ─────────────────────────────────────────────────────────

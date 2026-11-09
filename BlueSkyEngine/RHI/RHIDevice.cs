@@ -1,7 +1,7 @@
-using BlueSky.Platform;
-using BlueSky.Core.Platform.Detection;
+using BlueSky.Aegis;
+using BlueSky.Aegis.Detection;
 
-namespace BlueSky.Rendering.RHI;
+namespace BlueSky.BSR.RHI;
 
 public static class RHIDevice
 {

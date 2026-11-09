@@ -58,23 +58,9 @@ else
 fi
 
 # ============================================================================
-# Compile horizon_lighting.metal
-# ============================================================================
-echo "[3/3] Compiling horizon_lighting.metal..."
-if [ -f "horizon_lighting.metal" ]; then
-    xcrun -sdk macosx metal -c horizon_lighting.metal -o horizon_lighting.air
-    xcrun -sdk macosx metallib horizon_lighting.air -o horizon_lighting.metallib
-    rm -f horizon_lighting.air
-    echo "  ✓ horizon_lighting.metallib created"
-else
-    echo "  ✗ horizon_lighting.metal not found"
-    exit 1
-fi
-
-# ============================================================================
 # Compile PolarisUpscale.metal (AVX Ray Tracing edge-aware upscaler)
 # ============================================================================
-echo "[4/4] Compiling PolarisUpscale.metal..."
+echo "[3/3] Compiling PolarisUpscale.metal..."
 POLARIS_SRC="../../Rendering/Shaders/PolarisUpscale.metal"
 if [ -f "$POLARIS_SRC" ]; then
     xcrun -sdk macosx metal -c "$POLARIS_SRC" -o PolarisUpscale.air

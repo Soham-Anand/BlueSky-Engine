@@ -1,7 +1,7 @@
 using System;
 using System.Runtime.InteropServices;
 
-namespace BlueSky.Rendering.RHI;
+namespace BlueSky.BSR.RHI;
 
 public static class RHIDiscovery
 {

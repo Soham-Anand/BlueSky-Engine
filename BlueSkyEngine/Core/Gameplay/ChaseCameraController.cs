@@ -1,7 +1,7 @@
 using System;
 using System.Numerics;
-using BVec3 = BlueSky.Core.Math.Vector3;
-using BQuat = BlueSky.Core.Math.Quaternion;
+using BVec3 = BlueSky.Ramanujan.Vector3;
+using BQuat = BlueSky.Ramanujan.Quaternion;
 
 namespace BlueSky.Core.Gameplay
 {

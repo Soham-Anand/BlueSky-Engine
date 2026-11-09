@@ -1,7 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Numerics;
-using BlueSky.Rendering.Strata;
+using BlueSky.BSR.Strata;
 
 namespace BlueSky.Tests;
 

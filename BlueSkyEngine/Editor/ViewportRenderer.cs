@@ -1,4 +1,6 @@
 using System;
+using BlueSky.Ramanujan;
+using BlueSky.Airborne;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
@@ -7,11 +9,10 @@ using System.Numerics;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using System.Collections.Concurrent;
-using BlueSky.Rendering.RHI;
-using BlueSky.Rendering.RHI.DirectX11;
-using BlueSky.Core.ECS;
-using BlueSky.Core.ECS.Builtin;
-using BlueSky.Core.Math;
+using BlueSky.BSR.RHI;
+using BlueSky.BSR.RHI.DirectX11;
+using BlueSky.SkyCore;
+using BlueSky.SkyCore.Builtin;
 using BlueSky.Core.Gameplay;
 using BlueSky.Motif;
 
@@ -50,20 +51,6 @@ public sealed class ViewportRenderer : IDisposable
         public System.Numerics.Vector4 SunDirection; // 16 bytes (offset 352)
 
         public System.Numerics.Vector4 WindParams;   // 16 bytes (offset 368)
-    }
-    
-    // ── Horizon shader ViewUniforms (different structure for horizon_lighting.metal) ────────
-    [StructLayout(LayoutKind.Sequential)]
-    private struct HorizonViewUniforms
-    {
-        public System.Numerics.Matrix4x4 ViewProj;
-        public System.Numerics.Matrix4x4 View;
-        public System.Numerics.Matrix4x4 InvView;
-        public System.Numerics.Vector3   CameraPos;
-        public float     Time;
-        public System.Numerics.Vector2   ScreenSize;
-        public float     NearPlane;
-        public float     FarPlane;
     }
 
     // ── Entity uniform structure (model matrix + tint) ─────────────────────────
@@ -190,7 +177,7 @@ public sealed class ViewportRenderer : IDisposable
     }
 
     // ── Conversion helpers ───────────────────────────────────────────────
-    private static System.Numerics.Matrix4x4 ToSystemMatrix4x4(BlueSky.Core.Math.Matrix4x4 m)
+    private static System.Numerics.Matrix4x4 ToSystemMatrix4x4(BlueSky.Ramanujan.Matrix4x4 m)
     {
         return new System.Numerics.Matrix4x4(
             m.M11, m.M12, m.M13, m.M14,
@@ -230,6 +217,11 @@ public sealed class ViewportRenderer : IDisposable
         /// Used for centroid-based submesh→wheel mapping on static meshes.
         /// </summary>
         public System.Numerics.Vector3[]? RawVertexPositions;
+
+        /// <summary>
+        /// Tight local-space Axis-Aligned Bounding Box computed via RamanujanSimd on load.
+        /// </summary>
+        public BlueSky.Ramanujan.AABB LocalBounds = new(new BlueSky.Ramanujan.Vector3(-5f), new BlueSky.Ramanujan.Vector3(5f));
         
         public void Dispose()
         {
@@ -249,8 +241,10 @@ public sealed class ViewportRenderer : IDisposable
     // ── RHI resources ───────────────────────────────────────────────────
     private readonly IRHIDevice    _device;
     private readonly World         _world;
-    private readonly BlueSky.Rendering.TerrainSystem? _terrainSystem;
-    private readonly BlueSky.Rendering.TerrainRenderer _terrainRenderer;
+    private readonly BlueSky.BSR.TerrainSystem? _terrainSystem;
+    private readonly BlueSky.BSR.TerrainRenderer _terrainRenderer;
+    private readonly BlueSky.BSR.Vectra.VectraSystem? _vectraSystem;
+    private readonly BlueSky.BSR.Vectra.VectraRenderer? _vectraRenderer;
     private          IRHIPipeline? _skyPipeline;
     private          IRHIPipeline? _gridPipeline;
     private          IRHIPipeline? _meshPipeline;
@@ -258,34 +252,61 @@ public sealed class ViewportRenderer : IDisposable
     private          IRHIPipeline? _wireframePipeline;
     private          IRHIPipeline? _shadowPipeline;
     private          IRHITexture?  _shadowMap;
-    private          IRHIBuffer?   _uniformBuffer;
-    private          IRHIBuffer?   _entityUniformBuffer;
-    private          IRHIBuffer?   _instanceBuffer;
+    // M4b: per-frame dynamic buffers are ringed ×3 so frame N+1 CPU uploads
+    // never race in-flight frame N GPU reads. Same-name properties index the
+    // ring by _fi (set at PreRender/Render entry), so use sites are unchanged.
+    private const int FrameRing = 3;
+    private int _fi;
+    // Cached query descriptions — CreateQuery/Build per frame was pure waste
+    // (GetQueryChunks revalidates against the world on each call anyway).
+    private static readonly BlueSky.SkyCore.QueryDescription _meshQueryDesc =
+        new BlueSky.SkyCore.QueryBuilder()
+            .All<TransformComponent>()
+            .Any(typeof(BlueSky.SkyCore.Builtin.StaticMeshComponent), typeof(BlueSky.SkyCore.Builtin.SkeletalMeshComponent))
+            .Build();
+    private static readonly BlueSky.SkyCore.QueryDescription _lightQueryDesc =
+        new BlueSky.SkyCore.QueryBuilder()
+            .All<LightComponent>()
+            .Build();
+    private readonly IRHIBuffer?[] _uniformBufferRing = new IRHIBuffer?[3];
+    private IRHIBuffer? _uniformBuffer => _uniformBufferRing[_fi];
+    private readonly IRHIBuffer?[] _shadowUniformBufferRing = new IRHIBuffer?[3];
+    private IRHIBuffer? _shadowUniformBuffer => _shadowUniformBufferRing[_fi];
+    private readonly IRHIBuffer?[] _instanceBufferRing = new IRHIBuffer?[3];
+    private IRHIBuffer? _instanceBuffer => _instanceBufferRing[_fi];
     private          const int     MaxInstancesPerBatch = 64;
     // Per-frame instance buffer: large enough for ALL entities in the scene.
     // Uploaded ONCE per frame before any draw calls so every draw can read its
     // own unique slice via the firstInstance offset — eliminates the shared-
     // buffer aliasing bug where entities would snap to each other's position.
-    private          IRHIBuffer?   _frameInstanceBuffer;
+    private readonly IRHIBuffer?[] _frameInstanceBufferRing = new IRHIBuffer?[3];
+    private IRHIBuffer? _frameInstanceBuffer => _frameInstanceBufferRing[_fi];
     private const int MaxFrameInstances    = 256;  // DX11 HLSL entity array max (256 * 80 = 20480 bytes in cbuffer)
     private          int           _debugFrameCounter   = 0;
     
-    // Horizon Lighting buffers
-    private IRHIBuffer? _horizonViewUniformBuffer; // Separate buffer for Horizon shader
-    private IRHIBuffer? _lightBuffer;
-    private IRHIBuffer? _lightCountBuffer;
-    private IRHIBuffer? _lightSettingsBuffer;
-    private IRHIBuffer? _surfaceBuffer;
+    // Horizon Lighting buffers (live rings only — the dead HorizonView/Surface/
+    // EntityUB rings were removed: uploaded every frame, never bound)
+    private readonly IRHIBuffer?[] _lightBufferRing = new IRHIBuffer?[3];
+    private IRHIBuffer? _lightBuffer => _lightBufferRing[_fi];
+    private readonly IRHIBuffer?[] _lightCountBufferRing = new IRHIBuffer?[3];
+    private IRHIBuffer? _lightCountBuffer => _lightCountBufferRing[_fi];
+    private readonly IRHIBuffer?[] _lightSettingsBufferRing = new IRHIBuffer?[3];
+    private IRHIBuffer? _lightSettingsBuffer => _lightSettingsBufferRing[_fi];
 
     // ── Strata sky-captured IBL: 9 SH coeffs, recaptured when the sun moves ──
-    private IRHIBuffer? _shBuffer;
+    private readonly IRHIBuffer?[] _shBufferRing = new IRHIBuffer?[3];
+    private IRHIBuffer? _shBuffer => _shBufferRing[_fi];
     private System.Numerics.Vector3 _shSunDir = new(float.NaN);
     private float _shPreset = float.NaN;
     private IRHITexture? _gradeLut;
-    private IRHIBuffer? _skyParamsBuffer; // b17: SkyPreset float + padding
+    private readonly IRHIBuffer?[] _skyParamsBufferRing = new IRHIBuffer?[3];
+    private IRHIBuffer? _skyParamsBuffer => _skyParamsBufferRing[_fi]; // b17: SkyPreset float + padding
+    // Scene samplers (bound every batch — viewport_3d.metal takes [[sampler()]] now).
+    private IRHISampler? _linearSampler;
+    private IRHISampler? _shadowSampler;
     // ── Phase-B probes: pack path caches + active probe key ────────────────
     private readonly Dictionary<string, string> _meshPackCache = new();
-    private readonly Dictionary<string, System.Collections.Generic.List<BlueSky.Rendering.Strata.StrataPack.PackProbe>> _packProbeCache = new();
+    private readonly Dictionary<string, System.Collections.Generic.List<BlueSky.BSR.Strata.StrataPack.PackProbe>> _packProbeCache = new();
     private readonly Dictionary<string, System.Numerics.Vector3[]> _probeCoeffCache = new();
     private string _shProbeKey = "";
     private float _shParamsPreset = float.NaN;
@@ -297,8 +318,8 @@ public sealed class ViewportRenderer : IDisposable
 
     // ── Strata override (vehicle proof): when set, every mesh renders with ──
     // this material instead of the orange clay. Textures upload lazily once.
-    public BlueSky.Rendering.Strata.StrataMaterial? StrataOverride { get; set; }
-    private BlueSky.Rendering.Strata.StrataSurfaceUpload.SurfaceParams _strataParams;
+    public BlueSky.BSR.Strata.StrataMaterial? StrataOverride { get; set; }
+    private BlueSky.BSR.Strata.StrataSurfaceUpload.SurfaceParams _strataParams;
     private bool _strataReady;
     private string _strataReadyFor = "";
     private readonly Dictionary<string, IRHITexture> _strataTexCache = new(StringComparer.OrdinalIgnoreCase);
@@ -376,7 +397,8 @@ public sealed class ViewportRenderer : IDisposable
                 !header.Metadata.TryGetValue("skinSize", out var skinSizeS) ||
                 !header.Metadata.TryGetValue("skinCount", out var skinCountS) ||
                 !header.Metadata.TryGetValue("skeletonIndex", out var skelIdxS) ||
-                string.IsNullOrWhiteSpace(packPath) || !System.IO.File.Exists(packPath) ||
+                // A packaged build stores the pack path relative to its GameData folder, so resolve it first.
+                string.IsNullOrWhiteSpace(packPath) || !System.IO.File.Exists(packPath = BlueSky.Core.Assets.AssetPathResolver.Resolve(packPath)) ||
                 !ulong.TryParse(skinOffS, out ulong skinOff) ||
                 !ulong.TryParse(skinSizeS, out ulong skinSize) ||
                 !int.TryParse(skinCountS, out int skinCount) ||
@@ -384,13 +406,13 @@ public sealed class ViewportRenderer : IDisposable
                 gpuData.RawIndices == null || gpuData.Submeshes == null)
                 return null;
             var (packHeader, payloadBase) =
-                BlueSky.Rendering.Strata.StrataPack.DecodeHeader(packPath);
+                BlueSky.BSR.Strata.StrataPack.DecodeHeader(packPath);
             if (skelIdx < 0 || skelIdx >= packHeader.Skeletons.Count)
                 return null;
             var skel = packHeader.Skeletons[skelIdx];
             if (skel == null || skel.Bones.Count == 0)
                 return null;
-            int stride = BlueSky.Rendering.Strata.StrataPack.SkinStride;
+            int stride = BlueSky.BSR.Strata.StrataPack.SkinStride;
             if (skinCount <= 0 || skinSize != (ulong)skinCount * (ulong)stride)
                 return null;
             byte[] skin = new byte[skinSize];
@@ -458,7 +480,8 @@ public sealed class ViewportRenderer : IDisposable
 
     // ── Gizmo resources ─────────────────────────────────────────────────
     private          IRHIPipeline? _gizmoPipeline;
-    private          IRHIBuffer?[] _gizmoUniformBuffers = new IRHIBuffer?[5];
+    private          IRHIBuffer?[] _gizmoUniformBufferRing = new IRHIBuffer?[15]; // M4b: 5 slots × 3 frames
+    private          IRHIBuffer?   GizmoUB(int i) => _gizmoUniformBufferRing[_fi * 5 + i];
     private          IRHIBuffer?   _gizmoArrowVB;
     private          IRHIBuffer?   _gizmoArrowIB;
     private          int           _gizmoArrowIndexCount;
@@ -471,7 +494,8 @@ public sealed class ViewportRenderer : IDisposable
     public          int           HoveredAxis = -1; // 0=X, 1=Y, 2=Z, 3=Center
     private          bool          _gizmoGeometryCreated;
     internal          List<DebugShape> _physicsDebugShapes = new();
-    private          IRHIBuffer?   _hullLineVB;
+    private          IRHIBuffer?[] _hullLineVBRing = new IRHIBuffer?[3]; // M4b: ringed
+    private          IRHIBuffer?   _hullLineVB => _hullLineVBRing[_fi];
     private          int           _hullLineVertexCapacity;
     private          IRHIBuffer?   _gizmoCapsuleVB;
     private          IRHIBuffer?   _gizmoCapsuleIB;
@@ -485,14 +509,19 @@ public sealed class ViewportRenderer : IDisposable
     private readonly TextureFormat _colorFormat;
     private readonly bool _showEditorGizmos;
 
-    public ViewportRenderer(IRHIDevice device, World world, BlueSky.Rendering.TerrainSystem? terrainSystem = null, TextureFormat colorFormat = TextureFormat.RGBA8Unorm, bool showEditorGizmos = true)
+    public ViewportRenderer(IRHIDevice device, World world, BlueSky.BSR.TerrainSystem? terrainSystem = null, TextureFormat colorFormat = TextureFormat.RGBA8Unorm, bool showEditorGizmos = true, BlueSky.BSR.Vectra.VectraSystem? vectraSystem = null)
     {
         _device = device;
         _showEditorGizmos = showEditorGizmos;
         _world = world;
         _terrainSystem = terrainSystem;
+        _vectraSystem = vectraSystem;
         _colorFormat = colorFormat;
-        _terrainRenderer = new BlueSky.Rendering.TerrainRenderer(device);
+        _terrainRenderer = new BlueSky.BSR.TerrainRenderer(device);
+        // Particle resources are only allocated for viewports that own a
+        // Vectra system; asset and preview viewports otherwise pay no smoke cost.
+        if (_vectraSystem != null)
+            _vectraRenderer = new BlueSky.BSR.Vectra.VectraRenderer(device, MakeShader, _colorFormat);
         CreatePipelines();
         CreateBuffers();
         CreateDefaultTextures();
@@ -523,30 +552,26 @@ public sealed class ViewportRenderer : IDisposable
     /// </summary>
     private void CleanupCorruptedMeshes()
     {
-        var query = _world.CreateQuery()
-            .All<TransformComponent>()
-            .Any(typeof(BlueSky.Core.ECS.Builtin.StaticMeshComponent), typeof(BlueSky.Core.ECS.Builtin.SkeletalMeshComponent))
-            .Build();
-        var chunks = _world.GetQueryChunks(query);
+        var chunks = _world.GetQueryChunks(_meshQueryDesc);
         var entitiesToRemove = new List<Entity>();
         
         foreach (var chunk in chunks)
         {
-            int staticMeshIndex = chunk.GetComponentIndex(typeof(BlueSky.Core.ECS.Builtin.StaticMeshComponent));
-            int skeletalMeshIndex = chunk.GetComponentIndex(typeof(BlueSky.Core.ECS.Builtin.SkeletalMeshComponent));
+            int staticMeshIndex = chunk.GetComponentIndex(typeof(BlueSky.SkyCore.Builtin.StaticMeshComponent));
+            int skeletalMeshIndex = chunk.GetComponentIndex(typeof(BlueSky.SkyCore.Builtin.SkeletalMeshComponent));
             var entities = chunk.GetEntities();
             
             for (int i = 0; i < chunk.Count; i++)
             {
                 string meshId = "";
-                if (staticMeshIndex >= 0 && chunk.Archetype.HasComponent(typeof(BlueSky.Core.ECS.Builtin.StaticMeshComponent)))
+                if (staticMeshIndex >= 0 && chunk.Archetype.HasComponent(typeof(BlueSky.SkyCore.Builtin.StaticMeshComponent)))
                 {
-                    var staticMesh = chunk.GetComponent<BlueSky.Core.ECS.Builtin.StaticMeshComponent>(i, staticMeshIndex);
+                    var staticMesh = chunk.GetComponent<BlueSky.SkyCore.Builtin.StaticMeshComponent>(i, staticMeshIndex);
                     meshId = staticMesh.MeshAssetId;
                 }
-                else if (skeletalMeshIndex >= 0 && chunk.Archetype.HasComponent(typeof(BlueSky.Core.ECS.Builtin.SkeletalMeshComponent)))
+                else if (skeletalMeshIndex >= 0 && chunk.Archetype.HasComponent(typeof(BlueSky.SkyCore.Builtin.SkeletalMeshComponent)))
                 {
-                    var skeletalMesh = chunk.GetComponent<BlueSky.Core.ECS.Builtin.SkeletalMeshComponent>(i, skeletalMeshIndex);
+                    var skeletalMesh = chunk.GetComponent<BlueSky.SkyCore.Builtin.SkeletalMeshComponent>(i, skeletalMeshIndex);
                     meshId = skeletalMesh.MeshAssetPath;
                 }
                 
@@ -753,7 +778,7 @@ public sealed class ViewportRenderer : IDisposable
             DebugName = asset.AssetName
         });
         _device.UploadTexture(tex, data);
-        BlueSky.Rendering.Strata.StrataBenchmark.RecordTextureBytes(data.Length);
+        BlueSky.BSR.Strata.StrataBenchmark.RecordTextureBytes(data.Length);
         
         return tex;
     }
@@ -781,7 +806,7 @@ public sealed class ViewportRenderer : IDisposable
             DebugName = System.IO.Path.GetFileNameWithoutExtension(path)
         });
         _device.UploadTexture(tex, image.Data);
-        BlueSky.Rendering.Strata.StrataBenchmark.RecordTextureBytes(image.Data.Length);
+        BlueSky.BSR.Strata.StrataBenchmark.RecordTextureBytes(image.Data.Length);
         return tex;
     }
 
@@ -801,7 +826,9 @@ public sealed class ViewportRenderer : IDisposable
         if (_strataReady && _strataReadyFor == mat.Name)
             return true;
 
-        _strataParams = BlueSky.Rendering.Strata.StrataSurfaceUpload.BuildParams(mat);
+        _strataParams = BlueSky.BSR.Strata.StrataSurfaceUpload.BuildParams(mat);
+        // In-flight frames may sample the old override textures — drain first.
+        DrainMetalFlight();
         foreach (var kv in _strataTexCache)
             kv.Value?.Dispose();
         _strataTexCache.Clear();
@@ -824,7 +851,7 @@ public sealed class ViewportRenderer : IDisposable
                 Depth = 1,
                 MipLevels = 1,
                 ArrayLayers = 1,
-                Format = tex.Colorspace == BlueSky.Rendering.Strata.StrataColorspace.Srgb
+                Format = tex.Colorspace == BlueSky.BSR.Strata.StrataColorspace.Srgb
                     ? TextureFormat.RGBA8Srgb : TextureFormat.RGBA8Unorm,
                 Usage = TextureUsage.Sampled | TextureUsage.TransferDst,
                 DebugName = $"Strata_{mat.Name}_{tex.Slot}"
@@ -869,7 +896,7 @@ public sealed class ViewportRenderer : IDisposable
     }
 
     // ── Per-file .stratamat cache (mesh slot assignment) ────────────────────
-    private readonly Dictionary<string, (BlueSky.Rendering.Strata.StrataSurfaceUpload.SurfaceParams Params,
+    private readonly Dictionary<string, (BlueSky.BSR.Strata.StrataSurfaceUpload.SurfaceParams Params,
         Dictionary<string, IRHITexture> Texs)> _strataFileCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _strataFailLogged = new();
     private readonly HashSet<string> _strataMissingLogged = new();
@@ -884,8 +911,9 @@ public sealed class ViewportRenderer : IDisposable
             return true;
         try
         {
-            var mat = BlueSky.Rendering.Strata.StrataMaterial.Load(path);
-            var pars = BlueSky.Rendering.Strata.StrataSurfaceUpload.BuildParams(mat);
+            string resolvedPath = BlueSky.Core.Assets.AssetPathResolver.Resolve(path);
+            var mat = BlueSky.BSR.Strata.StrataMaterial.Load(resolvedPath);
+            var pars = BlueSky.BSR.Strata.StrataSurfaceUpload.BuildParams(mat);
             var texs = new Dictionary<string, IRHITexture>(StringComparer.OrdinalIgnoreCase);
             foreach (var tex in mat.Textures)
             {
@@ -894,17 +922,30 @@ public sealed class ViewportRenderer : IDisposable
                     continue;
                 var bytes = new byte[size];
                 Buffer.BlockCopy(mat.Payload, off, bytes, 0, size);
+                // M5: mip chains on Metal (shader already samples linear-mip) —
+                // capped at 6 levels to bound the +33% memory cost. Others stay
+                // single-level until their GenerateMipmaps paths are built.
+                uint levels = 1;
+                if (_device.Backend == RHIBackend.Metal)
+                {
+                    uint maxDim = (uint)Math.Max(1, Math.Max(tex.Width, tex.Height));
+                    levels = 1;
+                    while (levels < 6 && (maxDim >> (int)levels) >= 8)
+                        levels++;
+                }
                 var gpu = _device.CreateTexture(new TextureDesc
                 {
                     Width = (uint)Math.Max(1, tex.Width),
                     Height = (uint)Math.Max(1, tex.Height),
-                    Depth = 1, MipLevels = 1, ArrayLayers = 1,
-                    Format = tex.Colorspace == BlueSky.Rendering.Strata.StrataColorspace.Srgb
+                    Depth = 1, MipLevels = levels, ArrayLayers = 1,
+                    Format = tex.Colorspace == BlueSky.BSR.Strata.StrataColorspace.Srgb
                         ? TextureFormat.RGBA8Srgb : TextureFormat.RGBA8Unorm,
                     Usage = TextureUsage.Sampled | TextureUsage.TransferDst,
                     DebugName = $"StrataFile_{mat.Name}_{tex.Slot}"
                 });
                 _device.UploadTexture(gpu, bytes);
+                if (levels > 1)
+                    _device.GenerateMipmaps(gpu);
                 texs[tex.Slot] = gpu;
             }
             _strataFileCache[path] = (pars, texs);
@@ -919,6 +960,7 @@ public sealed class ViewportRenderer : IDisposable
     }
     public void InvalidateTexture(string path)
     {
+        DrainMetalFlight(); // disposes below may free in-flight sampled textures
         var toRemove = new System.Collections.Generic.List<(string Path, bool Srgb)>();
         foreach (var kv in _textureCache)
         {
@@ -938,6 +980,7 @@ public sealed class ViewportRenderer : IDisposable
     /// </summary>
     public void InvalidateAssetDirectory(string assetDir)
     {
+        DrainMetalFlight(); // disposes below may free in-flight sampled textures/buffers
         // Evict textures (cache keys are path + sRGB flag)
         var texKeys = new System.Collections.Generic.List<(string Path, bool Srgb)>(
             System.Linq.Enumerable.Where(_textureCache.Keys,
@@ -967,66 +1010,145 @@ public sealed class ViewportRenderer : IDisposable
     {
         if (string.IsNullOrEmpty(meshAssetId)) return;
         if (!_meshCache.TryGetValue(meshAssetId, out var gpu)) return;
+        DrainMetalFlight();
         gpu.Dispose();
         _meshCache.Remove(meshAssetId);
     }
 
+    // ── M4b: frame-slot helpers ──────────────────────────────────────────
+    private int CurrentMetalFrame()
+    {
+        var inner = (_device as BlueSky.BSR.RHI.IRHIWrapped<BlueSky.BSR.RHI.IRHIDevice>)?.Inner;
+        if (inner is BlueSky.BSR.RHI.Metal.MetalDevice metal)
+            return metal.FrameIndex;
+        return 0;
+    }
+
+    private void DrainMetalFlight()
+    {
+        var inner = (_device as BlueSky.BSR.RHI.IRHIWrapped<BlueSky.BSR.RHI.IRHIDevice>)?.Inner;
+        (inner as BlueSky.BSR.RHI.Metal.MetalDevice)?.DrainPending();
+    }
+
     // ── Public API ──────────────────────────────────────────────────────
 
-    public void PreRender(IRHICommandBuffer cmd, System.Numerics.Vector3 sunDir)
-    {
-        // Compute Light space bounds
-        var lightProj = System.Numerics.Matrix4x4.CreateOrthographicOffCenter(-20, 20, -20, 20, 0.1f, 100f);
-        var lightView = System.Numerics.Matrix4x4.CreateLookAt(-sunDir * 30f, System.Numerics.Vector3.Zero, System.Numerics.Vector3.UnitY);
-        var lightViewProj = lightView * lightProj;
+    private System.Numerics.Vector3 _lastCameraPos;
+    private int _shadowMapResolution = 2048;
 
+    /// <summary>
+    /// Computes a camera-following, texel-snapped directional light View*Projection matrix.
+    /// Snapping the light-space origin to exact shadow-map texel steps prevents sub-texel
+    /// shadow edge shimmering/swimming when the camera moves while keeping high-density
+    /// shadows centered around the player anywhere in the world.
+    /// </summary>
+    public static System.Numerics.Matrix4x4 ComputeLightSpaceMatrix(
+        System.Numerics.Vector3 sunDir,
+        System.Numerics.Vector3 cameraPos,
+        int shadowResolution = 2048,
+        float orthoExtent = 32f)
+    {
+        var dir = sunDir.LengthSquared() > 1e-6f
+            ? System.Numerics.Vector3.Normalize(sunDir)
+            : System.Numerics.Vector3.Normalize(new System.Numerics.Vector3(0.3f, 0.7f, 0.4f));
+
+        var up = MathF.Abs(dir.Y) > 0.99f ? System.Numerics.Vector3.UnitZ : System.Numerics.Vector3.UnitY;
+
+        // Build canonical light view basis at world origin first so rotation never changes with camera pos
+        var baseLightView = System.Numerics.Matrix4x4.CreateLookAt(dir * 45f, System.Numerics.Vector3.Zero, up);
+
+        // Anchor shadow frustum around camera XZ ground projection
+        var anchorWorld = new System.Numerics.Vector3(cameraPos.X, 0f, cameraPos.Z);
+        var anchorLightSpace = System.Numerics.Vector3.Transform(anchorWorld, baseLightView);
+
+        // Snap light-space X and Y to exact shadow map texel increments
+        float worldUnitsPerTexel = (orthoExtent * 2f) / Math.Max(1, shadowResolution);
+        float snappedX = MathF.Floor(anchorLightSpace.X / worldUnitsPerTexel) * worldUnitsPerTexel;
+        float snappedY = MathF.Floor(anchorLightSpace.Y / worldUnitsPerTexel) * worldUnitsPerTexel;
+
+        var lightProj = System.Numerics.Matrix4x4.CreateOrthographicOffCenter(
+            snappedX - orthoExtent,
+            snappedX + orthoExtent,
+            snappedY - orthoExtent,
+            snappedY + orthoExtent,
+            0.1f,
+            120f);
+
+        return baseLightView * lightProj;
+    }
+
+    public void PreRender(IRHICommandBuffer cmd, System.Numerics.Vector3 sunDir)
+        => PreRender(cmd, sunDir, _lastCameraPos);
+
+    public void PreRender(IRHICommandBuffer cmd, System.Numerics.Vector3 sunDir, System.Numerics.Vector3 cameraPos)
+    {
+        _fi = CurrentMetalFrame(); // M4b: select this frame's buffer ring
+        _lastCameraPos = cameraPos;
+
+        var effectiveSunDir = BlueSky.Meridian.GlobalEnvironment.SunDirection;
+        if (effectiveSunDir.LengthSquared() <= 1e-6f)
+            effectiveSunDir = sunDir;
+
+        var lightViewProj = ComputeLightSpaceMatrix(effectiveSunDir, cameraPos, _shadowMapResolution);
+
+        Span<System.Numerics.Vector4> shadowFrustumPlanes = stackalloc System.Numerics.Vector4[6];
+        ExtractFrustumPlanes(lightViewProj, shadowFrustumPlanes);
+
+        uint shadowRes = (uint)_shadowMapResolution;
         cmd.BeginRenderPass(Array.Empty<IRHITexture>(), _shadowMap, ClearValue.FromDepth(1.0f));
-        cmd.SetViewport(new Viewport { X = 0, Y = 0, Width = 2048, Height = 2048, MinDepth = 0, MaxDepth = 1 });
-        cmd.SetScissor(new Scissor { X = 0, Y = 0, Width = 2048, Height = 2048 });
+        cmd.SetViewport(new Viewport { X = 0, Y = 0, Width = shadowRes, Height = shadowRes, MinDepth = 0, MaxDepth = 1 });
+        cmd.SetScissor(new Scissor { X = 0, Y = 0, Width = shadowRes, Height = shadowRes });
         
         cmd.SetPipeline(_shadowPipeline!);
+
+        // Shadow-acne fix: slope-scaled depth bias on casters. Curved/crevice
+        // geometry (wheels, interiors) shimmers without it; flat paint does not.
+        if (_device.Backend == RHIBackend.Metal)
+            cmd.SetDepthBias(0.0002f, 2.0f, 0.0f);
         
         var shadowUniforms = new ShadowUniforms
         {
             LightSpaceMatrix = lightViewProj
         };
         var shadowUniformSpan = MemoryMarshal.CreateSpan(ref shadowUniforms, 1);
-        _device.UpdateBuffer(_uniformBuffer!, MemoryMarshal.AsBytes(shadowUniformSpan));
-        cmd.SetUniformBuffer(_uniformBuffer!, 10); // LightSpaceMatrix at slot 10
+        _device.UpdateBuffer(_shadowUniformBuffer!, MemoryMarshal.AsBytes(shadowUniformSpan));
+        cmd.SetUniformBuffer(_shadowUniformBuffer!, 10); // LightSpaceMatrix at slot 10 (dedicated ring so Render() never overwrites it before GPU execution)
 
-        var query = _world.CreateQuery()
-            .All<TransformComponent>()
-            .Any(typeof(BlueSky.Core.ECS.Builtin.StaticMeshComponent), typeof(BlueSky.Core.ECS.Builtin.SkeletalMeshComponent))
-            .Build();
-        var chunks = _world.GetQueryChunks(query);
+        var chunks = _world.GetQueryChunks(_meshQueryDesc);
         
-        var shadowItems = new System.Collections.Generic.List<(MeshGPUData GpuData, SubmeshInfo Submesh, BlueSky.Core.Math.Matrix4x4 ModelMatrix)>();
+        var shadowItems = _shadowItemsCache;
+        shadowItems.Clear();
 
         foreach (var chunk in chunks)
         {
             int transformIndex = chunk.GetComponentIndex(typeof(TransformComponent));
-            int staticMeshIndex = chunk.GetComponentIndex(typeof(BlueSky.Core.ECS.Builtin.StaticMeshComponent));
-            int skeletalMeshIndex = chunk.GetComponentIndex(typeof(BlueSky.Core.ECS.Builtin.SkeletalMeshComponent));
+            int staticMeshIndex = chunk.GetComponentIndex(typeof(BlueSky.SkyCore.Builtin.StaticMeshComponent));
+            int skeletalMeshIndex = chunk.GetComponentIndex(typeof(BlueSky.SkyCore.Builtin.SkeletalMeshComponent));
             for (int i = 0; i < chunk.Count; i++)
             {
                 var transform = chunk.GetComponent<TransformComponent>(i, transformIndex);
                 
-                bool hasSkeletal = skeletalMeshIndex >= 0 && chunk.Archetype.HasComponent(typeof(BlueSky.Core.ECS.Builtin.SkeletalMeshComponent));
-                bool hasStatic = staticMeshIndex >= 0 && chunk.Archetype.HasComponent(typeof(BlueSky.Core.ECS.Builtin.StaticMeshComponent));
+                bool hasSkeletal = skeletalMeshIndex >= 0 && chunk.Archetype.HasComponent(typeof(BlueSky.SkyCore.Builtin.SkeletalMeshComponent));
+                bool hasStatic = staticMeshIndex >= 0 && chunk.Archetype.HasComponent(typeof(BlueSky.SkyCore.Builtin.StaticMeshComponent));
 
                 string assetId = "";
                 if (hasSkeletal)
                 {
-                    var skeletalMesh = chunk.GetComponent<BlueSky.Core.ECS.Builtin.SkeletalMeshComponent>(i, skeletalMeshIndex);
+                    var skeletalMesh = chunk.GetComponent<BlueSky.SkyCore.Builtin.SkeletalMeshComponent>(i, skeletalMeshIndex);
                     assetId = skeletalMesh.MeshAssetPath;
                 }
                 else if (hasStatic)
                 {
-                    var staticMesh = chunk.GetComponent<BlueSky.Core.ECS.Builtin.StaticMeshComponent>(i, staticMeshIndex);
+                    var staticMesh = chunk.GetComponent<BlueSky.SkyCore.Builtin.StaticMeshComponent>(i, skeletalMeshIndex >= 0 && !hasStatic ? skeletalMeshIndex : staticMeshIndex);
                     assetId = staticMesh.MeshAssetId;
                 }
 
                 if (string.IsNullOrEmpty(assetId) || !_meshCache.TryGetValue(assetId, out var gpuData)) continue;
+
+                // Shadow-frustum AABB culling via Ramanujan AABB.Transform
+                var baseModelMatrix = transform.WorldMatrix;
+                var worldShadowBounds = gpuData.LocalBounds.Transform(baseModelMatrix);
+                if (!IsAABBFrustumVisible(worldShadowBounds, shadowFrustumPlanes))
+                    continue;
                 
                 // Ensure submeshes list is initialized
                 if (gpuData.Submeshes == null || gpuData.Submeshes.Count == 0)
@@ -1038,7 +1160,7 @@ public sealed class ViewportRenderer : IDisposable
                 }
 
                 uint entityId = (uint)chunk.GetEntities()[i].Id;
-                var carController = BlueSky.Core.Gameplay.CarControllerSystem.GetController(entityId);
+                var carController = BlueSky.Airborne.CarControllerSystem.GetController(entityId);
 
                 for (int submeshIdx = 0; submeshIdx < gpuData.Submeshes.Count; submeshIdx++)
                 {
@@ -1051,10 +1173,10 @@ public sealed class ViewportRenderer : IDisposable
                     if (shadowStrata != null && EnsureStrataFile(shadowStrata) &&
                         _strataFileCache.TryGetValue(shadowStrata, out var shadowFile) &&
                         (shadowFile.Params.FeatureMask &
-                            (uint)BlueSky.Rendering.Strata.StrataFeature.Transparent) != 0)
+                            (uint)BlueSky.BSR.Strata.StrataFeature.Transparent) != 0)
                         continue;
 
-                    var modelMatrix = transform.WorldMatrix;
+                    var modelMatrix = baseModelMatrix;
 
                     if (carController != null)
                     {
@@ -1072,8 +1194,11 @@ public sealed class ViewportRenderer : IDisposable
             // FIX: Same shared-buffer aliasing bug as the main pass.
             // Build a local shadow instance list, upload once, then use per-item
             // InstanceIndex as firstInstance in DrawIndexed.
-            var shadowInstances = new List<EntityUniforms>(shadowItems.Count);
-            var shadowIndices   = new int[shadowItems.Count];
+            var shadowInstances = _shadowInstancesCache;
+            shadowInstances.Clear();
+            if (_shadowIndexCache.Length < shadowItems.Count)
+                _shadowIndexCache = new int[shadowItems.Count];
+            var shadowIndices = _shadowIndexCache;
             for (int si = 0; si < shadowItems.Count; si++)
             {
                 shadowIndices[si] = shadowInstances.Count;
@@ -1090,8 +1215,33 @@ public sealed class ViewportRenderer : IDisposable
             // and using firstInstance = shadowIndices[idx], we rebind a tiny per-draw
             // instance buffer holding ONLY this item's transform, and draw with
             // firstInstance = 0. The shadow VS reads EntityUniforms[SV_InstanceID].
-            foreach (var (item, idx) in shadowItems.Select((it, ix) => (it, ix)))
+            // M3: on Metal, firstInstance is honored — upload once, draw each
+            // item with firstInstance = slot (one UpdateBuffer per frame instead
+            // of one per caster). Other backends keep the per-draw rebind
+            // (FL10.1 ignores FirstInstance; see comment below).
+            var shadowInner = (cmd as BlueSky.BSR.RHI.IRHIWrapped<BlueSky.BSR.RHI.IRHICommandBuffer>)?.Inner ?? cmd;
+            bool shadowMetalInstancing = shadowInner is BlueSky.BSR.RHI.Metal.MetalCommandBuffer
+                && _instanceBuffer != null && shadowInstances.Count > 0;
+            if (shadowMetalInstancing)
             {
+                var allShadow = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(shadowInstances);
+                _device.UpdateBuffer(_instanceBuffer!, MemoryMarshal.AsBytes(allShadow));
+                cmd.SetUniformBuffer(_instanceBuffer!, 12);
+                // Indexed for — the LINQ Select+tuple form allocated per caster.
+                for (int idx = 0; idx < shadowItems.Count; idx++)
+                {
+                    var item = shadowItems[idx];
+                    int slot = shadowIndices[idx];
+                    if (slot >= shadowInstances.Count) continue;
+                    cmd.SetVertexBuffer(item.GpuData.VertexBuffer!, 0);
+                    cmd.SetIndexBuffer(item.GpuData.IndexBuffer!, IndexType.UInt32);
+                    BlueSky.BSR.Strata.StrataBenchmark.RecordShadowDraw();
+                    cmd.DrawIndexed((uint)item.Submesh.IndexCount, 1, (uint)item.Submesh.IndexOffset, 0, (uint)slot);
+                }
+            }
+            else for (int idx = 0; idx < shadowItems.Count; idx++)
+            {
+                var item = shadowItems[idx];
                 int slot = shadowIndices[idx];
                 if (_instanceBuffer != null && slot < shadowInstances.Count)
                 {
@@ -1103,7 +1253,7 @@ public sealed class ViewportRenderer : IDisposable
 
                 cmd.SetVertexBuffer(item.GpuData.VertexBuffer!, 0);
                 cmd.SetIndexBuffer(item.GpuData.IndexBuffer!, IndexType.UInt32);
-                BlueSky.Rendering.Strata.StrataBenchmark.RecordShadowDraw();
+                BlueSky.BSR.Strata.StrataBenchmark.RecordShadowDraw();
 
                 cmd.DrawIndexed((uint)item.Submesh.IndexCount, 1, (uint)item.Submesh.IndexOffset, 0, 0);
             }
@@ -1117,7 +1267,7 @@ public sealed class ViewportRenderer : IDisposable
     /// <summary>Uploads 9 SH coeffs to the b16 probe buffer.</summary>
     private void UploadShCoeffs(System.Numerics.Vector3[] coeffs)
     {
-        if (_shBuffer == null || coeffs == null || coeffs.Length < 9)
+        if (_shBufferRing[_fi] == null || coeffs == null || coeffs.Length < 9)
             return;
         var shBytes = new byte[9 * 16];
         for (int i = 0; i < 9; i++)
@@ -1127,7 +1277,11 @@ public sealed class ViewportRenderer : IDisposable
             Buffer.BlockCopy(BitConverter.GetBytes(coeffs[i].Z), 0, shBytes, i * 16 + 8, 4);
             Buffer.BlockCopy(BitConverter.GetBytes(1f), 0, shBytes, i * 16 + 12, 4);
         }
-        _device.UpdateBuffer(_shBuffer, shBytes);
+        // Flicker fix: this upload fires only when sun/preset/probe changes,
+        // but binds rotate across all 3 ring slots — write every slot so the
+        // two un-uploaded frames never bind stale/zero SH (Lit/Env flashing).
+        for (int r = 0; r < FrameRing; r++)
+            _device.UpdateBuffer(_shBufferRing[r]!, shBytes);
     }
 
     /// <summary>
@@ -1141,7 +1295,7 @@ public sealed class ViewportRenderer : IDisposable
     {
         coeffs = null;
         var keys = new System.Collections.Generic.List<string>();
-        var flat = new System.Collections.Generic.List<BlueSky.Rendering.Strata.StrataPack.PackProbe>();
+        var flat = new System.Collections.Generic.List<BlueSky.BSR.Strata.StrataPack.PackProbe>();
         foreach (var assetId in _meshCache.Keys)
         {
             if (!_meshPackCache.TryGetValue(assetId, out var packPath))
@@ -1152,7 +1306,7 @@ public sealed class ViewportRenderer : IDisposable
                     var h = BlueSky.Core.Assets.BlueAsset.LoadHeader(assetId);
                     if (h != null && h.Metadata.TryGetValue("sourcePack", out var sp) &&
                         !string.IsNullOrWhiteSpace(sp))
-                        packPath = sp;
+                        packPath = BlueSky.Core.Assets.AssetPathResolver.Resolve(sp); // relative inside a packaged build
                 }
                 catch { }
                 _meshPackCache[assetId] = packPath;
@@ -1161,10 +1315,10 @@ public sealed class ViewportRenderer : IDisposable
                 continue;
             if (!_packProbeCache.TryGetValue(packPath, out var probes))
             {
-                probes = new System.Collections.Generic.List<BlueSky.Rendering.Strata.StrataPack.PackProbe>();
+                probes = new System.Collections.Generic.List<BlueSky.BSR.Strata.StrataPack.PackProbe>();
                 try
                 {
-                    var decoded = BlueSky.Rendering.Strata.StrataPack.DecodeHeader(packPath);
+                    var decoded = BlueSky.BSR.Strata.StrataPack.DecodeHeader(packPath);
                     if (decoded.Header.Probes != null)
                         probes.AddRange(decoded.Header.Probes);
                 }
@@ -1179,7 +1333,7 @@ public sealed class ViewportRenderer : IDisposable
         }
         if (flat.Count == 0)
             return "";
-        int sel = BlueSky.Rendering.Strata.StrataSkyProbe.SelectProbe(flat, cameraPos);
+        int sel = BlueSky.BSR.Strata.StrataSkyProbe.SelectProbe(flat, cameraPos);
         if (sel < 0)
             return "";
         string key = keys[sel];
@@ -1187,7 +1341,7 @@ public sealed class ViewportRenderer : IDisposable
         if (!_probeCoeffCache.TryGetValue(key, out var c))
         {
             int n = pr.SampleDirs.Length / 3;
-            c = BlueSky.Rendering.Strata.StrataSkyProbe.ProjectSamples(pr.SampleDirs, pr.SampleColors, n);
+            c = BlueSky.BSR.Strata.StrataSkyProbe.ProjectSamples(pr.SampleDirs, pr.SampleColors, n);
             _probeCoeffCache[key] = c;
         }
         coeffs = c;
@@ -1195,23 +1349,22 @@ public sealed class ViewportRenderer : IDisposable
     }
 
 public void Render(IRHICommandBuffer cmd, System.Numerics.Matrix4x4 view, System.Numerics.Matrix4x4 proj,
-    System.Numerics.Vector3 cameraPos, int viewportX, int viewportY, int viewportW, int viewportH, float deltaTime)
+    System.Numerics.Vector3 cameraPos, int viewportX, int viewportY, int viewportW, int viewportH, float deltaTime,
+    IRHITexture? colorTarget = null, IRHITexture? sceneDepth = null)
 {
+    _fi = CurrentMetalFrame(); // M4b: select this frame's buffer ring
     _frameCount++;
     _elapsedTime += deltaTime;
+    _lastCameraPos = cameraPos;
 
-    
-    
-// ── build uniforms for sky/grid (old ViewUniforms) ────────────────────────────────
+// ── build uniforms for sky/grid/meshes (synchronized camera-snapped LightSpaceMatrix) ──
 var viewProj = view * proj;
 System.Numerics.Matrix4x4.Invert(viewProj, out var invViewProj);
-var sunDir = System.Numerics.Vector3.Normalize(new System.Numerics.Vector3(0.3f, 0.7f, 0.4f)); // Natural sun angle
+if (!System.Numerics.Matrix4x4.Invert(proj, out var inverseProjection))
+    inverseProjection = System.Numerics.Matrix4x4.Identity;
 
-var lightProj = System.Numerics.Matrix4x4.CreateOrthographicOffCenter(-20, 20, -20, 20, 0.1f, 100f);
-var lightView = System.Numerics.Matrix4x4.CreateLookAt(-sunDir * 30f, System.Numerics.Vector3.Zero, System.Numerics.Vector3.UnitY);
-var lightViewProj = lightView * lightProj;
-
-var sunDirectionValue = BlueSky.Core.WorldEnvironment.GlobalEnvironment.SunDirection;
+var sunDirectionValue = BlueSky.Meridian.GlobalEnvironment.SunDirection;
+var lightViewProj = ComputeLightSpaceMatrix(sunDirectionValue, cameraPos, _shadowMapResolution);
 
 var uniforms = new ViewUniforms
 {
@@ -1223,7 +1376,7 @@ var uniforms = new ViewUniforms
     CameraPos = new System.Numerics.Vector4(cameraPos, 1.0f),
     Time = _elapsedTime,
     SunDirection = new System.Numerics.Vector4(sunDirectionValue, 0.0f),
-    WindParams = BlueSky.Core.WorldEnvironment.GlobalEnvironment.WindParams
+    WindParams = BlueSky.Meridian.GlobalEnvironment.WindParams
 };
 
 var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
@@ -1235,7 +1388,7 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
         // Phase-B probes override the sky when the camera stands inside one:
         // same b16 buffer, renderer agnostic to coefficient origin.
         float skyPreset = Math.Clamp(
-            BlueSky.Core.WorldEnvironment.GlobalEnvironment.SkyPreset, 0f, 1f);
+            BlueSky.Meridian.GlobalEnvironment.SkyPreset, 0f, 1f);
         string probeKey = TryGetProbeKey(cameraPos, out var probeCoeffs);
         if (probeCoeffs != null)
         {
@@ -1254,7 +1407,7 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
                 System.Numerics.Vector3.DistanceSquared(sunDirectionValue, _shSunDir) > 1e-8f ||
                 Math.Abs(skyPreset - _shPreset) > 1e-6f))
             {
-                var coeffs = BlueSky.Rendering.Strata.StrataSkyCapture.CaptureCoefficients(
+                var coeffs = BlueSky.BSR.Strata.StrataSkyCapture.CaptureCoefficients(
                     sunDirectionValue, skyPreset);
                 UploadShCoeffs(coeffs);
                 _shSunDir = sunDirectionValue;
@@ -1263,23 +1416,25 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
         }
         // b17 sky params follow the preset independently of the SH source:
         // fs_sky and the env sampler read it every frame.
-        if (_skyParamsBuffer != null && (float.IsNaN(_shParamsPreset) ||
+        // Flicker fix: same ring rule as UploadShCoeffs — write all slots.
+        if (_skyParamsBufferRing[_fi] != null && (float.IsNaN(_shParamsPreset) ||
             Math.Abs(skyPreset - _shParamsPreset) > 1e-6f))
         {
             var skyBytes = new byte[16];
             Buffer.BlockCopy(BitConverter.GetBytes(skyPreset), 0, skyBytes, 0, 4);
-            _device.UpdateBuffer(_skyParamsBuffer, skyBytes);
+            for (int r = 0; r < FrameRing; r++)
+                _device.UpdateBuffer(_skyParamsBufferRing[r]!, skyBytes);
             _shParamsPreset = skyPreset;
         }
 
         // ── Strata grade LUT (generated once, display-referred 16³ strip) ────
         if (_gradeLut == null)
         {
-            byte[] lut = BlueSky.Rendering.Strata.StrataLut.Generate();
+            byte[] lut = BlueSky.BSR.Strata.StrataLut.Generate();
             _gradeLut = _device.CreateTexture(new TextureDesc
             {
-                Width = (uint)BlueSky.Rendering.Strata.StrataLut.StripWidth,
-                Height = (uint)BlueSky.Rendering.Strata.StrataLut.StripHeight,
+                Width = (uint)BlueSky.BSR.Strata.StrataLut.StripWidth,
+                Height = (uint)BlueSky.BSR.Strata.StrataLut.StripHeight,
                 Depth = 1,
                 MipLevels = 1,
                 ArrayLayers = 1,
@@ -1290,41 +1445,45 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
             _device.UploadTexture(_gradeLut, lut);
         }
 
-        // ── build uniforms for Horizon Lighting (new HorizonViewUniforms) ─────────────────
-        System.Numerics.Matrix4x4.Invert(view, out var invView);
-        
-        var horizonUniforms = new HorizonViewUniforms
-        {
-            ViewProj = viewProj,
-            View = view,
-            InvView = invView,
-            CameraPos = cameraPos,
-            Time = _elapsedTime,
-            ScreenSize = new System.Numerics.Vector2(viewportW, viewportH),
-            NearPlane = 0.1f,
-            FarPlane = 1000f,
-        };
-
-        var horizonUniformSpan = MemoryMarshal.CreateSpan(ref horizonUniforms, 1);
-        _device.UpdateBuffer(_horizonViewUniformBuffer!, MemoryMarshal.AsBytes(horizonUniformSpan));
-
         // ── Prepare Horizon Lighting buffers ─────────────────────────────
+        // NOTE: HorizonViewUniforms upload removed — the horizon shader reads
+        // buffer(10) ViewUniforms, and _horizonViewUniformBuffer was never bound.
         Span<LightData> lightDataArray = stackalloc LightData[64];
         lightDataArray.Clear();
         int lightCount = 0;
-        foreach (var entity in _world.GetAllEntities())
+        // Chunk walk over a cached description — no GetAllEntities snapshot.
+        // Behavior identical: lights without Transform get TransformComponent.Default.
+        foreach (var lightChunk in _world.GetQueryChunks(_lightQueryDesc))
         {
-            if (!_world.HasComponent<LightComponent>(entity)) continue;
+            int lightIndex = lightChunk.GetComponentIndex(typeof(LightComponent));
+            int lightTransformIndex = lightChunk.GetComponentIndex(typeof(TransformComponent));
+            bool chunkHasTransform = lightTransformIndex >= 0
+                && lightChunk.Archetype.HasComponent(typeof(TransformComponent));
+            for (int li = 0; li < lightChunk.Count; li++)
+            {
+                var light = lightChunk.GetComponent<LightComponent>(li, lightIndex);
+                var transform = chunkHasTransform
+                    ? lightChunk.GetComponent<TransformComponent>(li, lightTransformIndex)
+                    : TransformComponent.Default;
+                if (!CollectLight(lightDataArray, ref lightCount, light, transform))
+                    break;
+            }
+            if (lightCount >= lightDataArray.Length) break;
+        }
 
-            var light = _world.GetComponent<LightComponent>(entity);
-            var transform = _world.HasComponent<TransformComponent>(entity)
-                ? _world.GetComponent<TransformComponent>(entity)
-                : TransformComponent.Default;
+    /// Collects one light into the frame's light array. Returns false when full.
+    /// Skips degenerate directional/spot orientations (zero forward vector).
+    /// Local function: keeps the hot loop allocation-free and together.
+    bool CollectLight(Span<LightData> lightDataArray, ref int lightCount,
+        LightComponent light, TransformComponent transform)
+    {
+        if (lightCount >= lightDataArray.Length) return false;
+        {
             var direction = transform.Forward;
             var directionLength = MathF.Sqrt(direction.X * direction.X + direction.Y * direction.Y + direction.Z * direction.Z);
             if ((light.Type is LightComponent.LightType.Directional or LightComponent.LightType.Spot) && directionLength <= 1e-5f)
-                continue;
-            if (lightCount >= lightDataArray.Length) break;
+                return true;
+            if (lightCount >= lightDataArray.Length) return false;
 
             float outerAngle = Math.Clamp(light.SpotAngle, 1.0f, 179.0f) * (MathF.PI / 360.0f);
             lightDataArray[lightCount++] = new LightData
@@ -1347,7 +1506,9 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
                 CastShadows = light.CastsShadows ? 1 : 0,
                 Volumetric = 0,
             };
+            return true;
         }
+    }
 
         // Keep a useful daylight default for scenes that have no explicit lights.
         if (lightCount == 0)
@@ -1366,7 +1527,7 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
             lightCount = 1;
         }
         
-        _device.UpdateBuffer(_lightBuffer!, MemoryMarshal.AsBytes(lightDataArray));
+        _device.UpdateBuffer(_lightBuffer!, MemoryMarshal.AsBytes(lightDataArray.Slice(0, Math.Max(lightCount, 1))));
         
         // Update light count
         var lightCountSpan = MemoryMarshal.CreateSpan(ref lightCount, 1);
@@ -1388,38 +1549,10 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
         _device.UpdateBuffer(_lightSettingsBuffer!, MemoryMarshal.AsBytes(lightSettingsSpan));
         
         // Default surface data (strata override when active, else orange clay)
+        // NOTE: the inline AstraSurface upload was removed — surface data rides
+        // setFragmentBytes per batch (BindDefaultSurface); _surfaceBuffer was
+        // uploaded every frame but never bound.
         EnsureStrataOverride();
-        var surface = new AstraSurface
-        {
-            BaseColor = _strataReady
-                ? new System.Numerics.Vector4(
-                    _strataParams.BaseColor.X, _strataParams.BaseColor.Y, _strataParams.BaseColor.Z, 1.0f)
-                : new System.Numerics.Vector4(DefaultAlbedo, 1.0f),
-            Roughness = _strataReady ? _strataParams.Roughness : 0.6f,
-            Metallic = _strataReady ? _strataParams.Metallic : 0.0f,
-            AO = _strataReady ? _strataParams.AO : 1.0f,
-            EmissiveStrength = 0.0f,
-            SpecularStrength = 0.5f,
-            Shininess = 32.0f,
-            Alpha = _strataReady ? _strataParams.Alpha : 1.0f,
-            // Bits 14-15 carry the transient debug-view selector (0 when Lit).
-            Flags = (uint)(AstraSurfaceFlags.ReceiveShadow | AstraSurfaceFlags.CastShadow)
-                  | ((uint)(Program._debugView & 7) << 14),
-            UVScale = new System.Numerics.Vector2(1, 1),
-            UVOffset = new System.Numerics.Vector2(0, 0),
-            EmissiveColor = new System.Numerics.Vector4(0, 0, 0, 1),
-            Custom0 = _strataReady
-                ? new System.Numerics.Vector4(1, _strataParams.Wrap, _strataParams.DetailTile, _strataParams.ToksvigK)
-                : new System.Numerics.Vector4(1, 0, 0, 0),
-            Custom1 = _strataReady
-                ? new System.Numerics.Vector4(_strataParams.FeatureMask,
-                    _strataParams.ClearcoatTintLinear.X,
-                    _strataParams.ClearcoatTintLinear.Y,
-                    _strataParams.ClearcoatTintLinear.Z)
-                : new System.Numerics.Vector4(0, 1, 1, 1),
-        };
-        var surfaceSpan = MemoryMarshal.CreateSpan(ref surface, 1);
-        _device.UpdateBuffer(_surfaceBuffer!, MemoryMarshal.AsBytes(surfaceSpan));
 
         // ── set viewport + scissor to the panel region ────────────────────
         cmd.SetViewport(new Viewport
@@ -1437,9 +1570,11 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
         // ── 0. Bind Shadow Map ───────────────────────────────────────────
         cmd.SetTexture(_shadowMap!, 1);
 
-        // ── 1. Sky ────────────────────────────────────────────────────────
+        // ── 1. Sky (TBDR-friendly background pass) ────────────────────────
         cmd.SetPipeline(_skyPipeline!);
         cmd.SetUniformBuffer(_uniformBuffer!, 10);
+        if (_skyParamsBuffer != null)
+            cmd.SetUniformBuffer(_skyParamsBuffer, 17);
         cmd.Draw(3); // fullscreen triangle
 
         // ── 2. Terrain (BEFORE entities/grid; writes depth like world geometry) ───────────
@@ -1454,13 +1589,8 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
                 _defaultWhiteTexture, _defaultNormalTexture, _gradeLut, _defaultWhiteTexture,
                 Program._debugView, viewProj, cameraPos);
         }
-        else
-        {
-        }
 
         // ── 3. Entities (BEFORE grid for correct transparency) ───────────
-        // Clear per-frame instance list so we start fresh; RenderEntities will
-        // repopulate it and upload it once before any draw calls.
         _frameInstances.Clear();
         RenderEntities(cmd, view, proj, cameraPos);
 
@@ -1469,7 +1599,19 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
         {
             cmd.SetPipeline(_gridPipeline);
             cmd.SetUniformBuffer(_uniformBuffer!, 10);
+            if (_shadowMap != null)
+                cmd.SetTexture(_shadowMap, 1, 0);
+            if (_shadowSampler != null)
+                cmd.SetSampler(_shadowSampler, 1, 0);
             cmd.Draw(6); // fullscreen quad (2 tris)
+        }
+
+        // ── 4b. Vectra particles (AFTER grid) ────────────────────────────
+        if (_vectraSystem != null && _vectraRenderer != null && _uniformBuffer != null)
+        {
+            _vectraRenderer.Draw(cmd, _uniformBuffer, _vectraSystem.Pool, cameraPos,
+                colorTarget, sceneDepth, viewportX, viewportY, viewportW, viewportH,
+                inverseProjection);
         }
         
         // ── 5. Editor Gizmos (LAST — always on top) ──────────────────────
@@ -1477,6 +1619,9 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
         RenderGizmos(cmd, viewProj, cameraPos);
         RenderPhysicsDebugShapes(cmd, viewProj);
     }
+
+    /// <summary>Points the particle renderer at a PNG (editor sprite row).</summary>
+    internal void SetVectraSprite(string? path) => _vectraRenderer?.SetSprite(path);
 
     // ── Pipeline creation ───────────────────────────────────────────────
 
@@ -1497,7 +1642,7 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
 
     private void CreatePipelines()
     {
-        // Sky pipeline — no depth, draws behind everything
+        // Sky pipeline — no depth write, draws behind everything (TBDR HSR friendly)
         _skyPipeline = TryCreatePipeline(new GraphicsPipelineDesc
         {
             VertexShader   = MakeShader(ShaderStage.Vertex, "vs_sky"),
@@ -1938,102 +2083,108 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
             DebugName = "Viewport.ShadowMap"
         });
 
-        _uniformBuffer = _device.CreateBuffer(new BufferDesc
+        for (int r = 0; r < FrameRing; r++)
+        _uniformBufferRing[r] = _device.CreateBuffer(new BufferDesc
         {
             Size       = (ulong)Marshal.SizeOf<ViewUniforms>(),
             Usage      = BufferUsage.Uniform,
             MemoryType = MemoryType.CpuToGpu,
-            DebugName  = "Viewport.UB",
+            DebugName  = $"Viewport.UB{r}",
         });
 
-        _entityUniformBuffer = _device.CreateBuffer(new BufferDesc
+        for (int r = 0; r < FrameRing; r++)
+        _shadowUniformBufferRing[r] = _device.CreateBuffer(new BufferDesc
         {
-            Size       = (ulong)Marshal.SizeOf<EntityUniforms>(),
+            Size       = (ulong)Marshal.SizeOf<ShadowUniforms>(),
             Usage      = BufferUsage.Uniform,
             MemoryType = MemoryType.CpuToGpu,
-            DebugName  = "Viewport.EntityUB",
+            DebugName  = $"Viewport.ShadowUB{r}",
         });
-        
-        _instanceBuffer = _device.CreateBuffer(new BufferDesc
+
+        for (int r = 0; r < FrameRing; r++)
+        _instanceBufferRing[r] = _device.CreateBuffer(new BufferDesc
         {
             Size       = (ulong)Marshal.SizeOf<EntityUniforms>() * MaxFrameInstances,
             Usage      = BufferUsage.Uniform,
             MemoryType = MemoryType.CpuToGpu,
-            DebugName  = "Viewport.InstanceUB",
+            DebugName  = $"Viewport.InstanceUB{r}",
         });
-        
+
         // Large per-frame instance buffer — holds transforms for ALL entities.
         // Uploaded once per frame so every draw call sees its own unique slice.
-        _frameInstanceBuffer = _device.CreateBuffer(new BufferDesc
+        for (int r = 0; r < FrameRing; r++)
+        _frameInstanceBufferRing[r] = _device.CreateBuffer(new BufferDesc
         {
             Size       = (ulong)Marshal.SizeOf<EntityUniforms>() * MaxFrameInstances,
             Usage      = BufferUsage.Uniform,
             MemoryType = MemoryType.CpuToGpu,
-            DebugName  = "Viewport.FrameInstanceUB",
+            DebugName  = $"Viewport.FrameInstanceUB{r}",
         });
-        
+
         // Horizon Lighting buffers
-        _horizonViewUniformBuffer = _device.CreateBuffer(new BufferDesc
-        {
-            Size       = (ulong)Marshal.SizeOf<HorizonViewUniforms>(),
-            Usage      = BufferUsage.Uniform,
-            MemoryType = MemoryType.CpuToGpu,
-            DebugName  = "Viewport.HorizonViewUB",
-        });
-        
-        _lightBuffer = _device.CreateBuffer(new BufferDesc
+        for (int r = 0; r < FrameRing; r++)
+        _lightBufferRing[r] = _device.CreateBuffer(new BufferDesc
         {
             Size       = 5120, // Space for up to 64 lights (72 bytes each = 4608, rounded to 5120)
             Usage      = BufferUsage.Uniform,
             MemoryType = MemoryType.CpuToGpu,
-            DebugName  = "Viewport.LightBuffer",
+            DebugName  = $"Viewport.LightBuffer{r}",
         });
-        
-        _lightSettingsBuffer = _device.CreateBuffer(new BufferDesc
+
+        for (int r = 0; r < FrameRing; r++)
+        _lightSettingsBufferRing[r] = _device.CreateBuffer(new BufferDesc
         {
             Size       = 64, // Lighting settings
             Usage      = BufferUsage.Uniform,
             MemoryType = MemoryType.CpuToGpu,
-            DebugName  = "Viewport.LightSettings",
+            DebugName  = $"Viewport.LightSettings{r}",
         });
-        
-        _lightCountBuffer = _device.CreateBuffer(new BufferDesc
+
+        for (int r = 0; r < FrameRing; r++)
+        _lightCountBufferRing[r] = _device.CreateBuffer(new BufferDesc
         {
             Size       = 16, // int with padding
             Usage      = BufferUsage.Uniform,
             MemoryType = MemoryType.CpuToGpu,
-            DebugName  = "Viewport.LightCount",
-        });
-        
-        _surfaceBuffer = _device.CreateBuffer(new BufferDesc
-        {
-            Size       = (ulong)Marshal.SizeOf<AstraSurface>(),
-            Usage      = BufferUsage.Uniform,
-            MemoryType = MemoryType.CpuToGpu,
-            DebugName  = "Viewport.SurfaceUB",
+            DebugName  = $"Viewport.LightCount{r}",
         });
 
-        _shBuffer = _device.CreateBuffer(new BufferDesc
+        for (int r = 0; r < FrameRing; r++)
+        _shBufferRing[r] = _device.CreateBuffer(new BufferDesc
         {
             Size       = 9 * 16, // 9 SH coeffs × float4
             Usage      = BufferUsage.Uniform,
             MemoryType = MemoryType.CpuToGpu,
-            DebugName  = "Viewport.SHProbe",
+            DebugName  = $"Viewport.SHProbe{r}",
         });
 
-        _skyParamsBuffer = _device.CreateBuffer(new BufferDesc
+        for (int r = 0; r < FrameRing; r++)
+        _skyParamsBufferRing[r] = _device.CreateBuffer(new BufferDesc
         {
             Size       = 16, // SkyPreset float + 12B padding
             Usage      = BufferUsage.Uniform,
             MemoryType = MemoryType.CpuToGpu,
-            DebugName  = "Viewport.SkyParams",
+            DebugName  = $"Viewport.SkyParams{r}",
+        });
+
+        _linearSampler = _device.CreateSampler(SamplerDesc.LinearClamp);
+        _shadowSampler = _device.CreateSampler(new SamplerDesc
+        {
+            Filter = SamplerFilter.Linear,
+            AddressU = SamplerAddressMode.Clamp,
+            AddressV = SamplerAddressMode.Clamp,
+            AddressW = SamplerAddressMode.Clamp,
+            MaxAnisotropy = 1,
+            MinLod = 0,
+            MaxLod = 1000,
+            CompareLess = true,
         });
     }
 
 
     private void RenderEntities(IRHICommandBuffer cmd, System.Numerics.Matrix4x4 view, System.Numerics.Matrix4x4 proj, System.Numerics.Vector3 cameraPos)
     {
-        BlueSky.Rendering.Strata.StrataBenchmark.BeginSection("mesh");
+        BlueSky.BSR.Strata.StrataBenchmark.BeginSection("mesh");
         try
         {
         // Bind buffers for fs_mesh (viewport_3d.metal)
@@ -2060,53 +2211,44 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
         Span<System.Numerics.Vector4> frustumPlanes = stackalloc System.Numerics.Vector4[6];
         ExtractFrustumPlanes(viewProj, frustumPlanes);
 
-        var query = _world.CreateQuery()
-            .All<TransformComponent>()
-            .Any(typeof(BlueSky.Core.ECS.Builtin.StaticMeshComponent), typeof(BlueSky.Core.ECS.Builtin.SkeletalMeshComponent))
-            .Build();
+        // 1. Gather all submeshes to be rendered (pooled lists — no per-frame alloc)
+        var opaqueItems = _opaqueItemsCache;
+        var transparentItems = _transparentItemsCache;
+        opaqueItems.Clear();
+        transparentItems.Clear();
 
-        // 1. Gather all submeshes to be rendered
-        var opaqueItems = new List<RenderItem>();
-        var transparentItems = new List<RenderItem>();
-
-        var chunks = _world.GetQueryChunks(query);
+        var chunks = _world.GetQueryChunks(_meshQueryDesc);
         foreach (var chunk in chunks)
         {
             int transformIndex = chunk.GetComponentIndex(typeof(TransformComponent));
-            int staticMeshIndex = chunk.GetComponentIndex(typeof(BlueSky.Core.ECS.Builtin.StaticMeshComponent));
-            int skeletalMeshIndex = chunk.GetComponentIndex(typeof(BlueSky.Core.ECS.Builtin.SkeletalMeshComponent));
+            int staticMeshIndex = chunk.GetComponentIndex(typeof(BlueSky.SkyCore.Builtin.StaticMeshComponent));
+            int skeletalMeshIndex = chunk.GetComponentIndex(typeof(BlueSky.SkyCore.Builtin.SkeletalMeshComponent));
 
-            bool chunkHasStatic = staticMeshIndex >= 0 && chunk.Archetype.HasComponent(typeof(BlueSky.Core.ECS.Builtin.StaticMeshComponent));
-            bool chunkHasSkeletal = skeletalMeshIndex >= 0 && chunk.Archetype.HasComponent(typeof(BlueSky.Core.ECS.Builtin.SkeletalMeshComponent));
+            bool chunkHasStatic = staticMeshIndex >= 0 && chunk.Archetype.HasComponent(typeof(BlueSky.SkyCore.Builtin.StaticMeshComponent));
+            bool chunkHasSkeletal = skeletalMeshIndex >= 0 && chunk.Archetype.HasComponent(typeof(BlueSky.SkyCore.Builtin.SkeletalMeshComponent));
 
             for (int i = 0; i < chunk.Count; i++)
             {
                 var transform = chunk.GetComponent<TransformComponent>(i, transformIndex);
                 
-                // CPU frustum culling
+                // Fast coarse sphere frustum check before any dictionary/cache lookup
                 var posMatrix = transform.WorldMatrix;
                 var entityPos = new System.Numerics.Vector3(posMatrix.M41, posMatrix.M42, posMatrix.M43);
                 float maxScale = Math.Max(Math.Max(Math.Abs(transform.Scale.X), Math.Abs(transform.Scale.Y)), Math.Abs(transform.Scale.Z));
-                float boundingRadius = maxScale * 5.0f;
-                
-                bool isVisible = IsSphereFrustumVisible(entityPos, boundingRadius, frustumPlanes);
-                
-                if (!isVisible)
-                {
+                if (!IsSphereFrustumVisible(entityPos, maxScale * 15.0f, frustumPlanes))
                     continue;
-                }
 
                 // Resolve asset ID from whichever mesh component is present
                 string assetId = "";
 
                 if (chunkHasSkeletal)
                 {
-                    var skeletalMesh = chunk.GetComponent<BlueSky.Core.ECS.Builtin.SkeletalMeshComponent>(i, skeletalMeshIndex);
+                    var skeletalMesh = chunk.GetComponent<BlueSky.SkyCore.Builtin.SkeletalMeshComponent>(i, skeletalMeshIndex);
                     assetId = skeletalMesh.MeshAssetPath;
                 }
                 else if (chunkHasStatic)
                 {
-                    var staticMesh = chunk.GetComponent<BlueSky.Core.ECS.Builtin.StaticMeshComponent>(i, staticMeshIndex);
+                    var staticMesh = chunk.GetComponent<BlueSky.SkyCore.Builtin.StaticMeshComponent>(i, staticMeshIndex);
                     assetId = staticMesh.MeshAssetId;
                 }
 
@@ -2136,6 +2278,13 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
 
                 if (gpuData != null)
                 {
+                    // True world-space AABB frustum culling via Ramanujan AABB.Transform
+                    var worldBounds = gpuData.LocalBounds.Transform(posMatrix);
+                    if (!IsAABBFrustumVisible(worldBounds, frustumPlanes))
+                    {
+                        continue;
+                    }
+
                     if (_frameCount <= 3 && chunkHasSkeletal)
                         Console.WriteLine($"[ViewportRenderer] SKELETAL ENTITY FOUND: asset={assetId} submeshes={gpuData.Submeshes.Count} verts={gpuData.RawVertexPositions?.Length ?? 0}");
 
@@ -2146,9 +2295,6 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
                     {
                         var submesh = gpuData.Submeshes[submeshIdx];
                         if (submesh.IndexCount == 0) continue;
-
-                        // No material system: every surface shades with the global
-                        // historic orange clay. Lighting still varies per pixel.
 
                         // Record the instance index DURING gather so DrawBatched can
                         // use it as firstInstance — no matrix-equality search needed.
@@ -2172,10 +2318,10 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
                         }
                         var color = tint;
                         
-                        var modelMatrix = transform.WorldMatrix;
+                        var modelMatrix = posMatrix;
                         
                         // Check if this entity has a CarController (for wheel steering/spinning animation)
-                        var carController = BlueSky.Core.Gameplay.CarControllerSystem.GetController((uint)chunk.GetEntities()[i].Id);
+                        var carController = BlueSky.Airborne.CarControllerSystem.GetController((uint)chunk.GetEntities()[i].Id);
                         if (carController != null)
                         {
                             uint entId = (uint)chunk.GetEntities()[i].Id;
@@ -2205,9 +2351,7 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
                         };
 
                         item.Flags = AstraSurfaceFlags.ReceiveShadow | AstraSurfaceFlags.CastShadow;
-                        // Transparent-bit materials join the back-to-front blend pass;
-                        // everything else stays in the opaque batch.
-                        if ((itemMask & (uint)BlueSky.Rendering.Strata.StrataFeature.Transparent) != 0)
+                        if ((itemMask & (uint)BlueSky.BSR.Strata.StrataFeature.Transparent) != 0)
                             transparentItems.Add(item);
                         else
                             opaqueItems.Add(item);
@@ -2222,21 +2366,20 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
         }
 
         // 2. Upload ALL instance transforms ONCE before any draw calls.
-        //    This is the critical fix: a single UpdateBuffer here means the GPU
-        //    sees every entity's unique transform, not just the last one written.
         UploadFrameInstances();
 
-        // 3. Draw Opaque Pass (Opaque + AlphaTest)
-        cmd.SetPipeline(_meshPipeline!);
+        // 3. Draw Opaque Pass (Opaque + AlphaTest).
+        bool wireframeView = Program._viewMode == 1 && _wireframePipeline != null;
+        cmd.SetPipeline(wireframeView ? _wireframePipeline! : _meshPipeline!);
         DrawBatched(cmd, opaqueItems);
 
-        // 3. Draw Transparent Pass (AlphaBlend) - Sorted Back-to-Front
+        // 4. Draw Transparent Pass (AlphaBlend) - Sorted Back-to-Front
         transparentItems.Sort((a, b) => b.DistanceToCameraSq.CompareTo(a.DistanceToCameraSq));
-        cmd.SetPipeline(_transparentMeshPipeline ?? _meshPipeline!);
-
-        // DrawBatched re-sorts for batching by default; the transparent list
-        // must keep its far-to-near order (batching still merges runs).
-        DrawBatched(cmd, transparentItems, keepOrder: true);
+        if (transparentItems.Count > 0)
+        {
+            cmd.SetPipeline(wireframeView ? _wireframePipeline! : (_transparentMeshPipeline ?? _meshPipeline!));
+            DrawBatched(cmd, transparentItems, keepOrder: true);
+        }
 
         // Evict old meshes if cache is too large (VRAM optimization)
         if (_frameCount % 60 == 0 && _meshCache.Count > 64)
@@ -2246,7 +2389,7 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
         }
         finally
         {
-            BlueSky.Rendering.Strata.StrataBenchmark.EndSection("mesh");
+            BlueSky.BSR.Strata.StrataBenchmark.EndSection("mesh");
         }
     }
 
@@ -2345,6 +2488,19 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
                 }
             }
 
+            BlueSky.Ramanujan.AABB localBounds;
+            if (rawPositions.Length > 0)
+            {
+                var ramanujanSpan = MemoryMarshal.Cast<System.Numerics.Vector3, BlueSky.Ramanujan.Vector3>(rawPositions.AsSpan());
+                BlueSky.Ramanujan.RamanujanSimd.ComputeBoundsSIMD(ramanujanSpan, out var bMin, out var bMax);
+                // Pad slightly so planar quads (e.g. ground planes with Y=0) never have zero thickness
+                localBounds = new BlueSky.Ramanujan.AABB(bMin - new BlueSky.Ramanujan.Vector3(0.05f), bMax + new BlueSky.Ramanujan.Vector3(0.05f));
+            }
+            else
+            {
+                localBounds = new BlueSky.Ramanujan.AABB(new BlueSky.Ramanujan.Vector3(-5f), new BlueSky.Ramanujan.Vector3(5f));
+            }
+
             var gpuData = new MeshGPUData 
             { 
                 VertexBuffer = vb, 
@@ -2353,7 +2509,8 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
                 Submeshes = submeshes,
                 SubmeshSlots = submeshSlots,
                 RawIndices = rawIndices,
-                RawVertexPositions = rawPositions
+                RawVertexPositions = rawPositions,
+                LocalBounds = localBounds
             };
 
             // Strata slot links live in the mesh header (written at import).
@@ -2424,7 +2581,7 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
             file.Texs.TryGetValue("bent", out bentTex);
             // Data rules: lobes needing textures stay OFF without blobs.
             if (bentTex == null)
-                mask &= ~(uint)BlueSky.Rendering.Strata.StrataFeature.BentNormal;
+                mask &= ~(uint)BlueSky.BSR.Strata.StrataFeature.BentNormal;
             fileBound = true;
         }
         if (!fileBound && _strataReady)
@@ -2472,7 +2629,13 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
             Custom1 = new System.Numerics.Vector4(mask, coatTint.X, coatTint.Y, coatTint.Z),
         };
 
-        // Push inline surface data to GPU at slot b11 (and b2 for legacy compatibility)
+        // Push inline surface data to GPU at slot b11 (and b2 for legacy compatibility).
+        // NOTE (flashing fix): this MUST push on every batch. An earlier
+        // dedup skipped pushes when the bytes matched the last batch, but
+        // Metal setFragmentBytes state dies with each render encoder — shadow
+        // pass, main pass, Vectra's depth-snapshot split, and every new frame
+        // all start with unset slots, and Terrain writes b11 directly without
+        // updating any cache. Skips = stale/garbage surfaces = flashing.
         var surfaceSpan = MemoryMarshal.CreateSpan(ref surface, 1);
         cmd.SetFragmentUniforms(11, MemoryMarshal.AsBytes(surfaceSpan));
         cmd.SetFragmentUniforms(2, MemoryMarshal.AsBytes(surfaceSpan));
@@ -2490,13 +2653,35 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
             cmd.SetTexture(_gradeLut, 8);
             binds++;
         }
-        BlueSky.Rendering.Strata.StrataBenchmark.RecordTextureBind(binds);
+        // Bound samplers for fs_mesh [[sampler()]] params (slot mirrors texture).
+        if (_shadowSampler != null)
+            cmd.SetSampler(_shadowSampler, 1, 0);
+        if (_linearSampler != null)
+        {
+            cmd.SetSampler(_linearSampler, 2, 0);
+            cmd.SetSampler(_linearSampler, 3, 0);
+            cmd.SetSampler(_linearSampler, 4, 0);
+            cmd.SetSampler(_linearSampler, 5, 0);
+            cmd.SetSampler(_linearSampler, 6, 0);
+            cmd.SetSampler(_linearSampler, 7, 0);
+            if (_gradeLut != null)
+                cmd.SetSampler(_linearSampler, 8, 0);
+            cmd.SetSampler(_linearSampler, 9, 0);
+        }
+        BlueSky.BSR.Strata.StrataBenchmark.RecordTextureBind(binds);
     }
     
     // ── Per-frame instance data staging ──────────────────────────────────────
     // Stores all entity transforms for the current frame. DrawBatched fills this
     // list during collection and UploadFrameInstances writes it to the GPU once.
     private readonly List<EntityUniforms> _frameInstances = new(256);
+
+    // M3: reused shadow-pass staging (no per-frame List/int[] allocs).
+    private readonly System.Collections.Generic.List<(MeshGPUData GpuData, SubmeshInfo Submesh, BlueSky.Ramanujan.Matrix4x4 ModelMatrix)> _shadowItemsCache = new(256);
+    private readonly List<EntityUniforms> _shadowInstancesCache = new(256);
+    private int[] _shadowIndexCache = new int[256];
+    private readonly List<RenderItem> _opaqueItemsCache = new(256);
+    private readonly List<RenderItem> _transparentItemsCache = new(64);
 
     /// <summary>
     /// Upload ALL instance transforms collected this frame into _frameInstanceBuffer.
@@ -2519,7 +2704,10 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
         // and must keep that order (batching still merges adjacent runs).
         if (!keepOrder)
             items.Sort(CompareRenderItemsForBatching);
-        bool useStableMetalInstances = cmd is BlueSky.Rendering.RHI.Metal.MetalCommandBuffer &&
+        // M4b: unwrap validation decorator — without this the Metal fast path
+        // below never triggers and every batch pays a per-batch re-upload.
+        var innerCmd = (cmd as BlueSky.BSR.RHI.IRHIWrapped<BlueSky.BSR.RHI.IRHICommandBuffer>)?.Inner ?? cmd;
+        bool useStableMetalInstances = innerCmd is BlueSky.BSR.RHI.Metal.MetalCommandBuffer &&
                                         _frameInstanceBuffer != null;
         if (useStableMetalInstances)
         {
@@ -2557,7 +2745,7 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
             {
                 cmd.DrawIndexed((uint)firstItem.Submesh.IndexCount, (uint)instanceCount,
                     (uint)firstItem.Submesh.IndexOffset, 0, (uint)firstItem.InstanceIndex);
-                BlueSky.Rendering.Strata.StrataBenchmark.RecordMeshDraw((long)firstItem.Submesh.IndexCount * instanceCount / 3);
+                BlueSky.BSR.Strata.StrataBenchmark.RecordMeshDraw((long)firstItem.Submesh.IndexCount * instanceCount / 3);
                 i += instanceCount;
                 continue;
             }
@@ -2584,7 +2772,7 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
 
             cmd.DrawIndexed((uint)firstItem.Submesh.IndexCount, (uint)instanceCount,
                 (uint)firstItem.Submesh.IndexOffset, 0, 0);
-            BlueSky.Rendering.Strata.StrataBenchmark.RecordMeshDraw((long)firstItem.Submesh.IndexCount * instanceCount / 3);
+            BlueSky.BSR.Strata.StrataBenchmark.RecordMeshDraw((long)firstItem.Submesh.IndexCount * instanceCount / 3);
 
             i += instanceCount;
         }
@@ -2602,7 +2790,11 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
         cmp = a.Submesh.IndexCount.CompareTo(b.Submesh.IndexCount);
         if (cmp != 0) return cmp;
 
-        return string.CompareOrdinal(a.StrataPath, b.StrataPath);
+        cmp = string.CompareOrdinal(a.StrataPath, b.StrataPath);
+        if (cmp != 0) return cmp;
+
+        // Preserve contiguous InstanceIndex runs so DrawBatched can merge up to 64 instances per draw call!
+        return a.InstanceIndex.CompareTo(b.InstanceIndex);
     }
 
     private static bool CanBatchRenderItems(RenderItem a, RenderItem b)
@@ -2616,7 +2808,9 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
     private void EvictOldMeshes(int maxCacheSize)
     {
         if (_meshCache.Count <= maxCacheSize) return;
-        
+
+        // M4b: eviction disposes GPU buffers — drain in-flight frames first.
+        DrainMetalFlight();
         var sortedByUsage = _meshCache.ToList();
         sortedByUsage.Sort((a, b) => a.Value.LastUsedFrame.CompareTo(b.Value.LastUsedFrame));
         
@@ -3026,10 +3220,10 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
             _gizmoCapsuleIndexCount = cIdx.Count;
         }
 
-        // Gizmo uniform buffers (one per axis + center + terrain brush preview)
-        for (int i = 0; i < _gizmoUniformBuffers.Length; i++)
+        // Gizmo uniform buffers: 5 slots (axes + center + brush) × 3 frames (M4b)
+        for (int i = 0; i < _gizmoUniformBufferRing.Length; i++)
         {
-            _gizmoUniformBuffers[i] = _device.CreateBuffer(new BufferDesc
+            _gizmoUniformBufferRing[i] = _device.CreateBuffer(new BufferDesc
             {
                 Size = (ulong)Marshal.SizeOf<GizmoUniforms>(),
                 Usage = BufferUsage.Uniform,
@@ -3048,7 +3242,7 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
     private void RenderTerrainBrushPreview(IRHICommandBuffer cmd, System.Numerics.Matrix4x4 viewProj)
     {
         if (!_terrainBrushPreviewVisible || !_gizmoGeometryCreated || _gizmoPipeline == null ||
-            _gizmoRingVB == null || _gizmoRingIB == null || _gizmoUniformBuffers.Length < 5)
+            _gizmoRingVB == null || _gizmoRingIB == null || _gizmoUniformBufferRing.Length < 15)
             return;
 
         var normal = _terrainBrushPreviewNormal.LengthSquared() > 0.0001f
@@ -3075,10 +3269,10 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
         };
 
         var span = MemoryMarshal.CreateSpan(ref uniforms, 1);
-        _device.UpdateBuffer(_gizmoUniformBuffers[4]!, MemoryMarshal.AsBytes(span));
+        _device.UpdateBuffer(GizmoUB(4)!, MemoryMarshal.AsBytes(span));
 
         cmd.SetPipeline(_gizmoPipeline!);
-        cmd.SetUniformBuffer(_gizmoUniformBuffers[4]!, 10);
+        cmd.SetUniformBuffer(GizmoUB(4)!, 10);
         cmd.SetVertexBuffer(_gizmoRingVB!, 0);
         cmd.SetIndexBuffer(_gizmoRingIB!, IndexType.UInt16);
         cmd.DrawIndexed((uint)_gizmoRingIndexCount);
@@ -3163,8 +3357,8 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
             };
             
             var span = MemoryMarshal.CreateSpan(ref gizmoUniforms, 1);
-            _device.UpdateBuffer(_gizmoUniformBuffers[ubIndex]!, MemoryMarshal.AsBytes(span));
-            cmd.SetUniformBuffer(_gizmoUniformBuffers[ubIndex]!, 10);
+            _device.UpdateBuffer(GizmoUB(ubIndex)!, MemoryMarshal.AsBytes(span));
+            cmd.SetUniformBuffer(GizmoUB(ubIndex)!, 10);
             
             if (CurrentGizmoMode == GizmoMode.Translate)
             {
@@ -3189,7 +3383,7 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
                               * System.Numerics.Matrix4x4.CreateTranslation(entityPos);
                 
                 gizmoUniforms.Model = cubeModel;
-                _device.UpdateBuffer(_gizmoUniformBuffers[ubIndex]!, MemoryMarshal.AsBytes(span));
+                _device.UpdateBuffer(GizmoUB(ubIndex)!, MemoryMarshal.AsBytes(span));
                 
                 cmd.SetVertexBuffer(_gizmoCubeVB!, 0);
                 cmd.SetIndexBuffer(_gizmoCubeIB!, IndexType.UInt16);
@@ -3219,8 +3413,8 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
                 IsHovered = (HoveredAxis == 3) ? 1f : 0f,
             };
             var centerSpan = MemoryMarshal.CreateSpan(ref centerUniforms, 1);
-            _device.UpdateBuffer(_gizmoUniformBuffers[3]!, MemoryMarshal.AsBytes(centerSpan));
-            cmd.SetUniformBuffer(_gizmoUniformBuffers[3]!, 10);
+            _device.UpdateBuffer(GizmoUB(3)!, MemoryMarshal.AsBytes(centerSpan));
+            cmd.SetUniformBuffer(GizmoUB(3)!, 10);
             
             cmd.SetVertexBuffer(_gizmoCubeVB!, 0);
             cmd.SetIndexBuffer(_gizmoCubeIB!, IndexType.UInt16);
@@ -3251,8 +3445,8 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
                 IsHovered = 0f,
             };
             var fillSpan = MemoryMarshal.CreateSpan(ref fillUniforms, 1);
-            _device.UpdateBuffer(_gizmoUniformBuffers[ubIdx]!, MemoryMarshal.AsBytes(fillSpan));
-            cmd.SetUniformBuffer(_gizmoUniformBuffers[ubIdx]!, 10);
+            _device.UpdateBuffer(GizmoUB(ubIdx)!, MemoryMarshal.AsBytes(fillSpan));
+            cmd.SetUniformBuffer(GizmoUB(ubIdx)!, 10);
 
             switch (shape.ShapeType)
             {
@@ -3288,8 +3482,8 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
                 IsHovered = 0f,
             };
             var wireSpan = MemoryMarshal.CreateSpan(ref wireUniforms, 1);
-            _device.UpdateBuffer(_gizmoUniformBuffers[ubIdx]!, MemoryMarshal.AsBytes(wireSpan));
-            cmd.SetUniformBuffer(_gizmoUniformBuffers[ubIdx]!, 10);
+            _device.UpdateBuffer(GizmoUB(ubIdx)!, MemoryMarshal.AsBytes(wireSpan));
+            cmd.SetUniformBuffer(GizmoUB(ubIdx)!, 10);
 
             switch (shape.ShapeType)
             {
@@ -3345,8 +3539,8 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
 
         uniforms.Model = System.Numerics.Matrix4x4.Identity;
         var span = MemoryMarshal.CreateSpan(ref uniforms, 1);
-        _device.UpdateBuffer(_gizmoUniformBuffers[ubIdx]!, MemoryMarshal.AsBytes(span));
-        cmd.SetUniformBuffer(_gizmoUniformBuffers[ubIdx]!, 10);
+        _device.UpdateBuffer(GizmoUB(ubIdx)!, MemoryMarshal.AsBytes(span));
+        cmd.SetUniformBuffer(GizmoUB(ubIdx)!, 10);
         cmd.SetVertexBuffer(_hullLineVB!, 0);
         cmd.Draw((uint)vertCount);
 
@@ -3387,8 +3581,8 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
 
         uniforms.Model = model;
         var span = MemoryMarshal.CreateSpan(ref uniforms, 1);
-        _device.UpdateBuffer(_gizmoUniformBuffers[ubIdx]!, MemoryMarshal.AsBytes(span));
-        cmd.SetUniformBuffer(_gizmoUniformBuffers[ubIdx]!, 10);
+        _device.UpdateBuffer(GizmoUB(ubIdx)!, MemoryMarshal.AsBytes(span));
+        cmd.SetUniformBuffer(GizmoUB(ubIdx)!, 10);
         cmd.SetVertexBuffer(_hullLineVB!, 0);
         cmd.Draw((uint)vertCount);
     }
@@ -3406,7 +3600,7 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
         {
             uniforms.Model = rot * model;
             var rSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
-            _device.UpdateBuffer(_gizmoUniformBuffers[ubIdx]!, MemoryMarshal.AsBytes(rSpan));
+            _device.UpdateBuffer(GizmoUB(ubIdx)!, MemoryMarshal.AsBytes(rSpan));
             cmd.SetVertexBuffer(_gizmoRingVB!, 0);
             cmd.SetIndexBuffer(_gizmoRingIB!, IndexType.UInt16);
             cmd.DrawIndexed((uint)_gizmoRingIndexCount);
@@ -3451,8 +3645,8 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
 
             uniforms.Model = model;
             var span = MemoryMarshal.CreateSpan(ref uniforms, 1);
-            _device.UpdateBuffer(_gizmoUniformBuffers[ubIdx]!, MemoryMarshal.AsBytes(span));
-            cmd.SetUniformBuffer(_gizmoUniformBuffers[ubIdx]!, 10);
+            _device.UpdateBuffer(GizmoUB(ubIdx)!, MemoryMarshal.AsBytes(span));
+            cmd.SetUniformBuffer(GizmoUB(ubIdx)!, 10);
             cmd.SetVertexBuffer(_hullLineVB!, 0);
             // Draw as line strip for the ring outline
             cmd.Draw((uint)vCount);
@@ -3486,8 +3680,8 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
 
             uniforms.Model = model;
             var span = MemoryMarshal.CreateSpan(ref uniforms, 1);
-            _device.UpdateBuffer(_gizmoUniformBuffers[ubIdx]!, MemoryMarshal.AsBytes(span));
-            cmd.SetUniformBuffer(_gizmoUniformBuffers[ubIdx]!, 10);
+            _device.UpdateBuffer(GizmoUB(ubIdx)!, MemoryMarshal.AsBytes(span));
+            cmd.SetUniformBuffer(GizmoUB(ubIdx)!, 10);
             cmd.SetVertexBuffer(_hullLineVB!, 0);
             cmd.Draw((uint)lineVertCount);
         }
@@ -3495,16 +3689,21 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
 
     private void EnsureHullLineBuffer(int vertCount)
     {
-        if (_hullLineVB == null || _hullLineVertexCapacity < vertCount)
+        if (_hullLineVBRing[_fi] == null || _hullLineVertexCapacity < vertCount)
         {
+            // M4b: growing disposes live buffers — drain in-flight frames first.
+            DrainMetalFlight();
             _hullLineVertexCapacity = Math.Max(vertCount, 256);
-            _hullLineVB?.Dispose();
-            _hullLineVB = _device.CreateBuffer(new BufferDesc
+            for (int r = 0; r < FrameRing; r++)
             {
-                Size = (ulong)(_hullLineVertexCapacity * 32),
-                Usage = BufferUsage.Vertex,
-                DebugName = "HullLineVB"
-            });
+                _hullLineVBRing[r]?.Dispose();
+                _hullLineVBRing[r] = _device.CreateBuffer(new BufferDesc
+                {
+                    Size = (ulong)(_hullLineVertexCapacity * 32),
+                    Usage = BufferUsage.Vertex,
+                    DebugName = $"HullLineVB{r}"
+                });
+            }
         }
     }
 
@@ -3537,8 +3736,8 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
 
         uniforms.Model = System.Numerics.Matrix4x4.Identity;
         var span = MemoryMarshal.CreateSpan(ref uniforms, 1);
-        _device.UpdateBuffer(_gizmoUniformBuffers[ubIdx]!, MemoryMarshal.AsBytes(span));
-        cmd.SetUniformBuffer(_gizmoUniformBuffers[ubIdx]!, 10);
+        _device.UpdateBuffer(GizmoUB(ubIdx)!, MemoryMarshal.AsBytes(span));
+        cmd.SetUniformBuffer(GizmoUB(ubIdx)!, 10);
         cmd.SetVertexBuffer(_hullLineVB!, 0);
         cmd.Draw((uint)vertCount);
 
@@ -3578,17 +3777,17 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
     /// Performs hit-testing against gizmo geometry proxies (spheres/cylinders).
     /// Returns 0=X, 1=Y, 2=Z, 3=Center, or -1 if no hit.
     /// </summary>
-    public int HitTestGizmo(Ray ray, BlueSky.Core.Math.Vector3 entityPos, float gizmoScale)
+    public int HitTestGizmo(Ray ray, BlueSky.Ramanujan.Vector3 entityPos, float gizmoScale)
     {
         // 1. Check center cube
-        var centerSphere = new BlueSky.Core.Math.BoundingSphere(entityPos, 0.15f * gizmoScale);
+        var centerSphere = new BlueSky.Ramanujan.BoundingSphere(entityPos, 0.15f * gizmoScale);
         if (ray.Intersects(centerSphere, out _)) return 3;
 
         // 2. Check axes
-        BlueSky.Core.Math.Vector3[] directions = { 
-            BlueSky.Core.Math.Vector3.Right, 
-            BlueSky.Core.Math.Vector3.Up, 
-            BlueSky.Core.Math.Vector3.Back 
+        BlueSky.Ramanujan.Vector3[] directions = { 
+            BlueSky.Ramanujan.Vector3.Right, 
+            BlueSky.Ramanujan.Vector3.Up, 
+            BlueSky.Ramanujan.Vector3.Back 
         };
         
         for (int i = 0; i < 3; i++)
@@ -3596,11 +3795,11 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
             if (CurrentGizmoMode == GizmoMode.Rotate)
             {
                 var planeNormal = directions[i];
-                var plane = new BlueSky.Core.Math.Plane(planeNormal, -BlueSky.Core.Math.Vector3.Dot(planeNormal, entityPos));
+                var plane = new BlueSky.Ramanujan.Plane(planeNormal, -BlueSky.Ramanujan.Vector3.Dot(planeNormal, entityPos));
                 if (ray.Intersects(plane, out float t))
                 {
                     var hitPoint = ray.GetPoint(t);
-                    float dist = BlueSky.Core.Math.Vector3.Distance(hitPoint, entityPos);
+                    float dist = BlueSky.Ramanujan.Vector3.Distance(hitPoint, entityPos);
                     if (MathF.Abs(dist - 0.8f * gizmoScale) < 0.1f * gizmoScale)
                         return i;
                 }
@@ -3608,12 +3807,12 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
             else
             {
                 var tipPos = entityPos + directions[i] * (0.85f * gizmoScale);
-                var tipSphere = new BlueSky.Core.Math.BoundingSphere(tipPos, 0.15f * gizmoScale);
+                var tipSphere = new BlueSky.Ramanujan.BoundingSphere(tipPos, 0.15f * gizmoScale);
                 if (ray.Intersects(tipSphere, out _)) return i;
 
                 for (float s = 0.2f; s < 0.8f; s += 0.2f)
                 {
-                    var shaftSphere = new BlueSky.Core.Math.BoundingSphere(entityPos + directions[i] * (s * gizmoScale), 0.08f * gizmoScale);
+                    var shaftSphere = new BlueSky.Ramanujan.BoundingSphere(entityPos + directions[i] * (s * gizmoScale), 0.08f * gizmoScale);
                     if (ray.Intersects(shaftSphere, out _)) return i;
                 }
             }
@@ -3659,6 +3858,20 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
         return true;
     }
 
+    public static bool IsAABBFrustumVisible(in BlueSky.Ramanujan.AABB box, ReadOnlySpan<System.Numerics.Vector4> planes)
+    {
+        for (int i = 0; i < 6; i++)
+        {
+            var p = planes[i];
+            float px = p.X >= 0f ? box.Max.X : box.Min.X;
+            float py = p.Y >= 0f ? box.Max.Y : box.Min.Y;
+            float pz = p.Z >= 0f ? box.Max.Z : box.Min.Z;
+            if (BlueSky.Ramanujan.RamanujanMath.Fma(p.X, px, BlueSky.Ramanujan.RamanujanMath.Fma(p.Y, py, BlueSky.Ramanujan.RamanujanMath.Fma(p.Z, pz, p.W))) < 0f)
+                return false;
+        }
+        return true;
+    }
+
     // ── IDisposable ─────────────────────────────────────────────────────
 
     public void Dispose()
@@ -3671,23 +3884,27 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
         _shadowPipeline?.Dispose();
         _gizmoPipeline?.Dispose();
         _shadowMap?.Dispose();
-        _uniformBuffer?.Dispose();
+        foreach (var b in _uniformBufferRing) b?.Dispose();
+        foreach (var b in _shadowUniformBufferRing) b?.Dispose();
+        foreach (var b in _instanceBufferRing) b?.Dispose();
+        foreach (var b in _frameInstanceBufferRing) b?.Dispose();
+        foreach (var b in _lightBufferRing) b?.Dispose();
+        foreach (var b in _lightCountBufferRing) b?.Dispose();
+        foreach (var b in _lightSettingsBufferRing) b?.Dispose();
+        foreach (var b in _shBufferRing) b?.Dispose();
+        foreach (var b in _skyParamsBufferRing) b?.Dispose();
+        foreach (var b in _hullLineVBRing) b?.Dispose();
         _terrainRenderer.Dispose();
-        
-        if (_gizmoUniformBuffers != null)
+        _vectraRenderer?.Dispose();
+
+        if (_gizmoUniformBufferRing != null)
         {
-            for (int i = 0; i < 4; i++)
-                _gizmoUniformBuffers[i]?.Dispose();
+            for (int i = 0; i < _gizmoUniformBufferRing.Length; i++)
+                _gizmoUniformBufferRing[i]?.Dispose();
         }
-        _entityUniformBuffer?.Dispose();
-        _horizonViewUniformBuffer?.Dispose();
-        _lightBuffer?.Dispose();
-        _lightCountBuffer?.Dispose();
-        _lightSettingsBuffer?.Dispose();
-        _surfaceBuffer?.Dispose();
-        _shBuffer?.Dispose();
-        _skyParamsBuffer?.Dispose();
         _gradeLut?.Dispose();
+        _linearSampler?.Dispose();
+        _shadowSampler?.Dispose();
         _gizmoArrowVB?.Dispose();
         _gizmoArrowIB?.Dispose();
         _gizmoCubeVB?.Dispose();
@@ -3718,13 +3935,13 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
     }
 
     /// <summary>
-    private BlueSky.Core.Math.Matrix4x4 ApplyWheelTransformIfApplicable(
+    private BlueSky.Ramanujan.Matrix4x4 ApplyWheelTransformIfApplicable(
         MeshGPUData gpuData, 
         SubmeshInfo submesh, 
         int submeshIdx, 
-        BlueSky.Core.Gameplay.CarController carController, 
+        BlueSky.Airborne.CarController carController, 
         (string assetId, uint entityId) cacheKey, 
-        BlueSky.Core.Math.Matrix4x4 worldMatrix)
+        BlueSky.Ramanujan.Matrix4x4 worldMatrix)
     {
         if (carController == null || carController.WheelCount < 4)
             return worldMatrix;
@@ -3812,7 +4029,7 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
             var wheelTransform = System.Numerics.Matrix4x4.CreateTranslation(-centroid) *
                                  wheelRot *
                                  System.Numerics.Matrix4x4.CreateTranslation(centroid);
-            var ew = new BlueSky.Core.Math.Matrix4x4(
+            var ew = new BlueSky.Ramanujan.Matrix4x4(
                 wheelTransform.M11, wheelTransform.M12, wheelTransform.M13, wheelTransform.M14,
                 wheelTransform.M21, wheelTransform.M22, wheelTransform.M23, wheelTransform.M24,
                 wheelTransform.M31, wheelTransform.M32, wheelTransform.M33, wheelTransform.M34,
@@ -3895,7 +4112,7 @@ var uniformSpan = MemoryMarshal.CreateSpan(ref uniforms, 1);
     /// 3. Name similarity matching between submesh name and bone name.
     /// 4. Array structural matching (fallback to 1:1 if sizes align).
     /// </summary>
-    private static int[] BuildSkeletalSubmeshBoneMap(MeshGPUData gpuData, SkeletalMesh skelMesh, BlueSky.Core.Gameplay.CarController carController)
+    private static int[] BuildSkeletalSubmeshBoneMap(MeshGPUData gpuData, SkeletalMesh skelMesh, BlueSky.Airborne.CarController carController)
     {
         if (gpuData.Submeshes == null) return Array.Empty<int>();
         int[] boneMap = new int[gpuData.Submeshes.Count];

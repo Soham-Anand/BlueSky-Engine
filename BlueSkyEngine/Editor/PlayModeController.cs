@@ -3,15 +3,14 @@ using System.Diagnostics;
 using System.IO;
 using System.Numerics;
 using BlueSky.Editor.UI;
-using BlueSky.Platform;
-using BlueSky.Platform.Input;
-using BlueSky.Core.ECS;
-using BlueSky.Core.ECS.Builtin;
-using BlueSky.Core.Math;
-using BlueSky.Rendering;
+using BlueSky.Aegis;
+using BlueSky.Aegis.Input;
+using BlueSky.SkyCore;
+using BlueSky.SkyCore.Builtin;
+using BlueSky.BSR;
 using BlueSky.Core.Scripting;
-using BlueSky.Core.Scene;
-using BlueSky.Rendering.RHI;
+using BlueSky.Meridian;
+using BlueSky.BSR.RHI;
 
 namespace BlueSky.Editor;
 
@@ -23,15 +22,15 @@ partial class Program
 
         // Query all entities with rigidbody + transform
         var physicsQuery = _world.CreateQuery()
-            .All<BlueSky.Core.ECS.Builtin.PhysicsComponent>()
-            .All<BlueSky.Core.ECS.Builtin.TransformComponent>()
+            .All<BlueSky.SkyCore.Builtin.PhysicsComponent>()
+            .All<BlueSky.SkyCore.Builtin.TransformComponent>()
             .Build();
 
         var chunks = _world.GetQueryChunks(physicsQuery);
         foreach (var chunk in chunks)
         {
             var entities = chunk.GetEntities();
-            int transIdx = chunk.GetComponentIndex(typeof(BlueSky.Core.ECS.Builtin.TransformComponent));
+            int transIdx = chunk.GetComponentIndex(typeof(BlueSky.SkyCore.Builtin.TransformComponent));
 
             for (int i = 0; i < chunk.Count; i++)
             {
@@ -57,9 +56,9 @@ partial class Program
                 var physRot = System.Numerics.Quaternion.Slerp(previous.rot, current.rot, alpha);
 
                 // Update transform
-                ref var transform = ref chunk.GetComponent<BlueSky.Core.ECS.Builtin.TransformComponent>(i, transIdx);
-                transform.Position = new BlueSky.Core.Math.Vector3(physPos.X, physPos.Y, physPos.Z);
-                transform.Rotation = new BlueSky.Core.Math.Quaternion(physRot.X, physRot.Y, physRot.Z, physRot.W);
+                ref var transform = ref chunk.GetComponent<BlueSky.SkyCore.Builtin.TransformComponent>(i, transIdx);
+                transform.Position = new BlueSky.Ramanujan.Vector3(physPos.X, physPos.Y, physPos.Z);
+                transform.Rotation = new BlueSky.Ramanujan.Quaternion(physRot.X, physRot.Y, physRot.Z, physRot.W);
             }
         }
     }
@@ -168,9 +167,9 @@ partial class Program
         // Add transform at origin
         var transform = new TransformComponent
         {
-            Position = new BlueSky.Core.Math.Vector3(0, 0, 0),
-            Rotation = BlueSky.Core.Math.Quaternion.Identity,
-            Scale = new BlueSky.Core.Math.Vector3(1, 1, 1)
+            Position = new BlueSky.Ramanujan.Vector3(0, 0, 0),
+            Rotation = BlueSky.Ramanujan.Quaternion.Identity,
+            Scale = new BlueSky.Ramanujan.Vector3(1, 1, 1)
         };
         _world.AddComponent(entity, transform);
 

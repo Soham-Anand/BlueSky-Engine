@@ -1,9 +1,9 @@
 using System;
-using BlueSky.Core.ECS;
-using BlueSky.Core.ECS.Builtin;
-using BlueSky.Core.Scene;
+using BlueSky.SkyCore;
+using BlueSky.SkyCore.Builtin;
+using BlueSky.Meridian;
 using BlueSky.Airborne;
-using BlueSky.Rendering;
+using BlueSky.BSR;
 
 namespace BlueSky.Editor.Services;
 
@@ -26,7 +26,7 @@ public sealed class PlayModeService
 
         // The visualizer is opt-in for each play session. Otherwise a stale
         // editor toggle can draw projected labels over the viewport.
-        BlueSky.Runtime.PhysicsDebugVisualizer.SetEnabled(false);
+        BlueSky.Pulse.PhysicsDebugVisualizer.SetEnabled(false);
 
         Snapshot = new SceneSnapshot();
         Snapshot.Capture(world);
@@ -157,7 +157,7 @@ public sealed class PlayModeService
 
         IsPlaying = false;
         IsPaused = false;
-        BlueSky.Runtime.PhysicsDebugVisualizer.SetEnabled(false);
+        BlueSky.Pulse.PhysicsDebugVisualizer.SetEnabled(false);
 
         // ── Clean up car controller system (resets IsInitialized, clears state) ──
         log("Cleaning up car controller system...");

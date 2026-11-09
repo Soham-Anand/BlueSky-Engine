@@ -16,6 +16,9 @@ public enum TokenType
     True,
     False,
     While,
+    For,
+    Break,
+    Continue,
     And,
     Or,
     Not,
@@ -42,6 +45,7 @@ public enum TokenType
     LeftBracket,
     RightBracket,
     Comma,
+    Semicolon,
     
     // Special
     Newline,

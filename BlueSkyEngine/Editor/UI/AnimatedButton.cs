@@ -1,7 +1,7 @@
 using System;
 using System.Numerics;
 using System.Collections.Generic;
-using BlueSky.Rendering.RHI;
+using BlueSky.BSR.RHI;
 
 namespace BlueSky.Editor.UI;
 
@@ -42,7 +42,8 @@ public class AnimatedButton
         Vector4? pressColor = null,
         Vector4? textColor = null,
         bool enabled = true,
-        string icon = "")
+        string icon = "",
+        EditorUI.UIIcon iconKind = EditorUI.UIIcon.None)
     {
         // Get or create state for this button
         if (!_buttonStates.TryGetValue(id, out var state))
@@ -52,10 +53,10 @@ public class AnimatedButton
         }
         
         // Default colors
-        normalColor ??= ModernTheme.ToolbarBtnNormal;
-        hoverColor ??= ModernTheme.ToolbarBtnHover;
-        pressColor ??= ModernTheme.Accent;
-        textColor ??= ModernTheme.TextPrimary;
+        normalColor ??= EditorTheme.ToolbarBtnNormal;
+        hoverColor ??= EditorTheme.ToolbarBtnHover;
+        pressColor ??= EditorTheme.Accent;
+        textColor ??= EditorTheme.TextPrimary;
         
         // Check interaction
         bool isHovered = ui.IsHovering(x, y, w, h) && enabled;
@@ -79,41 +80,55 @@ public class AnimatedButton
             bgColor = Vector4.Lerp(bgColor, pressColor.Value, state.PressAmount.Current);
         }
         
-        // Draw a flat, sharp button. The transport controls should feel like
-        // editor chrome, not animated launcher UI.
-        ui.Panel(x, y, w, h, enabled ? bgColor : ModernTheme.Bg2);
+        float r = MathF.Min(EditorTheme.ButtonRadius, h * 0.35f);
+        ui.RoundedPanel(x, y, w, h, enabled ? bgColor : EditorTheme.Bg2, r);
+
         var borderColor = enabled && state.HoverAmount.Current > 0.05f
-            ? ModernTheme.WithAlpha(pressColor.Value, 0.75f)
-            : ModernTheme.Border1;
-        ui.Panel(x, y, w, 1, borderColor);
-        ui.Panel(x, y + h - 1, w, 1, borderColor);
-        ui.Panel(x, y, 1, h, borderColor);
-        ui.Panel(x + w - 1, y, 1, h, borderColor);
+            ? EditorTheme.WithAlpha(pressColor.Value, 0.85f)
+            : EditorTheme.Border1;
+        EditorChrome.Stroke(ui, x, y, w, h, borderColor);
+        if (enabled)
+            ui.Panel(x + 2, y + 1, MathF.Max(0, w - 4), 1, EditorTheme.Highlight);
         
         // Text with icon
         float textX = x + w * 0.5f;
-        float textY = y + h * 0.5f - 8;
-        
-        if (!string.IsNullOrEmpty(icon))
+        float textY = y + h * 0.5f - 7;
+
+        Vector4 glyphColor = enabled ? EditorTheme.WithAlpha(pressColor.Value, 0.95f) : EditorTheme.TextDisabled;
+        if (iconKind != EditorUI.UIIcon.None)
+        {
+            // Vector icon + text layout
+            float iconSize = Math.Min(w, h) * 0.52f;
+            float textWidth = ui.MeasureText(text);
+            float totalWidth = iconSize + (text.Length > 0 ? textWidth + 7 : 0);
+            float startX = x + (w - totalWidth) * 0.5f;
+            float iconY = y + (h - iconSize) * 0.5f;
+
+            ui.Icon(iconKind, startX, iconY, iconSize, glyphColor);
+
+            if (text.Length > 0)
+            {
+                ui.SetCursor(startX + iconSize + 7, textY);
+                ui.Text(text, enabled ? textColor.Value : EditorTheme.TextDisabled);
+            }
+        }
+        else if (!string.IsNullOrEmpty(icon))
         {
             // Icon + text layout
-            float iconWidth = icon.Length * 7.2f;
-            float textWidth = text.Length * 7.2f;
+            float iconWidth = ui.MeasureText(icon);
+            float textWidth = ui.MeasureText(text);
             float totalWidth = iconWidth + textWidth + 6;
             float startX = x + (w - totalWidth) * 0.5f;
             
             ui.SetCursor(startX, textY);
-            ui.Text(icon, enabled ? ModernTheme.WithAlpha(pressColor.Value, 0.9f) : ModernTheme.TextDisabled);
+            ui.Text(icon, enabled ? EditorTheme.WithAlpha(pressColor.Value, 0.95f) : EditorTheme.TextDisabled);
             
             ui.SetCursor(startX + iconWidth + 6, textY);
-            ui.Text(text, enabled ? textColor.Value : ModernTheme.TextDisabled);
+            ui.Text(text, enabled ? textColor.Value : EditorTheme.TextDisabled);
         }
         else
         {
-            // Center text
-            float textWidth = text.Length * 7.2f;
-            ui.SetCursor(textX - textWidth * 0.5f, textY);
-            ui.Text(text, enabled ? textColor.Value : ModernTheme.TextDisabled);
+            ui.TextCentered(x, y, w, h, text, enabled ? textColor.Value : EditorTheme.TextDisabled);
         }
         
         // Detect click (mouse was down and now released while hovering)
@@ -134,16 +149,18 @@ public class AnimatedButton
         string text,
         uint id,
         bool enabled = true,
-        string icon = "")
+        string icon = "",
+        EditorUI.UIIcon iconKind = EditorUI.UIIcon.None)
     {
         return Render(
             ui, x, y, w, h, text, id,
-            normalColor: ModernTheme.Accent,
-            hoverColor: ModernTheme.AccentHover,
-            pressColor: ModernTheme.AccentPressed,
-            textColor: ModernTheme.TextPrimary,
+            normalColor: EditorTheme.Accent,
+            hoverColor: EditorTheme.AccentHover,
+            pressColor: EditorTheme.AccentDim,
+            textColor: EditorTheme.TextPrimary,
             enabled: enabled,
-            icon: icon
+            icon: icon,
+            iconKind: iconKind
         );
     }
     
@@ -156,16 +173,18 @@ public class AnimatedButton
         string text,
         uint id,
         bool enabled = true,
-        string icon = "")
+        string icon = "",
+        EditorUI.UIIcon iconKind = EditorUI.UIIcon.None)
     {
         return Render(
             ui, x, y, w, h, text, id,
-            normalColor: ModernTheme.WithAlpha(ModernTheme.Red, 0.2f),
-            hoverColor: ModernTheme.WithAlpha(ModernTheme.Red, 0.4f),
-            pressColor: ModernTheme.Red,
-            textColor: ModernTheme.Red,
+            normalColor: EditorTheme.WithAlpha(EditorTheme.Red, 0.22f),
+            hoverColor: EditorTheme.WithAlpha(EditorTheme.Red, 0.42f),
+            pressColor: EditorTheme.Red,
+            textColor: EditorTheme.Red,
             enabled: enabled,
-            icon: icon
+            icon: icon,
+            iconKind: iconKind
         );
     }
     
@@ -178,16 +197,18 @@ public class AnimatedButton
         string text,
         uint id,
         bool enabled = true,
-        string icon = "")
+        string icon = "",
+        EditorUI.UIIcon iconKind = EditorUI.UIIcon.None)
     {
         return Render(
             ui, x, y, w, h, text, id,
-            normalColor: ModernTheme.WithAlpha(ModernTheme.Green, 0.2f),
-            hoverColor: ModernTheme.WithAlpha(ModernTheme.Green, 0.4f),
-            pressColor: ModernTheme.Green,
-            textColor: ModernTheme.Green,
+            normalColor: EditorTheme.WithAlpha(EditorTheme.Green, 0.22f),
+            hoverColor: EditorTheme.WithAlpha(EditorTheme.Green, 0.42f),
+            pressColor: EditorTheme.Green,
+            textColor: EditorTheme.Green,
             enabled: enabled,
-            icon: icon
+            icon: icon,
+            iconKind: iconKind
         );
     }
 }

@@ -1,7 +1,7 @@
 using System;
 using System.Collections.Generic;
 
-namespace BlueSky.Rendering.RHI;
+namespace BlueSky.BSR.RHI;
 
 internal static class RHIValidation
 {

@@ -1,5 +1,5 @@
 using BlueSky.Editor.UI;
-using BlueSky.Rendering.RHI;
+using BlueSky.BSR.RHI;
 
 namespace BlueSky.Editor.Services;
 
@@ -8,7 +8,7 @@ namespace BlueSky.Editor.Services;
 /// </summary>
 public sealed class ViewportService
 {
-    public BlueSky.Rendering.Viewport? Viewport { get; set; }
+    public BlueSky.BSR.Viewport? Viewport { get; set; }
     public BlueSky.Editor.ViewportRenderer? EditorViewportRenderer { get; set; }
 
     public IRHITexture? DepthTexture { get; set; }

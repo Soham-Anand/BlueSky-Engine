@@ -1,7 +1,7 @@
 using System;
 using System.IO;
 using System.Numerics;
-using BlueSky.Rendering.RHI;
+using BlueSky.BSR.RHI;
 using StbTrueTypeSharp;
 
 namespace BlueSky.Editor.UI;

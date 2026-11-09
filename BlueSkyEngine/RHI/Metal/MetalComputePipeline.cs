@@ -1,8 +1,8 @@
 using System;
 using System.Runtime.InteropServices;
-using static BlueSky.Rendering.RHI.Metal.MetalInterop;
+using static BlueSky.BSR.RHI.Metal.MetalInterop;
 
-namespace BlueSky.Rendering.RHI.Metal
+namespace BlueSky.BSR.RHI.Metal
 {
     /// <summary>
     /// Metal compute pipeline state — wraps MTLComputePipelineState.

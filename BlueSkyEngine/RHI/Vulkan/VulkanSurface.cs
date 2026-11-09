@@ -1,9 +1,9 @@
 using System;
-using BlueSky.Platform;
-using BlueSky.Platform.Linux;
-using BlueSky.Platform.Windows;
+using BlueSky.Aegis;
+using BlueSky.Aegis.Linux;
+using BlueSky.Aegis.Windows;
 
-namespace BlueSky.Rendering.RHI.Vulkan;
+namespace BlueSky.BSR.RHI.Vulkan;
 
 /// <summary>
 /// Creates a VkSurfaceKHR from a platform-specific window handle.

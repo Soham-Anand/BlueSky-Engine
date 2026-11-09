@@ -3,10 +3,10 @@ using System.Numerics;
 using System.Linq;
 using BlueSky.Airborne;
 using BlueSky.Core.Gameplay;
-using BlueSky.Core.ECS;
-using BlueSky.Core.ECS.Builtin;
-using BVec3 = BlueSky.Core.Math.Vector3;
-using BQuat = BlueSky.Core.Math.Quaternion;
+using BlueSky.SkyCore;
+using BlueSky.SkyCore.Builtin;
+using BVec3 = BlueSky.Ramanujan.Vector3;
+using BQuat = BlueSky.Ramanujan.Quaternion;
 
 namespace BlueSky.Tests;
 

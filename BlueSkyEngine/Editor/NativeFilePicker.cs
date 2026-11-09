@@ -32,32 +32,57 @@ public static class NativeFilePicker
         return null;
     }
 
+    /// <summary>
+    /// Runs an AppleScript with real process arguments. Values travel through
+    /// <c>argv</c>, so spaces and quotes in titles or paths need no escaping.
+    /// Returns the script output, or null if the user cancelled or the script failed.
+    /// </summary>
+    private static string? RunAppleScript(string[] scriptLines, params string[] scriptArgs)
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName = "osascript",
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+        foreach (var line in scriptLines)
+        {
+            psi.ArgumentList.Add("-e");
+            psi.ArgumentList.Add(line);
+        }
+        foreach (var arg in scriptArgs)
+            psi.ArgumentList.Add(arg);
+
+        using var process = Process.Start(psi);
+        if (process == null) return null;
+
+        var errorTask = process.StandardError.ReadToEndAsync();
+        string output = process.StandardOutput.ReadToEnd().Trim();
+        process.WaitForExit();
+        string error = errorTask.Result.Trim();
+
+        if (process.ExitCode == 0)
+            return string.IsNullOrEmpty(output) ? null : output;
+
+        // AppleScript error -128 means the user pressed Cancel; anything else is a real failure.
+        if (!error.Contains("(-128)"))
+            Console.WriteLine($"[NativeFilePicker] osascript failed (exit {process.ExitCode}): {error}");
+        return null;
+    }
+
     private static string? OpenFileMacOS(string title, string filter)
     {
         try
         {
-            // Use osascript to show native macOS file picker
-            var process = new Process
+            return RunAppleScript(new[]
             {
-                StartInfo = new ProcessStartInfo
-                {
-                    FileName = "osascript",
-                    Arguments = $"-e 'POSIX path of (choose file with prompt \"{title}\")'",
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    UseShellExecute = false,
-                    CreateNoWindow = true
-                }
-            };
-
-            process.Start();
-            string output = process.StandardOutput.ReadToEnd().Trim();
-            process.WaitForExit();
-
-            if (process.ExitCode == 0 && !string.IsNullOrEmpty(output))
-            {
-                return output;
-            }
+                "on run argv",
+                "set theFile to choose file with prompt (item 1 of argv)",
+                "return POSIX path of theFile",
+                "end run"
+            }, title);
         }
         catch (Exception ex)
         {
@@ -132,33 +157,26 @@ public static class NativeFilePicker
     {
         try
         {
-            string dir = !string.IsNullOrEmpty(defaultDir) ? defaultDir : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            string dir = !string.IsNullOrEmpty(defaultDir) && Directory.Exists(defaultDir)
+                ? defaultDir
+                : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
             string defaultName = $"Untitled.{extension}";
             string prompt = !string.IsNullOrEmpty(filterName) ? $"{filterName} (*.{extension})" : $"*.{extension}";
 
-            var process = new Process
+            string? output = RunAppleScript(new[]
             {
-                StartInfo = new ProcessStartInfo
-                {
-                    FileName = "osascript",
-                    Arguments = $"-e 'POSIX path of (choose file name with prompt \"{prompt}\" default name \"{defaultName}\" default location POSIX file \"{dir}\")'",
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    UseShellExecute = false,
-                    CreateNoWindow = true
-                }
-            };
+                "on run argv",
+                "set theFile to choose file name with prompt (item 1 of argv) default name (item 2 of argv) default location (POSIX file (item 3 of argv))",
+                "return POSIX path of theFile",
+                "end run"
+            }, prompt, defaultName, dir);
 
-            process.Start();
-            string output = process.StandardOutput.ReadToEnd().Trim();
-            process.WaitForExit();
+            if (string.IsNullOrEmpty(output))
+                return null;
 
-            if (process.ExitCode == 0 && !string.IsNullOrEmpty(output))
-            {
-                if (!output.EndsWith($".{extension}", StringComparison.OrdinalIgnoreCase))
-                    output += $".{extension}";
-                return output;
-            }
+            if (!output.EndsWith($".{extension}", StringComparison.OrdinalIgnoreCase))
+                output += $".{extension}";
+            return output;
         }
         catch (Exception ex)
         {

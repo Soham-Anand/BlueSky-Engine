@@ -12,6 +12,9 @@ public static class EngineTestSuiteRunner
         
         bool allPassed = true;
         
+        allPassed &= PlatformDetectionTests.RunAllTests();
+        allPassed &= RamanujanMathTests.RunAllTests();
+        allPassed &= PrismRenderTests.RunAllTests();
         allPassed &= ECSTests.RunAllTests();
         allPassed &= PolarisSIMDTests.RunAllTests();
         allPassed &= TeaScriptTests.RunAllTests();
@@ -28,6 +31,9 @@ public static class EngineTestSuiteRunner
         allPassed &= StrataPackTests.RunAllTests();
         allPassed &= StrataConfiguratorTests.RunAllTests();
         allPassed &= EditorStabilityTests.RunAllTests();
+        allPassed &= VectraTests.RunAllTests();
+        allPassed &= MetalAsyncTests.RunAllTests();
+        allPassed &= AvalanchePackagerTests.RunAllTests();
 
         Console.WriteLine("\n===============================================================");
         if (allPassed)

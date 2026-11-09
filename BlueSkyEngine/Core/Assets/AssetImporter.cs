@@ -5,21 +5,18 @@
 // OVERVIEW:
 // Meshes carry geometry only: [vertices][indices][submesh_info(offset,count)].
 // Every surface shades with the single global clay in the viewport renderer.
-// Texture extraction from source files is preserved for Strata (future).
+// Texture extraction from source files is preserved for Strata.
 //
 // ═══════════════════════════════════════════════════════════════════════════
 
-using BlueSky.Core.Diagnostics;
+using BlueSky.Pulse;
+using BlueSky.BSR.Strata;
 using BlueSky.Motif;
-using System.Collections.Concurrent;
-using System.Globalization;
-using System.Threading.Tasks;
 
 namespace BlueSky.Core.Assets;
 
 /// <summary>
-/// Asset import pipeline - converts source files (FBX, PNG, etc.) to .blueasset files.
-/// Like Unreal's asset import system!
+/// Asset import pipeline - converts source files (.stratapack, .tea, etc.) to .blueskyasset files.
 /// </summary>
 public class AssetImporter
 {
@@ -42,9 +39,7 @@ public class AssetImporter
         _contentDirectory = project.GetContentDirectory(projectPath);
 
         // Register default importers
-        RegisterImporter(new MeshImportHandler());
-        RegisterImporter(new FBXImportHandler());
-        RegisterImporter(new GLTFImportHandler());
+        RegisterImporter(new UnsupportedLegacyMeshImportHandler());
         RegisterImporter(new StratapackImportHandler());
         RegisterImporter(new ScriptImportHandler());
 
@@ -63,7 +58,7 @@ public class AssetImporter
     }
 
     /// <summary>
-    /// Import a source file and create a .blueasset.
+    /// Import a source file and create a .blueskyasset.
     /// </summary>
     public BlueAsset? Import(string sourceFilePath, ImportOptions? options = null)
     {
@@ -95,13 +90,12 @@ public class AssetImporter
                 ImportDate = DateTime.UtcNow,
                 ImportSettings = options?.Settings ?? new()
             };
-            // Determine target directory and create it before import
+
             var assetFileName = $"{asset.AssetName}.blueskyasset";
             string assetPath;
             
             if (extension == ".obj" || extension == ".glb" || extension == ".gltf" || extension == ".fbx" || extension == ".stratapack")
             {
-                // Create subfolder for mesh formats and their textures
                 string subDir = Path.Combine(_assetsDirectory, asset.AssetName);
                 Directory.CreateDirectory(subDir);
                 assetPath = Path.Combine(subDir, assetFileName);
@@ -126,7 +120,6 @@ public class AssetImporter
 
             // Save asset file
             asset.PayloadData = importResult.PayloadData ?? Array.Empty<byte>();
-            asset.DataFile = importResult.DataFilePath ?? "";
             asset.ThumbnailFile = importResult.ThumbnailPath ?? "";
             
             if (!asset.Save(assetPath))
@@ -236,22 +229,6 @@ public class AssetImporter
         ErrorHandler.LogInfo($"Reimport complete: {successCount}/{assetsToReimport.Count} succeeded", "AssetImporter");
         return successCount;
     }
-
-    private string GetAssetSubdirectory(AssetType type)
-    {
-        return type switch
-        {
-            AssetType.Mesh => "Meshes",
-            AssetType.StaticMesh => "Meshes",
-            AssetType.SkeletalMesh => "Meshes",
-            AssetType.Texture => "Textures",
-            AssetType.Scene => "Scenes",
-            AssetType.Terrain => "Terrains",
-            AssetType.Script => "Scripts",
-            AssetType.Audio => "Audio",
-            _ => "Other"
-        };
-    }
 }
 
 /// <summary>
@@ -277,31 +254,28 @@ public class ImportResult
     public bool Success { get; set; }
     public string? Error { get; set; }
     public byte[]? PayloadData { get; set; }
-    public string? DataFilePath { get; set; } // DEPRECATED
     public string? ThumbnailPath { get; set; }
 }
 
 /// <summary>
-/// Mesh import handler (.obj).
-/// Direct source-mesh import was removed: Blender Ease + .stratapack is the
-/// only mesh door. This handler stays registered so the dispatcher reports a
-/// loud rejection instead of "no importer".
+/// Direct source-mesh import (.obj, .fbx, .gltf, .glb) was replaced by Blender Ease + .stratapack.
+/// This single handler stays registered so the dispatcher reports a clear, actionable message.
 /// </summary>
-public class MeshImportHandler : IAssetImportHandler
+public class UnsupportedLegacyMeshImportHandler : IAssetImportHandler
 {
-    public string[] SupportedExtensions => new[] { ".obj" };
+    public string[] SupportedExtensions => new[] { ".obj", ".fbx", ".gltf", ".glb" };
     public AssetType AssetType => AssetType.StaticMesh;
 
     public ImportResult Import(string sourceFile, BlueAsset asset, ImportOptions? options)
     {
+        string ext = Path.GetExtension(sourceFile).ToLowerInvariant();
         return new ImportResult
         {
             Success = false,
-            Error = $"Direct .obj import is no longer supported — use BlueSky Engine Ease in Blender and import the .stratapack instead. (File: {Path.GetFileName(sourceFile)})"
+            Error = $"Direct {ext} import is no longer supported — use BlueSky Engine Ease in Blender and import the .stratapack instead. (File: {Path.GetFileName(sourceFile)})"
         };
     }
 }
-
 
 /// <summary>
 /// Script import handler (.bluescript, .cs, .tea files).
@@ -318,7 +292,7 @@ public class ScriptImportHandler : IAssetImportHandler
             return new ImportResult
             {
                 Success = true,
-                DataFilePath = sourceFile
+                PayloadData = File.Exists(sourceFile) ? File.ReadAllBytes(sourceFile) : Array.Empty<byte>()
             };
         }
         catch (Exception ex)
@@ -333,86 +307,7 @@ public class ScriptImportHandler : IAssetImportHandler
 }
 
 /// <summary>
-/// FBX import handler (.fbx).
-/// Direct source-mesh import was removed: Blender Ease + .stratapack is the
-/// only mesh door. This handler stays registered so the dispatcher reports a
-/// loud rejection instead of "no importer".
-/// </summary>
-public class FBXImportHandler : IAssetImportHandler
-{
-    public string[] SupportedExtensions => new[] { ".fbx" };
-    public AssetType AssetType => AssetType.StaticMesh;
-
-    public ImportResult Import(string sourceFile, BlueAsset asset, ImportOptions? options)
-    {
-        return new ImportResult
-        {
-            Success = false,
-            Error = $"Direct .fbx import is no longer supported — use BlueSky Engine Ease in Blender and import the .stratapack instead. (File: {Path.GetFileName(sourceFile)})"
-        };
-    }
-}
-
-/// <summary>
-/// Expanded vertex with position, normal, and UV for deduplication.
-/// Used during FBX import to expand per-polygon-vertex attributes into unique vertices.
-/// </summary>
-internal readonly struct ExpandedVertex : IEquatable<ExpandedVertex>
-{
-    public readonly System.Numerics.Vector3 Position;
-    public readonly System.Numerics.Vector3 Normal;
-    public readonly System.Numerics.Vector2 UV;
-
-    public ExpandedVertex(System.Numerics.Vector3 position, System.Numerics.Vector3 normal, System.Numerics.Vector2 uv)
-    {
-        Position = position;
-        Normal = normal;
-        UV = uv;
-    }
-
-    public bool Equals(ExpandedVertex other)
-    {
-        return Position == other.Position && Normal == other.Normal && UV == other.UV;
-    }
-
-    public override bool Equals(object? obj) => obj is ExpandedVertex v && Equals(v);
-
-    public override int GetHashCode()
-    {
-        return HashCode.Combine(
-            Position.X, Position.Y, Position.Z,
-            Normal.X, Normal.Y,
-            UV.X, UV.Y);
-    }
-}
-
-/// <summary>
-/// GLTF/GLB import handler - imports ALL meshes and textures from GLTF 2.0 files.
-/// Handles multi-mesh GLB files (geometry only; surface colors come from the global clay).
-/// Properly applies node transforms from scene graph to position mesh parts correctly.
-/// 
-/// CRITICAL FIX: Node Transform Application
-/// ─────────────────────────────────────────
-/// GLTF files store mesh geometry in local space and use a scene graph (nodes) to position
-/// meshes in world space. Each node has a transform (TRS or Matrix) that must be applied to
-/// vertices during import, otherwise mesh parts appear "exploded" (disconnected/floating).
-/// 
-/// Scene Graph Structure:
-///   Scene → Root Nodes → Child Nodes → Mesh References
-///   Each Node: Translation, Rotation (quaternion), Scale, or Matrix (4x4)
-///   World Transform = Parent Transform × Local Transform (hierarchical)
-/// 
-/// Implementation:
-///   1. ComputeNodeTransforms() recursively traverses scene graph from root nodes
-///   2. Computes world transform for each node (parent × local accumulation)
-///   3. During mesh extraction, applies world transform to vertex positions/normals
-///   4. Result: mesh parts correctly positioned relative to each other
-/// 
-/// Matrix Math:
-///   Local Transform = Scale × Rotation × Translation (GLTF spec order)
-///   World Transform = Parent × Local (row-major multiplication)
-///   Vertex Position = Transform(localPos, worldTransform) × scaleFactor
-///   Vertex Normal = Normalize(TransformNormal(localNormal, worldTransform))
+/// StrataPack (.stratapack) import handler — imports Packed32 meshes, skeletons, vertex AO, and Strata surfaces.
 /// </summary>
 public class StratapackImportHandler : IAssetImportHandler
 {
@@ -424,10 +319,10 @@ public class StratapackImportHandler : IAssetImportHandler
         const string Ctx = "StratapackImportHandler";
         try
         {
-            BlueSky.Rendering.Strata.StrataPack.PackFile pack;
+            BlueSky.BSR.Strata.StrataPack.PackFile pack;
             try
             {
-                pack = BlueSky.Rendering.Strata.StrataPack.Decode(File.ReadAllBytes(sourceFile));
+                pack = BlueSky.BSR.Strata.StrataPack.Decode(File.ReadAllBytes(sourceFile));
             }
             catch (InvalidOperationException ex)
             {
@@ -456,7 +351,7 @@ public class StratapackImportHandler : IAssetImportHandler
                 && options.Settings.TryGetValue("TargetDirectory", out var td) && td is string tdStr
                 ? tdStr : Path.Combine("Assets", asset.AssetName);
             var (strataDir, texturesDir) =
-                BlueSky.Core.Assets.StrataImportWriter.EnsureMaterialsLayout(targetDir);
+                BlueSky.BSR.Strata.StrataImportWriter.EnsureMaterialsLayout(targetDir);
 
             byte[]? Blob(ulong off, ulong size)
             {
@@ -561,7 +456,7 @@ public class StratapackImportHandler : IAssetImportHandler
                         if (blob == null) continue;
                         string role = (tex.Role ?? "").ToLowerInvariant();
                         // Persist every pack texture for user override.
-                        BlueSky.Core.Assets.StrataImportWriter.WriteTextureBlob(
+                        BlueSky.BSR.Strata.StrataImportWriter.WriteTextureBlob(
                             texturesDir, $"slot{slot}_{role}_{tex.Width}x{tex.Height}",
                             tex.Width, tex.Height, blob);
                         if (role.Contains("albedo") || role.Contains("basecolor") || role.Contains("diffuse"))
@@ -582,7 +477,7 @@ public class StratapackImportHandler : IAssetImportHandler
                         if (bent.Slot != slot) continue;
                         var blob = Blob(bent.Offset, bent.Size);
                         if (blob == null) continue;
-                        BlueSky.Core.Assets.StrataImportWriter.WriteTextureBlob(
+                        BlueSky.BSR.Strata.StrataImportWriter.WriteTextureBlob(
                             texturesDir, $"slot{slot}_bent_{bent.Width}x{bent.Height}",
                             bent.Width, bent.Height, blob);
                         if (string.Equals(bent.Encoding, "world", StringComparison.OrdinalIgnoreCase))
@@ -592,7 +487,7 @@ public class StratapackImportHandler : IAssetImportHandler
                                 $"[StratapackImportHandler] Slot {slot} bent map encoding '{bent.Encoding}' != world — persisted, not assembled.", Ctx);
                     }
 
-                    var mat = BlueSky.Rendering.Strata.StrataImporter.Assemble(
+                    var mat = BlueSky.BSR.Strata.StrataImporter.Assemble(
                         $"{meshTag}_slot{slot}",
                         alb,
                         surf?.Metallic ?? 0f,
@@ -611,8 +506,8 @@ public class StratapackImportHandler : IAssetImportHandler
                         bentMap: bentBytes, bentW: bentW, bentH: bentH);
 
                     string stratamatPath =
-                        BlueSky.Core.Assets.StrataImportWriter.WriteStrataMaterial(strataDir, mat);
-                    BlueSky.Core.Assets.StrataImportWriter.LinkSlot(meshAsset.Metadata, slot, stratamatPath);
+                        BlueSky.BSR.Strata.StrataImportWriter.WriteStrataMaterial(strataDir, mat);
+                    BlueSky.BSR.Strata.StrataImportWriter.LinkSlot(meshAsset.Metadata, slot, stratamatPath);
                     ErrorHandler.LogInfo(
                         $"[StratapackImportHandler] ✓ Slot {slot} → '{Path.GetFileName(stratamatPath)}' " +
                         $"(mask=0x{(uint)mat.Features:X})", Ctx);
@@ -702,25 +597,5 @@ public class StratapackImportHandler : IAssetImportHandler
         {
             return new ImportResult { Success = false, Error = ex.Message };
         }
-    }
-}
-/// <summary>
-/// GLTF/GLB import handler (.gltf/.glb).
-/// Direct source-mesh import was removed: Blender Ease + .stratapack is the
-/// only mesh door. This handler stays registered so the dispatcher reports a
-/// loud rejection instead of "no importer".
-/// </summary>
-public class GLTFImportHandler : IAssetImportHandler
-{
-    public string[] SupportedExtensions => new[] { ".gltf", ".glb" };
-    public AssetType AssetType => AssetType.StaticMesh;
-
-    public ImportResult Import(string sourceFile, BlueAsset asset, ImportOptions? options)
-    {
-        return new ImportResult
-        {
-            Success = false,
-            Error = $"Direct {Path.GetExtension(sourceFile).ToLowerInvariant()} import is no longer supported — use BlueSky Engine Ease in Blender and import the .stratapack instead. (File: {Path.GetFileName(sourceFile)})"
-        };
     }
 }

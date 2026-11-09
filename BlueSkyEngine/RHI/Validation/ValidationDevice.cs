@@ -1,6 +1,6 @@
-using BlueSky.Platform;
+using BlueSky.Aegis;
 
-namespace BlueSky.Rendering.RHI;
+namespace BlueSky.BSR.RHI;
 
 internal sealed class ValidationDevice : IRHIDevice, IRHIWrapped<IRHIDevice>
 {
@@ -60,6 +60,24 @@ internal sealed class ValidationDevice : IRHIDevice, IRHIWrapped<IRHIDevice>
 
         var pipeline = _inner.CreateGraphicsPipeline(desc);
         return new ValidationPipeline(this, pipeline, desc);
+    }
+
+    public IRHISampler CreateSampler(SamplerDesc desc)
+    {
+        RHIValidation.RequireNotDisposed(_disposed, nameof(ValidationDevice));
+        var sampler = _inner.CreateSampler(desc);
+        return new ValidationSampler(this, sampler, desc);
+    }
+
+    public void GenerateMipmaps(IRHITexture texture)
+    {
+        RHIValidation.RequireNotDisposed(_disposed, nameof(ValidationDevice));
+        var validated = ExpectTexture(texture);
+        RHIValidation.Require(validated.Desc.MipLevels > 1, "GenerateMipmaps requires MipLevels > 1.");
+        RHIValidation.Require(validated.Desc.Format != TextureFormat.Depth32Float &&
+            validated.Desc.Format != TextureFormat.Depth24Stencil8,
+            "GenerateMipmaps does not support depth textures.");
+        _inner.GenerateMipmaps(validated.Inner);
     }
 
     public IRHICommandBuffer CreateCommandBuffer()
@@ -173,6 +191,14 @@ internal sealed class ValidationDevice : IRHIDevice, IRHIWrapped<IRHIDevice>
     {
         if (pipeline is not ValidationPipeline validated || validated.Owner != this)
             throw new ArgumentException("Pipeline must be created by this device.");
+        validated.RequireNotDisposed();
+        return validated;
+    }
+
+    internal ValidationSampler ExpectSampler(IRHISampler sampler)
+    {
+        if (sampler is not ValidationSampler validated || validated.Owner != this)
+            throw new ArgumentException("Sampler must be created by this device.");
         validated.RequireNotDisposed();
         return validated;
     }

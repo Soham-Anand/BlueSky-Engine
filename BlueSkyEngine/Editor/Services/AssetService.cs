@@ -192,7 +192,34 @@ public sealed class AssetService : IDisposable
             cancellationToken.ThrowIfCancellationRequested();
             string[] files = Directory.GetFiles(directory);
             cancellationToken.ThrowIfCancellationRequested();
-            return new ContentBrowserListing(directory, directories, files, null, generation);
+
+            // Converted audio is the canonical asset: hide the raw WAV/OGG/etc.
+            // when a sibling .echosource exists.
+            var convertedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var file in files)
+            {
+                if (Path.GetExtension(file).Equals(".echosource", StringComparison.OrdinalIgnoreCase))
+                    convertedNames.Add(Path.GetFileNameWithoutExtension(file));
+            }
+
+            var visible = new List<string>(files.Length);
+            foreach (var file in files)
+            {
+                string ext = Path.GetExtension(file);
+                bool rawAudio = ext.Equals(".wav", StringComparison.OrdinalIgnoreCase) ||
+                                ext.Equals(".ogg", StringComparison.OrdinalIgnoreCase) ||
+                                ext.Equals(".oga", StringComparison.OrdinalIgnoreCase) ||
+                                ext.Equals(".mp3", StringComparison.OrdinalIgnoreCase) ||
+                                ext.Equals(".flac", StringComparison.OrdinalIgnoreCase);
+                if (rawAudio && convertedNames.Contains(Path.GetFileNameWithoutExtension(file)))
+                    continue;
+
+                visible.Add(file);
+            }
+
+            Array.Sort(directories, StringComparer.OrdinalIgnoreCase);
+            visible.Sort(StringComparer.OrdinalIgnoreCase);
+            return new ContentBrowserListing(directory, directories, visible.ToArray(), null, generation);
         }
         catch (OperationCanceledException)
         {

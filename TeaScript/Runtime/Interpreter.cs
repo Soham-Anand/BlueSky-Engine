@@ -25,6 +25,7 @@ public class Interpreter
     {
         _globalEnvironment = new Environment();
         _currentEnvironment = _globalEnvironment;
+        RegisterCoreBuiltins();
     }
     
     /// <summary>
@@ -33,6 +34,69 @@ public class Interpreter
     public void RegisterNativeFunction(string name, Func<List<object?>, object?> implementation)
     {
         _globalEnvironment.Define(name, new NativeFunction(name, implementation));
+    }
+
+    /// <summary>
+    /// Core standard library, always available (engine bindings register more).
+    /// Pure functions of their arguments; units follow the double|string|bool|array model.
+    /// </summary>
+    private void RegisterCoreBuiltins()
+    {
+        double Num(List<object?> args, int i, string fn)
+        {
+            if (i >= args.Count) throw new Exception($"{fn} expects argument {i + 1}");
+            return ToNumber(args[i]);
+        }
+        void Arity(List<object?> args, int n, string fn)
+        {
+            if (args.Count != n) throw new Exception($"{fn} expects {n} arguments but got {args.Count}");
+        }
+
+        RegisterNativeFunction("len", args =>
+        {
+            Arity(args, 1, "len");
+            if (args[0] is List<object?> list) return (double)list.Count;
+            if (args[0] is string s) return (double)s.Length;
+            throw new Exception("len expects an array or string");
+        });
+        RegisterNativeFunction("push", args =>
+        {
+            if (args.Count != 2) throw new Exception("push expects 2 arguments");
+            if (args[0] is List<object?> list) { list.Add(args[1]); return (double)list.Count; }
+            throw new Exception("push expects an array");
+        });
+        RegisterNativeFunction("pop", args =>
+        {
+            Arity(args, 1, "pop");
+            if (args[0] is List<object?> list)
+            {
+                if (list.Count == 0) throw new Exception("pop of empty array");
+                var v = list[list.Count - 1];
+                list.RemoveAt(list.Count - 1);
+                return v;
+            }
+            throw new Exception("pop expects an array");
+        });
+        RegisterNativeFunction("sqrt", args => { Arity(args, 1, "sqrt"); return Math.Sqrt(Num(args, 0, "sqrt")); });
+        RegisterNativeFunction("abs", args => { Arity(args, 1, "abs"); return Math.Abs(Num(args, 0, "abs")); });
+        RegisterNativeFunction("sin", args => { Arity(args, 1, "sin"); return Math.Sin(Num(args, 0, "sin")); });
+        RegisterNativeFunction("cos", args => { Arity(args, 1, "cos"); return Math.Cos(Num(args, 0, "cos")); });
+        RegisterNativeFunction("tan", args => { Arity(args, 1, "tan"); return Math.Tan(Num(args, 0, "tan")); });
+        RegisterNativeFunction("print", args =>
+        {
+            Console.WriteLine(string.Join(" ", args));
+            return null;
+        });
+        RegisterNativeFunction("floor", args => { Arity(args, 1, "floor"); return Math.Floor(Num(args, 0, "floor")); });
+        RegisterNativeFunction("ceil", args => { Arity(args, 1, "ceil"); return Math.Ceiling(Num(args, 0, "ceil")); });
+        RegisterNativeFunction("min", args => { Arity(args, 2, "min"); return Math.Min(Num(args, 0, "min"), Num(args, 1, "min")); });
+        RegisterNativeFunction("max", args => { Arity(args, 2, "max"); return Math.Max(Num(args, 0, "max"), Num(args, 1, "max")); });
+        RegisterNativeFunction("clamp", args =>
+        {
+            Arity(args, 3, "clamp");
+            double v = Num(args, 0, "clamp"), lo = Num(args, 1, "clamp"), hi = Num(args, 2, "clamp");
+            return Math.Min(Math.Max(v, lo), hi);
+        });
     }
 
     public bool HasFunction(string name)
@@ -92,6 +156,13 @@ public class Interpreter
             case WhileStatement whileStmt:
                 ExecuteWhileStatement(whileStmt);
                 break;
+            case ForStatement forStmt:
+                ExecuteForStatement(forStmt);
+                break;
+            case BreakStatement:
+                throw new BreakException();
+            case ContinueStatement:
+                throw new ContinueException();
             case ReturnStatement ret:
                 ExecuteReturnStatement(ret);
                 break;
@@ -141,7 +212,54 @@ public class Interpreter
             // Empty-body loops still need a budget check on every iteration.
             TickExecution();
             if (!IsTruthy(EvaluateExpression(statement.Condition))) break;
-            ExecuteBlock(statement.Body, new Environment(_currentEnvironment));
+            try
+            {
+                ExecuteBlock(statement.Body, new Environment(_currentEnvironment));
+            }
+            catch (ContinueException)
+            {
+                continue;
+            }
+            catch (BreakException)
+            {
+                break;
+            }
+        }
+    }
+
+    private void ExecuteForStatement(ForStatement statement)
+    {
+        var loopEnv = new Environment(_currentEnvironment);
+        var previous = _currentEnvironment;
+        _currentEnvironment = loopEnv;
+        try
+        {
+            if (statement.Initializer != null)
+                ExecuteStatement(statement.Initializer);
+            while (true)
+            {
+                TickExecution();
+                if (statement.Condition != null && !IsTruthy(EvaluateExpression(statement.Condition)))
+                    break;
+                try
+                {
+                    ExecuteBlock(statement.Body, new Environment(_currentEnvironment));
+                }
+                catch (ContinueException)
+                {
+                    // Fall through to the increment.
+                }
+                catch (BreakException)
+                {
+                    break;
+                }
+                if (statement.Increment != null)
+                    EvaluateExpression(statement.Increment);
+            }
+        }
+        finally
+        {
+            _currentEnvironment = previous;
         }
     }
     
@@ -204,12 +322,18 @@ public class Interpreter
     private object? EvaluateBinaryExpression(BinaryExpression expression)
     {
         object? left = EvaluateExpression(expression.Left);
+
+        if (expression.Operator == TokenType.And)
+            return IsTruthy(left) && IsTruthy(EvaluateExpression(expression.Right));
+        if (expression.Operator == TokenType.Or)
+            return IsTruthy(left) || IsTruthy(EvaluateExpression(expression.Right));
+
         object? right = EvaluateExpression(expression.Right);
         
         switch (expression.Operator)
         {
             case TokenType.Plus:
-                if (left is double l1 && right is double r1) return l1 + r1;
+                if (IsNumeric(left) && IsNumeric(right)) return ToNumber(left) + ToNumber(right);
                 if (left is string || right is string) return $"{left}{right}";
                 break;
             case TokenType.Minus:
@@ -236,10 +360,6 @@ public class Interpreter
                 return ToNumber(left) <= ToNumber(right);
             case TokenType.GreaterEqual:
                 return ToNumber(left) >= ToNumber(right);
-            case TokenType.And:
-                return IsTruthy(left) && IsTruthy(right);
-            case TokenType.Or:
-                return IsTruthy(left) || IsTruthy(right);
         }
         
         throw new Exception($"Invalid binary operation: {expression.Operator}");
@@ -371,18 +491,33 @@ public class Interpreter
         return true;
     }
     
+    private static bool IsNumeric(object? value) =>
+        value is double or float or int or uint or long or ulong or short or ushort or byte or sbyte;
+
     private bool IsEqual(object? a, object? b)
     {
         if (a == null && b == null) return true;
-        if (a == null) return false;
+        if (a == null || b == null) return false;
+        if (IsNumeric(a) && IsNumeric(b))
+            return Math.Abs(ToNumber(a) - ToNumber(b)) <= 1e-9;
         return a.Equals(b);
     }
     
     private double ToNumber(object? value)
     {
-        if (value is double d) return d;
-        if (value is int i) return i;
-        if (value is float f) return f;
-        throw new Exception($"Cannot convert {value} to number");
+        return value switch
+        {
+            double d => d,
+            float f => f,
+            int i => i,
+            uint u => u,
+            long l => l,
+            ulong ul => ul,
+            short s => s,
+            ushort us => us,
+            byte b => b,
+            sbyte sb => sb,
+            _ => throw new Exception($"Cannot convert {value} to number")
+        };
     }
 }

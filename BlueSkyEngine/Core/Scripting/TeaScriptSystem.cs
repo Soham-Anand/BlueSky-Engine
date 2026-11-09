@@ -1,14 +1,15 @@
 using System;
 using System.Collections.Generic;
 using System.Numerics;
-using BlueSky.Core.ECS;
-using BlueSky.Core.ECS.Builtin;
+using BlueSky.SkyCore;
+using BlueSky.SkyCore.Builtin;
 using BlueSky.Core.Assets;
 using BlueSky.Runtime.UI;
 using BlueSky.Core.Gameplay;
 using BlueSky.Airborne;
-using BlueSky.Networking;
-using TeaScript.Bridge;
+using BlueSky.LHO;
+using TeaScript.Frontend;
+using TeaScript.Runtime;
 using TeaScriptExecutionLimitException = TeaScript.Runtime.TeaScriptExecutionLimitException;
 
 namespace BlueSky.Core.Scripting;
@@ -18,14 +19,63 @@ namespace BlueSky.Core.Scripting;
 /// </summary>
 public class TeaScriptSystem : SystemBase
 {
-    private readonly Dictionary<uint, TeaScriptEngine> _runtimeInstances = new();
+    private sealed class ScriptInstance
+    {
+        private readonly Interpreter _interpreter = new();
+        private bool _isInitialized;
+
+        public void RegisterFunction(string name, Func<List<object?>, object?> implementation) =>
+            _interpreter.RegisterNativeFunction(name, implementation);
+
+        public void LoadScript(string filePath)
+        {
+            string source = System.IO.File.ReadAllText(filePath);
+            var tokens = new Lexer(source).ScanTokens();
+            var program = new Parser(tokens).Parse();
+            _interpreter.Execute(program);
+            _isInitialized = false;
+        }
+
+        public void CallStart()
+        {
+            if (_isInitialized) return;
+            if (_interpreter.HasFunction("start"))
+            {
+                _interpreter.CallFunction("start");
+                _isInitialized = true;
+            }
+        }
+
+        public void CallUpdate()
+        {
+            if (_interpreter.HasFunction("update"))
+                _interpreter.CallFunction("update");
+        }
+
+        public object? CallFunction(string name, params object?[] args) =>
+            _interpreter.HasFunction(name) ? _interpreter.CallFunction(name, args) : null;
+    }
+
+    private readonly Dictionary<uint, ScriptInstance> _runtimeInstances = new();
     private float _deltaTime = 0.016f;
+    private double _elapsedTime;
     private Func<string, bool>? _keyProvider;
     private Func<int, bool>? _mouseButtonProvider;
+    private Func<Vector2>? _mousePositionProvider;
     private readonly HashSet<Entity> _pendingDestroyEntities = new();
 
     private static TeaScriptSystem? _instance;
     public static TeaScriptSystem? Instance => _instance;
+
+    /// <summary>
+    /// Particle system reachable from scripts. Set once by the editor at
+    /// startup (ProjectBrowserUI); bindings no-op when null (headless/tests).
+    /// </summary>
+    public static BlueSky.BSR.Vectra.VectraSystem? VectraParticles { get; set; }
+
+    // Script-owned emitters: id → emitter. ids start at 1 (0 = invalid).
+    private readonly Dictionary<int, BlueSky.BSR.Vectra.VectraEmitter> _scriptEmitters = new();
+    private int _nextEmitterId = 1;
 
     public TeaScriptSystem(World world)
     {
@@ -50,10 +100,14 @@ public class TeaScriptSystem : SystemBase
         }
     }
 
-    public void SetInputProviders(Func<string, bool>? keyProvider, Func<int, bool>? mouseButtonProvider = null)
+    public void SetInputProviders(
+        Func<string, bool>? keyProvider,
+        Func<int, bool>? mouseButtonProvider = null,
+        Func<Vector2>? mousePositionProvider = null)
     {
         _keyProvider = keyProvider;
         _mouseButtonProvider = mouseButtonProvider;
+        _mousePositionProvider = mousePositionProvider;
     }
     
     /// <summary>
@@ -62,13 +116,13 @@ public class TeaScriptSystem : SystemBase
     public override void Update(float deltaTime)
     {
         _deltaTime = deltaTime;
+        _elapsedTime += System.Math.Max(0.0f, deltaTime);
         
         if (World == null) return;
         
-        // Query for entities with both TeaScriptComponent and TransformComponent
+        // Query for entities with TeaScriptComponent
         var query = World.CreateQuery()
             .All<TeaScriptComponent>()
-            .All<TransformComponent>()
             .Build();
         
         var chunks = World.GetQueryChunks(query);
@@ -77,14 +131,12 @@ public class TeaScriptSystem : SystemBase
         foreach (var chunk in chunks)
         {
             int scriptIndex = chunk.GetComponentIndex(typeof(TeaScriptComponent));
-            int transformIndex = chunk.GetComponentIndex(typeof(TransformComponent));
             var entities = chunk.GetEntities();
             
             for (int i = 0; i < chunk.Count; i++)
             {
                 var entity = entities[i];
                 ref var script = ref chunk.GetComponent<TeaScriptComponent>(i, scriptIndex);
-                ref var transform = ref chunk.GetComponent<TransformComponent>(i, transformIndex);
                 
                 if (!script.IsEnabled) continue;
                 
@@ -122,7 +174,7 @@ public class TeaScriptSystem : SystemBase
         FlushPendingEntityDestruction();
         
         // Update lobby state (broadcast, retry joins, countdown)
-        Networking.NetworkingTeaScriptBridge.UpdateLobby(_deltaTime);
+        LHO.NetworkingTeaScriptBridge.UpdateLobby(_deltaTime);
 
         // Debug: Log script count on first frame
         if (scriptCount > 0 && _deltaTime < 0.1f)
@@ -141,10 +193,9 @@ public class TeaScriptSystem : SystemBase
         
         if (World == null) return;
         
-        // Query for entities with both TeaScriptComponent and TransformComponent
+        // Query for entities with TeaScriptComponent
         var query = World.CreateQuery()
             .All<TeaScriptComponent>()
-            .All<TransformComponent>()
             .Build();
         
         var chunks = World.GetQueryChunks(query);
@@ -226,7 +277,7 @@ public class TeaScriptSystem : SystemBase
                 return;
             }
 
-            var engine = new TeaScriptEngine();
+            var engine = new ScriptInstance();
             
             // Register basic engine functions
             RegisterEngineFunctions(engine, entity);
@@ -257,15 +308,61 @@ public class TeaScriptSystem : SystemBase
     /// <summary>
     /// Register all engine functions that scripts can call.
     /// </summary>
-    private void RegisterEngineFunctions(TeaScriptEngine engine, Entity entity)
+    private void RegisterEngineFunctions(ScriptInstance engine, Entity entity)
     {
         if (World == null) return;
         
         // Logging
+        engine.RegisterFunction("print", (args) =>
+        {
+            Console.WriteLine(args.Count > 0 ? args[0]?.ToString() ?? string.Empty : string.Empty);
+            return null;
+        });
+
         engine.RegisterFunction("log", (args) =>
         {
             string message = args.Count > 0 ? args[0]?.ToString() ?? "" : "";
             Console.WriteLine($"[TeaScript:{entity.Id}] {message}");
+            return null;
+        });
+
+        engine.RegisterFunction("getTime", (args) => _elapsedTime);
+
+        // Echo audio — fire-and-forget 3D/2D sounds and music from TeaScript.
+        engine.RegisterFunction("playSound", (args) =>
+        {
+            if (args.Count < 1) return false;
+            string path = ResolveScriptPath(args[0]?.ToString() ?? "");
+            float volume = args.Count > 1 ? Convert.ToSingle(args[1]) : 1.0f;
+            bool loop = args.Count > 2 && Convert.ToBoolean(args[2]);
+            bool is3D = args.Count <= 3 || Convert.ToBoolean(args[3]);
+            float x = args.Count > 4 ? Convert.ToSingle(args[4]) : 0f;
+            float y = args.Count > 5 ? Convert.ToSingle(args[5]) : 0f;
+            float z = args.Count > 6 ? Convert.ToSingle(args[6]) : 0f;
+            return BlueSky.Echo.EchoTeaScriptBridge.PlaySound(path, volume, loop, is3D, x, y, z);
+        });
+
+        engine.RegisterFunction("playMusic", (args) =>
+        {
+            if (args.Count < 1) return false;
+            string path = ResolveScriptPath(args[0]?.ToString() ?? "");
+            float volume = args.Count > 1 ? Convert.ToSingle(args[1]) : 1.0f;
+            bool loop = args.Count <= 2 || Convert.ToBoolean(args[2]);
+            return BlueSky.Echo.EchoTeaScriptBridge.PlayMusic(path, volume, loop);
+        });
+
+        engine.RegisterFunction("stopAllSounds", (args) =>
+        {
+            BlueSky.Echo.EchoTeaScriptBridge.StopAllSounds();
+            return null;
+        });
+
+        engine.RegisterFunction("setAudioVolume", (args) =>
+        {
+            if (args.Count >= 2)
+                BlueSky.Echo.EchoTeaScriptBridge.SetChannelVolume(
+                    args[0]?.ToString() ?? "Master",
+                    Convert.ToSingle(args[1]));
             return null;
         });
 
@@ -357,7 +454,7 @@ public class TeaScriptSystem : SystemBase
                     Console.WriteLine("[TeaScript] Lazy-initializing EOS multiplayer service");
                     var config = new MultiplayerConfig
                     {
-                        Mode = BlueSky.Networking.MultiplayerMode.Host,
+                        Mode = BlueSky.LHO.MultiplayerMode.Host,
                         LocalPlayerName = playerName,
                         Eos = eos,
                     };
@@ -649,7 +746,7 @@ public class TeaScriptSystem : SystemBase
             {
                 ref var transform = ref World.GetComponent<TransformComponent>(entity);
                 var pos = transform.Position;
-                transform.Position = new BlueSky.Core.Math.Vector3(Convert.ToSingle(args[0]), pos.Y, pos.Z);
+                transform.Position = new BlueSky.Ramanujan.Vector3(Convert.ToSingle(args[0]), pos.Y, pos.Z);
                 SyncPhysicsPosition(entity, transform.Position);
             }
             return null;
@@ -661,7 +758,7 @@ public class TeaScriptSystem : SystemBase
             {
                 ref var transform = ref World.GetComponent<TransformComponent>(entity);
                 var pos = transform.Position;
-                transform.Position = new BlueSky.Core.Math.Vector3(pos.X, Convert.ToSingle(args[0]), pos.Z);
+                transform.Position = new BlueSky.Ramanujan.Vector3(pos.X, Convert.ToSingle(args[0]), pos.Z);
                 SyncPhysicsPosition(entity, transform.Position);
             }
             return null;
@@ -673,7 +770,7 @@ public class TeaScriptSystem : SystemBase
             {
                 ref var transform = ref World.GetComponent<TransformComponent>(entity);
                 var pos = transform.Position;
-                transform.Position = new BlueSky.Core.Math.Vector3(pos.X, pos.Y, Convert.ToSingle(args[0]));
+                transform.Position = new BlueSky.Ramanujan.Vector3(pos.X, pos.Y, Convert.ToSingle(args[0]));
                 SyncPhysicsPosition(entity, transform.Position);
             }
             return null;
@@ -689,7 +786,7 @@ public class TeaScriptSystem : SystemBase
                 float y = Convert.ToSingle(args[1]);
                 float z = Convert.ToSingle(args[2]);
                 var pos = transform.Position;
-                transform.Position = new BlueSky.Core.Math.Vector3(pos.X + x, pos.Y + y, pos.Z + z);
+                transform.Position = new BlueSky.Ramanujan.Vector3(pos.X + x, pos.Y + y, pos.Z + z);
                 SyncPhysicsPosition(entity, transform.Position);
             }
             return null;
@@ -708,11 +805,71 @@ public class TeaScriptSystem : SystemBase
             string key = args.Count > 0 ? args[0]?.ToString() ?? "" : "";
             return _keyProvider?.Invoke(key) ?? false;
         });
+
+        engine.RegisterFunction("getInput", (args) =>
+        {
+            string key = args.Count > 0 ? args[0]?.ToString() ?? "" : "";
+            return _keyProvider?.Invoke(key) ?? false;
+        });
         
         engine.RegisterFunction("getMouseButton", (args) =>
         {
             int button = args.Count > 0 ? Convert.ToInt32(args[0]) : 0;
             return _mouseButtonProvider?.Invoke(button) ?? false;
+        });
+
+        engine.RegisterFunction("getMousePosition", (args) =>
+        {
+            var pos = _mousePositionProvider?.Invoke() ?? Vector2.Zero;
+            return new List<object?> { (double)pos.X, (double)pos.Y };
+        });
+
+        engine.RegisterFunction("getPosition", (args) =>
+        {
+            if (World != null && World.TryGetComponent<TransformComponent>(entity, out var transform))
+            {
+                return new List<object?> { (double)transform.Position.X, (double)transform.Position.Y, (double)transform.Position.Z };
+            }
+            return new List<object?> { 0.0, 0.0, 0.0 };
+        });
+
+        engine.RegisterFunction("getRotation", (args) =>
+        {
+            if (World != null && World.TryGetComponent<TransformComponent>(entity, out var transform))
+            {
+                return new List<object?> {
+                    (double)transform.Rotation.X,
+                    (double)transform.Rotation.Y,
+                    (double)transform.Rotation.Z,
+                    (double)transform.Rotation.W
+                };
+            }
+            return new List<object?> { 0.0, 0.0, 0.0, 1.0 };
+        });
+
+        engine.RegisterFunction("setRotation", (args) =>
+        {
+            if (args.Count >= 4 && World != null && World.HasComponent<TransformComponent>(entity))
+            {
+                ref var transform = ref World.GetComponent<TransformComponent>(entity);
+                transform.Rotation = new BlueSky.Ramanujan.Quaternion(
+                    Convert.ToSingle(args[0]),
+                    Convert.ToSingle(args[1]),
+                    Convert.ToSingle(args[2]),
+                    Convert.ToSingle(args[3]));
+                BlueSky.Airborne.PhysicsTeaScriptBridge.SetRotation(entity, new System.Numerics.Quaternion(
+                    transform.Rotation.X,
+                    transform.Rotation.Y,
+                    transform.Rotation.Z,
+                    transform.Rotation.W));
+            }
+            return null;
+        });
+
+        engine.RegisterFunction("getVelocity", (args) =>
+        {
+            var vel = BlueSky.Airborne.PhysicsTeaScriptBridge.GetVelocity(entity);
+            return new List<object?> { (double)vel.X, (double)vel.Y, (double)vel.Z };
         });
         
         // Transform - Set Position (all at once)
@@ -724,7 +881,7 @@ public class TeaScriptSystem : SystemBase
                 float x = Convert.ToSingle(args[0]);
                 float y = Convert.ToSingle(args[1]);
                 float z = Convert.ToSingle(args[2]);
-                transform.Position = new BlueSky.Core.Math.Vector3(x, y, z);
+                transform.Position = new BlueSky.Ramanujan.Vector3(x, y, z);
                 SyncPhysicsPosition(entity, transform.Position);
             }
             return null;
@@ -742,7 +899,7 @@ public class TeaScriptSystem : SystemBase
             float x = Convert.ToSingle(args[0]);
             float y = Convert.ToSingle(args[1]);
             float z = args.Count >= 3 ? Convert.ToSingle(args[2]) : pos.Z;
-            transform.Position = new BlueSky.Core.Math.Vector3(x, y, z);
+            transform.Position = new BlueSky.Ramanujan.Vector3(x, y, z);
             SyncPhysicsPosition(entity, transform.Position);
             return null;
         });
@@ -828,6 +985,125 @@ public class TeaScriptSystem : SystemBase
                 return System.Math.Floor(value);
             }
             return 0.0;
+        });
+
+        // ══════════════════════════════════════════════════════════════
+        //  VECTRA PARTICLES API (driven by the shared VectraSystem)
+        //  addEmitter(x,y,z, rate,life,size, r,g,b,alpha, additive) → id
+        //  setEmitterPos(id,x,y,z) | setEmitterRate(id,rate) | removeEmitter(id)
+        //  burst(x,y,z, count, r,g,b, size,life, additive) → spawned
+        //  particleCount() → live particles across all emitters
+        // ════════════════════════════════════════════════════════════
+
+        engine.RegisterFunction("particleCount", (args) =>
+        {
+            var vectra = VectraParticles;
+            return vectra != null ? (double)vectra.Pool.LiveCount : 0.0;
+        });
+
+        engine.RegisterFunction("clearParticles", (args) =>
+        {
+            var vectra = VectraParticles;
+            if (vectra == null) return 0.0;
+            int removed = 0;
+            foreach (var emitter in _scriptEmitters.Values)
+            {
+                if (vectra.RemoveEmitter(emitter)) removed++;
+            }
+            _scriptEmitters.Clear();
+            return (double)removed;
+        });
+
+        engine.RegisterFunction("addEmitter", (args) =>
+        {
+            var vectra = VectraParticles;
+            if (vectra == null || args.Count < 12) return 0.0;
+            var cfg = new BlueSky.BSR.Vectra.VectraEmitterConfig
+            {
+                RatePerSec = Convert.ToSingle(args[3]),
+                LifeMin = Convert.ToSingle(args[4]),
+                LifeMax = Convert.ToSingle(args[4]),
+                SpeedMin = 0.45f,
+                SpeedMax = 1.05f,
+                Direction = new Vector3(0f, 1f, 0f),
+                ConeAngleRad = 0.48f,
+                Gravity = 0.38f,
+                Drag = 0.32f,
+                SizeMin = Convert.ToSingle(args[5]) * 0.6f,
+                SizeMax = Convert.ToSingle(args[5]),
+                GrowRate = 0.48f,
+                ColorA = new Vector3(Convert.ToSingle(args[6]), Convert.ToSingle(args[7]), Convert.ToSingle(args[8])),
+                ColorB = new Vector3(Convert.ToSingle(args[6]), Convert.ToSingle(args[7]), Convert.ToSingle(args[8])),
+                Alpha = Convert.ToSingle(args[9]),
+                Additive = Convert.ToDouble(args[10]) >= 0.5,
+                SpawnRadius = 0.2f,
+                Turbulence = 0.28f,
+            };
+            var emitter = new BlueSky.BSR.Vectra.VectraEmitter(cfg,
+                new Vector3(Convert.ToSingle(args[0]), Convert.ToSingle(args[1]), Convert.ToSingle(args[2])));
+            if (!vectra.AddEmitter(emitter)) return 0.0;
+            int id = _nextEmitterId++;
+            _scriptEmitters[id] = emitter;
+            return (double)id;
+        });
+
+        engine.RegisterFunction("removeEmitter", (args) =>
+        {
+            var vectra = VectraParticles;
+            if (vectra == null || args.Count < 1) return 0.0;
+            int id = Convert.ToInt32(args[0]);
+            if (!_scriptEmitters.TryGetValue(id, out var emitter)) return 0.0;
+            _scriptEmitters.Remove(id);
+            return vectra.RemoveEmitter(emitter) ? 1.0 : 0.0;
+        });
+
+        engine.RegisterFunction("setEmitterPos", (args) =>
+        {
+            if (args.Count < 4) return 0.0;
+            int id = Convert.ToInt32(args[0]);
+            if (!_scriptEmitters.TryGetValue(id, out var emitter)) return 0.0;
+            emitter.Position = new Vector3(Convert.ToSingle(args[1]), Convert.ToSingle(args[2]), Convert.ToSingle(args[3]));
+            return 1.0;
+        });
+
+        engine.RegisterFunction("setEmitterRate", (args) =>
+        {
+            if (args.Count < 2) return 0.0;
+            int id = Convert.ToInt32(args[0]);
+            if (!_scriptEmitters.TryGetValue(id, out var emitter)) return 0.0;
+            var cfg = emitter.Config;
+            cfg.RatePerSec = System.Math.Max(0f, Convert.ToSingle(args[1]));
+            emitter.Config = cfg;
+            return 1.0;
+        });
+
+        engine.RegisterFunction("burst", (args) =>
+        {
+            var vectra = VectraParticles;
+            if (vectra == null || args.Count < 10) return 0.0;
+            float x = Convert.ToSingle(args[0]), y = Convert.ToSingle(args[1]), z = Convert.ToSingle(args[2]);
+            int count = System.Math.Max(0, Convert.ToInt32(args[3]));
+            float r = Convert.ToSingle(args[4]), g = Convert.ToSingle(args[5]), b = Convert.ToSingle(args[6]);
+            float size = System.Math.Max(0.05f, Convert.ToSingle(args[7]));
+            float life = System.Math.Max(0.05f, Convert.ToSingle(args[8]));
+            float add = Convert.ToDouble(args[9]) >= 0.5 ? 1f : 0f;
+            int spawned = 0;
+            var pool = vectra.Pool;
+            for (int k = 0; k < count; k++)
+            {
+                float ang = pool.NextFloat() * MathF.PI * 2f;
+                float rad = MathF.Sqrt(pool.NextFloat()) * 0.25f;
+                float up = 1f + pool.NextFloat() * 1.5f;
+                if (pool.Spawn(
+                    x + MathF.Cos(ang) * rad, y, z + MathF.Sin(ang) * rad,
+                    MathF.Cos(ang) * rad * 4f, up, MathF.Sin(ang) * rad * 4f,
+                    life * (0.7f + pool.NextFloat() * 0.6f), size, 0.5f,
+                    r, g, b, 0.85f, 0.5f, 0.5f, 0.3f, add))
+                    spawned++;
+                else
+                    break;
+            }
+            return (double)spawned;
         });
         
         // ══════════════════════════════════════════════════════════════
@@ -1322,7 +1598,7 @@ public class TeaScriptSystem : SystemBase
                 float z = Convert.ToSingle(args[2]);
                 
                 // Simple euler angle rotation (degrees)
-                transform.Rotation = BlueSky.Core.Math.Quaternion.Euler(x, y, z);
+                transform.Rotation = BlueSky.Ramanujan.Quaternion.Euler(x, y, z);
                 BlueSky.Airborne.PhysicsTeaScriptBridge.SetRotation(entity, new System.Numerics.Quaternion(
                     transform.Rotation.X,
                     transform.Rotation.Y,
@@ -1370,7 +1646,7 @@ public class TeaScriptSystem : SystemBase
         _pendingDestroyEntities.Clear();
     }
 
-    private static void SyncPhysicsPosition(Entity entity, BlueSky.Core.Math.Vector3 position)
+    private static void SyncPhysicsPosition(Entity entity, BlueSky.Ramanujan.Vector3 position)
     {
         BlueSky.Airborne.PhysicsTeaScriptBridge.SetPosition(
             entity,
@@ -1382,18 +1658,7 @@ public class TeaScriptSystem : SystemBase
         if (string.IsNullOrWhiteSpace(path))
             return string.Empty;
 
-        path = path.Trim();
-        if (System.IO.File.Exists(path))
-            return path;
-
-        if (!System.IO.Path.IsPathRooted(path))
-        {
-            string cwdPath = System.IO.Path.GetFullPath(path, Environment.CurrentDirectory);
-            if (System.IO.File.Exists(cwdPath))
-                return cwdPath;
-        }
-
-        return path;
+        return BlueSky.Core.Assets.AssetPathResolver.Resolve(path);
     }
 
     private static RuntimeUIAnchor ParseRuntimeUIAnchor(List<object?> args, int index)

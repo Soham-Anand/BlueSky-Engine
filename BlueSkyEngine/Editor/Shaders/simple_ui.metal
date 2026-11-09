@@ -24,18 +24,8 @@ struct VertexOut {
     float  mode;
 };
 
-// Compile-time sampler — no RHI sampler object needed on the CPU side.
-constexpr sampler kFontSampler(
-    filter::linear,
-    address::clamp_to_edge,
-    mip_filter::none
-);
-
-constexpr sampler kViewportSampler(
-    filter::linear,
-    address::clamp_to_edge,
-    mip_filter::none
-);
+// (M2: filtering comes from the RHI sampler bound at [[sampler(0)]] —
+// see fs_ui below. No baked constexpr sampler.)
 
 // ──────────────────────────────────────── Vertex ────────────────────────────
 
@@ -53,17 +43,20 @@ vertex VertexOut vs_ui(
 
 // ──────────────────────────────────────── Fragment ──────────────────────────
 
+// M2: bound sampler from the RHI (slot 0). The engine binds a linear-clamp
+// sampler for font glyphs and viewport blits — no more baked constexpr.
 fragment float4 fs_ui(
     VertexOut              in        [[stage_in]],
-    texture2d<float>       fontAtlas [[texture(0)]]
+    texture2d<float>       fontAtlas [[texture(0)]],
+    sampler                uiSampler [[sampler(0)]]
 ) {
     if (in.mode > 1.5) {
         // Mode 2: Full texture render (viewport).
-        return fontAtlas.sample(kViewportSampler, in.uv);
+        return fontAtlas.sample(uiSampler, in.uv);
     }
     else if (in.mode > 0.5) {
         // Mode 1: Font atlas with coverage
-        float coverage = fontAtlas.sample(kFontSampler, in.uv).r;
+        float coverage = fontAtlas.sample(uiSampler, in.uv).r;
         if (coverage < 0.01) discard_fragment();
         return float4(in.color.rgb, in.color.a * coverage);
     }

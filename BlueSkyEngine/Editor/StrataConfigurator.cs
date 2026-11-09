@@ -2,8 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.Numerics;
 using BlueSky.Editor.UI;
-using BlueSky.Rendering.Strata;
-using BlueSky.Rendering.RHI;
+using BlueSky.BSR.Strata;
+using BlueSky.BSR.RHI;
 
 namespace BlueSky.Editor;
 
@@ -264,7 +264,7 @@ partial class Program
             string? path = NativeFilePicker.OpenFile($"Pick {slot} texture",
                 "Images|*.png;*.jpg;*.jpeg;*.bmp;*.tga");
             if (string.IsNullOrEmpty(path)) return;
-            var decoded = BlueSky.Core.Assets.StrataImportWriter.DecodeImageFile(path);
+            var decoded = BlueSky.BSR.Strata.StrataImportWriter.DecodeImageFile(path);
             if (decoded == null)
             {
                 _strataStatus = $"Unreadable image: {path}";
@@ -414,9 +414,9 @@ partial class Program
                 _strataStatus = "Bad mesh path.";
                 return;
             }
-            var (strataDir, _) = BlueSky.Core.Assets.StrataImportWriter.EnsureMaterialsLayout(meshDir);
+            var (strataDir, _) = BlueSky.BSR.Strata.StrataImportWriter.EnsureMaterialsLayout(meshDir);
             var mat = BuildConfiguredMaterial($"{System.IO.Path.GetFileNameWithoutExtension(_strataTargetMesh)}_slot{slot}");
-            string stratamatPath = BlueSky.Core.Assets.StrataImportWriter.WriteStrataMaterial(strataDir, mat);
+            string stratamatPath = BlueSky.BSR.Strata.StrataImportWriter.WriteStrataMaterial(strataDir, mat);
 
             var asset = BlueSky.Core.Assets.BlueAsset.Load(_strataTargetMesh);
             if (asset == null)
@@ -424,7 +424,7 @@ partial class Program
                 _strataStatus = "Mesh asset unreadable.";
                 return;
             }
-            BlueSky.Core.Assets.StrataImportWriter.LinkSlot(asset.Metadata, slot, stratamatPath);
+            BlueSky.BSR.Strata.StrataImportWriter.LinkSlot(asset.Metadata, slot, stratamatPath);
             asset.Save(_strataTargetMesh);
 
             // Force renderer to pick up the new link next frame.

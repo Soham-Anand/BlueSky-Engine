@@ -1,8 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Numerics;
-using BlueSky.Core.ECS;
-using BlueSky.Core.ECS.Builtin;
+using BlueSky.SkyCore;
+using BlueSky.SkyCore.Builtin;
 
 namespace BlueSky.Airborne;
 

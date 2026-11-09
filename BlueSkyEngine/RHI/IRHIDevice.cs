@@ -1,6 +1,6 @@
-using BlueSky.Platform;
+using BlueSky.Aegis;
 
-namespace BlueSky.Rendering.RHI;
+namespace BlueSky.BSR.RHI;
 
 public interface IRHIDevice : IDisposable
 {
@@ -13,6 +13,13 @@ public interface IRHIDevice : IDisposable
     // Resources
     IRHIBuffer CreateBuffer(BufferDesc desc);
     IRHITexture CreateTexture(TextureDesc desc);
+    IRHISampler CreateSampler(SamplerDesc desc);
+    /// <summary>
+    /// M5: generate full mip chain for a texture created with MipLevels &gt; 1
+    /// after level 0 was uploaded. Blocking; call during load, not per frame.
+    /// Metal implements; Vulkan/DirectX11 throw until their paths are built.
+    /// </summary>
+    void GenerateMipmaps(IRHITexture texture);
     
     // Pipeline
     IRHIPipeline CreateGraphicsPipeline(GraphicsPipelineDesc desc);

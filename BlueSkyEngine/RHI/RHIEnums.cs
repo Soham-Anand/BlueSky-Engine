@@ -1,6 +1,6 @@
 // RHI backend and resource format enumerations.
 
-namespace BlueSky.Rendering.RHI;
+namespace BlueSky.BSR.RHI;
 
 public enum RHIBackend
 {

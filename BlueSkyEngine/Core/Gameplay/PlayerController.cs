@@ -1,10 +1,10 @@
 using System;
 using System.Numerics;
 using System.Collections.Generic;
-using BlueSky.Platform;
-using BlueSky.Platform.Input;
-using BlueSky.Core.ECS;
-using BlueSky.Rendering;
+using BlueSky.Aegis;
+using BlueSky.Aegis.Input;
+using BlueSky.SkyCore;
+using BlueSky.BSR;
 
 namespace BlueSky.Core.Gameplay;
 
@@ -175,11 +175,11 @@ public class PlayerController
         
         ref var cameraTransform = ref _viewport.GetCameraTransform();
         
-        var pos = new BlueSky.Core.Math.Vector3(cameraPos.X, cameraPos.Y, cameraPos.Z);
-        var target = new BlueSky.Core.Math.Vector3(cameraTarget.X, cameraTarget.Y, cameraTarget.Z);
+        var pos = new BlueSky.Ramanujan.Vector3(cameraPos.X, cameraPos.Y, cameraPos.Z);
+        var target = new BlueSky.Ramanujan.Vector3(cameraTarget.X, cameraTarget.Y, cameraTarget.Z);
         
         cameraTransform.SetPosition(pos);
-        cameraTransform.LookAt(target, BlueSky.Core.Math.Vector3.Up);
+        cameraTransform.LookAt(target, BlueSky.Ramanujan.Vector3.Up);
     }
     
 }

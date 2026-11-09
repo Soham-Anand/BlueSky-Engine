@@ -1,12 +1,14 @@
 using System;
 using System.IO;
-using BlueSky.Networking;
+using BlueSky.Core.Assets;
+using BlueSky.Editor;
+using BlueSky.LHO;
 
 namespace BlueSky.Runtime;
 
 /// <summary>
 /// BlueSky Runtime - Standalone game execution without editor.
-/// This is the entry point for "Play Standalone" mode and built games.
+/// This is the entry point for "Play Standalone" mode and built Avalanche macOS (.app) games.
 /// </summary>
 class Program
 {
@@ -24,18 +26,32 @@ class Program
 
         try
         {
+            // Load Avalanche bundle manifest if present (explicit flag or auto-detected in .app bundle)
+            var manifest = TryLocateAndLoadAvalancheManifest(args, out string? manifestPath);
+            if (manifest != null && !string.IsNullOrEmpty(manifestPath))
+            {
+                string resourcesDir = Path.GetDirectoryName(Path.GetFullPath(manifestPath))!;
+                string gameDataDir = Path.Combine(resourcesDir, "GameData");
+                if (Directory.Exists(gameDataDir))
+                {
+                    AssetPathResolver.RegisterSearchRoot(gameDataDir);
+                    Directory.SetCurrentDirectory(gameDataDir);
+                    Console.WriteLine($"[Avalanche] Mounted bundle GameData root: {gameDataDir}");
+                }
+            }
+
             // Auto-detect project root and change working directory to it
             AutoDetectAndSetProjectDirectory(args);
 
-            // Parse command line arguments
-            var config = ParseArguments(args);
-            
+            // Parse command line arguments (with Avalanche manifest defaults if bundled)
+            var config = ParseArguments(args, manifest);
+
             // Initialize runtime
             var runtime = new GameRuntime(config);
-            
+
             // Run the game (blocks until quit)
             runtime.Run();
-            
+
             Console.WriteLine("=== BlueSky Runtime Stopped ===");
         }
         catch (Exception ex)
@@ -44,6 +60,48 @@ class Program
             Console.WriteLine(ex.StackTrace);
             Environment.Exit(1);
         }
+    }
+
+    static AvalancheManifest? TryLocateAndLoadAvalancheManifest(string[] args, out string? resolvedManifestPath)
+    {
+        resolvedManifestPath = null;
+
+        for (int i = 0; i < args.Length; i++)
+        {
+            if (args[i] == "--avalanche-manifest" && i + 1 < args.Length)
+            {
+                string explicitPath = args[i + 1];
+                if (File.Exists(explicitPath))
+                {
+                    resolvedManifestPath = Path.GetFullPath(explicitPath);
+                    return AvalancheManifest.Load(resolvedManifestPath);
+                }
+            }
+        }
+
+        // Auto-detect inside <App>.app/Contents/Resources/avalanche.json
+        string baseDir = AppContext.BaseDirectory;
+        string[] candidates =
+        {
+            Path.Combine(baseDir, "..", "Resources", "avalanche.json"),
+            Path.Combine(baseDir, "avalanche.json"),
+            Path.Combine(Directory.GetCurrentDirectory(), "avalanche.json")
+        };
+
+        foreach (string cand in candidates)
+        {
+            try
+            {
+                if (File.Exists(cand))
+                {
+                    resolvedManifestPath = Path.GetFullPath(cand);
+                    return AvalancheManifest.Load(resolvedManifestPath);
+                }
+            }
+            catch { }
+        }
+
+        return null;
     }
 
     static void AutoDetectAndSetProjectDirectory(string[] args)
@@ -68,7 +126,7 @@ class Program
             if (Directory.GetFiles(dir, "*.BlueSkyProj").Length > 0)
                 return true;
 
-            if (Directory.Exists(Path.Combine(dir, "Assets")) && 
+            if (Directory.Exists(Path.Combine(dir, "Assets")) &&
                 Directory.Exists(Path.Combine(dir, "Config")))
                 return true;
 
@@ -90,7 +148,7 @@ class Program
                     dir = Path.GetDirectoryName(dir);
                 }
             }
-            catch {}
+            catch { }
             return "";
         }
 
@@ -106,7 +164,14 @@ class Program
             projectDir = FindRoot(Directory.GetCurrentDirectory());
         }
 
-        // 3. Try from app base directory
+        // 3. Try from app base directory or macOS bundle GameData
+        if (string.IsNullOrEmpty(projectDir))
+        {
+            string bundleGameData = Path.Combine(AppContext.BaseDirectory, "..", "Resources", "GameData");
+            if (Directory.Exists(bundleGameData))
+                projectDir = FindRoot(bundleGameData);
+        }
+
         if (string.IsNullOrEmpty(projectDir))
         {
             projectDir = FindRoot(AppDomain.CurrentDomain.BaseDirectory);
@@ -116,6 +181,7 @@ class Program
         {
             try
             {
+                AssetPathResolver.RegisterSearchRoot(projectDir);
                 Directory.SetCurrentDirectory(projectDir);
                 Console.WriteLine($"[Runtime] Changed working directory to project root: {projectDir}");
             }
@@ -129,13 +195,25 @@ class Program
             Console.WriteLine("[Runtime] ⚠️ Could not auto-detect project root directory!");
         }
     }
-    
-    static RuntimeConfig ParseArguments(string[] args)
+
+    static RuntimeConfig ParseArguments(string[] args, AvalancheManifest? manifest)
     {
         var config = new RuntimeConfig();
-        
+
+        if (manifest != null)
+        {
+            config.AppTitle = manifest.AppName;
+            config.Mode = "avalanche";
+            config.ScenePath = AssetPathResolver.Resolve(manifest.StartupScene);
+            config.WindowWidth = Math.Clamp(manifest.WindowWidth, 640, 7680);
+            config.WindowHeight = Math.Clamp(manifest.WindowHeight, 360, 4320);
+            config.Fullscreen = manifest.Fullscreen;
+            config.VSync = manifest.VSync;
+            config.ShowDiagnosticsHud = manifest.ShowDiagnosticsHud;
+        }
+
         // Find --scene first to locate the project config
-        string scenePath = "";
+        string scenePath = config.ScenePath;
         for (int i = 0; i < args.Length; i++)
         {
             if (args[i] == "--scene" && i + 1 < args.Length)
@@ -146,22 +224,32 @@ class Program
         }
 
         string projDir = FindProjectDir(scenePath);
+        if (string.IsNullOrEmpty(projDir))
+            projDir = Directory.GetCurrentDirectory();
         config.Multiplayer.Eos = EosCredentials.LoadForProject(projDir);
-        
+
         for (int i = 0; i < args.Length; i++)
         {
             switch (args[i])
             {
+                case "--avalanche-manifest":
+                    i++; // Consumed in TryLocateAndLoadAvalancheManifest
+                    break;
+
                 case "--scene":
                     if (i + 1 < args.Length)
-                        config.ScenePath = args[++i];
+                        config.ScenePath = AssetPathResolver.Resolve(args[++i]);
                     break;
-                    
+
+                case "--title":
+                    if (i + 1 < args.Length)
+                        config.AppTitle = args[++i];
+                    break;
+
                 case "--mode":
                     if (i + 1 < args.Length)
                     {
                         config.Mode = args[++i];
-                        // --mode also sets the multiplayer mode if the value matches
                         if (Enum.TryParse<MultiplayerMode>(config.Mode, true, out var modeParsed))
                             config.Multiplayer.Mode = modeParsed;
                     }
@@ -227,35 +315,43 @@ class Program
                     if (i + 1 < args.Length)
                         config.Multiplayer.Eos.ProductVersion = args[++i];
                     break;
-                    
+
                 case "--width":
                     if (i + 1 < args.Length)
                         config.WindowWidth = int.Parse(args[++i]);
                     break;
-                    
+
                 case "--height":
                     if (i + 1 < args.Length)
                         config.WindowHeight = int.Parse(args[++i]);
                     break;
-                    
+
                 case "--fullscreen":
                     config.Fullscreen = true;
                     break;
-                    
+
                 case "--vsync":
                     config.VSync = true;
                     break;
-                    
+
+                case "--diagnostics-hud":
+                    config.ShowDiagnosticsHud = true;
+                    break;
+
+                case "--no-diagnostics-hud":
+                    config.ShowDiagnosticsHud = false;
+                    break;
+
                 case "--help":
                     PrintHelp();
                     Environment.Exit(0);
                     break;
             }
         }
-        
+
         return config;
     }
-    
+
     static void PrintHelp()
     {
         Console.WriteLine("BlueSky Runtime - Standalone Game Execution");
@@ -263,28 +359,22 @@ class Program
         Console.WriteLine("Usage: BlueSkyRuntime [options]");
         Console.WriteLine();
         Console.WriteLine("Options:");
-        Console.WriteLine("  --scene <path>        Path to scene file (.bsscene)");
-        Console.WriteLine("  --scene <path>        Path to scene file (.bsscene)");
-        Console.WriteLine("  --mode <mode>         Window title mode (standalone, build)");
-        Console.WriteLine("  --multiplayer <mode>  offline, host, or join (default: host)");
-        Console.WriteLine("  --width <pixels>      Window width (default: 1280)");
-        Console.WriteLine("  --height <pixels>     Window height (default: 720)");
-        Console.WriteLine("  --fullscreen          Start in fullscreen mode");
-        Console.WriteLine("  --vsync               Enable VSync");
-        Console.WriteLine("  --session-name <id>   EOS lobby/session name");
-        Console.WriteLine("  --join-session <id>   Join an existing session id");
-        Console.WriteLine("  --player <name>       Local player display name (alias for --player-name)");
-        Console.WriteLine("  --player-name <name>  Local player display name");
-        Console.WriteLine("  --eos-product-id <id> EOS product id");
-        Console.WriteLine("  --eos-sandbox-id <id> EOS sandbox id");
-        Console.WriteLine("  --eos-deployment-id <id> EOS deployment id");
-        Console.WriteLine("  --eos-client-id <id> EOS client id");
-        Console.WriteLine("  --eos-client-secret <secret> EOS client secret");
-        Console.WriteLine("  --help                Show this help");
-        Console.WriteLine();
-        Console.WriteLine("Example:");
-        Console.WriteLine("  BlueSkyRuntime --scene game.bsscene --player Host");
-        Console.WriteLine("  BlueSkyRuntime --scene game.bsscene --multiplayer join --player Client");
+        Console.WriteLine("  --avalanche-manifest <path>  Path to packaged avalanche.json manifest");
+        Console.WriteLine("  --scene <path>               Path to scene file (.bsscene)");
+        Console.WriteLine("  --title <title>              Custom window title");
+        Console.WriteLine("  --mode <mode>                Window title mode (standalone, build)");
+        Console.WriteLine("  --multiplayer <mode>         offline, host, or join (default: host)");
+        Console.WriteLine("  --width <pixels>             Window width (default: 1280)");
+        Console.WriteLine("  --height <pixels>            Window height (default: 720)");
+        Console.WriteLine("  --fullscreen                 Start in fullscreen mode");
+        Console.WriteLine("  --vsync                      Enable VSync");
+        Console.WriteLine("  --diagnostics-hud            Show F3 diagnostics HUD on startup");
+        Console.WriteLine("  --no-diagnostics-hud         Hide diagnostics HUD on startup (toggle with F3)");
+        Console.WriteLine("  --session-name <id>          EOS lobby/session name");
+        Console.WriteLine("  --join-session <id>          Join an existing session id");
+        Console.WriteLine("  --player <name>              Local player display name (alias for --player-name)");
+        Console.WriteLine("  --player-name <name>         Local player display name");
+        Console.WriteLine("  --help                       Show this help");
     }
 
     static string FindProjectDir(string scenePath)
@@ -300,7 +390,7 @@ class Program
                 if (Directory.GetFiles(dir, "*.BlueSkyProj").Length > 0)
                     return dir;
 
-                if (Directory.Exists(Path.Combine(dir, "Assets")) && 
+                if (Directory.Exists(Path.Combine(dir, "Assets")) &&
                     Directory.Exists(Path.Combine(dir, "Config")))
                     return dir;
 
@@ -316,15 +406,17 @@ class Program
 }
 
 /// <summary>
-/// Runtime configuration parsed from command line arguments
+/// Runtime configuration parsed from command line arguments or Avalanche manifest.
 /// </summary>
 public class RuntimeConfig
 {
+    public string AppTitle { get; set; } = "";
     public string ScenePath { get; set; } = "";
     public string Mode { get; set; } = "standalone";
     public int WindowWidth { get; set; } = 1280;
     public int WindowHeight { get; set; } = 720;
     public bool Fullscreen { get; set; } = false;
     public bool VSync { get; set; } = true;
+    public bool ShowDiagnosticsHud { get; set; } = true;
     public MultiplayerConfig Multiplayer { get; set; } = new();
 }

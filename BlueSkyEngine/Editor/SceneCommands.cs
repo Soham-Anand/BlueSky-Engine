@@ -3,15 +3,14 @@ using System.Diagnostics;
 using System.IO;
 using System.Numerics;
 using BlueSky.Editor.UI;
-using BlueSky.Platform;
-using BlueSky.Platform.Input;
-using BlueSky.Core.ECS;
-using BlueSky.Core.ECS.Builtin;
-using BlueSky.Core.Math;
-using BlueSky.Rendering;
+using BlueSky.Aegis;
+using BlueSky.Aegis.Input;
+using BlueSky.SkyCore;
+using BlueSky.SkyCore.Builtin;
+using BlueSky.BSR;
 using BlueSky.Core.Scripting;
-using BlueSky.Core.Scene;
-using BlueSky.Rendering.RHI;
+using BlueSky.Meridian;
+using BlueSky.BSR.RHI;
 
 namespace BlueSky.Editor;
 
@@ -29,7 +28,7 @@ partial class Program
             }
 
             // Use macOS native file dialog
-            if (_window is Platform.macOS.CocoaWindow cocoaWindow)
+            if (_window is Aegis.macOS.CocoaWindow cocoaWindow)
             {
                 var files = cocoaWindow.ShowOpenFileDialog();
                 if (files != null && files.Length > 0)
@@ -38,7 +37,7 @@ partial class Program
                 }
             }
             // Use Win32 native file dialog (GetOpenFileNameW — no WinForms needed)
-            else if (_window is Platform.Windows.Win32Window win32Window)
+            else if (_window is Aegis.Windows.Win32Window win32Window)
             {
                 var files = win32Window.ShowOpenFileDialog();
                 if (files != null && files.Length > 0)
@@ -50,7 +49,7 @@ partial class Program
             {
                 // Fallback: use cross-platform NativeFilePicker
                 var file = NativeFilePicker.OpenFile("Import Asset", 
-                    "StrataPack|*.stratapack|3D Models|*.obj;*.fbx;*.gltf;*.glb|Images|*.png;*.jpg;*.jpeg;*.bmp;*.tga|All Files|*.*");
+                    "StrataPack|*.stratapack|3D Models|*.obj;*.fbx;*.gltf;*.glb|Images|*.png;*.jpg;*.jpeg;*.bmp;*.tga|Audio|*.wav;*.ogg;*.mp3;*.flac|All Files|*.*");
                 if (!string.IsNullOrEmpty(file))
                 {
                     HandleFilesDropped(new[] { file });
@@ -84,8 +83,8 @@ partial class Program
                 ShowImportDialog(meshFiles);
             }
 
-            // Handle other file types (textures, etc.) immediately
-            string[] otherExtensions = { ".png", ".jpg", ".jpeg", ".bmp", ".tga", ".blueskyasset" };
+            // Handle other file types (textures, audio, etc.) immediately
+            string[] otherExtensions = { ".png", ".jpg", ".jpeg", ".bmp", ".tga", ".wav", ".ogg", ".mp3", ".flac", ".echosource", ".echosuper", ".blueskyasset" };
             foreach (var file in files.Where(f => !meshFiles.Contains(f)))
             {
                 string ext = Path.GetExtension(file).ToLower();
@@ -111,6 +110,16 @@ partial class Program
                         string destPath = Path.Combine(ProjectManager.AssetsDir!, Path.GetFileName(file));
                         File.Copy(file, destPath, overwrite: true);
                         Log($"✓ Copied: {Path.GetFileName(destPath)}");
+
+                        // Raw audio becomes a canonical Echo Source next to the original.
+                        if (ext == ".wav" || ext == ".ogg" || ext == ".mp3" || ext == ".flac")
+                        {
+                            var converted = BlueSky.Echo.EchoSourceAsset.Import(destPath);
+                            if (converted != null)
+                                Log($"✓ Converted to Echo Source: {Path.GetFileNameWithoutExtension(destPath)}.echosource");
+                            else
+                                Log($"✗ Echo Source conversion failed: {Path.GetFileName(destPath)}");
+                        }
                     }
                 }
                 catch (Exception ex)
@@ -380,11 +389,186 @@ partial class Program
         _pendingImportFiles = Array.Empty<string>();
     }
 
+    private static BlueSky.Echo.AudioSource? _audioPreviewSource;
+
+    /// <summary>
+    /// Play a short editor-only preview of an audio file through Echo (2D, no entity).
+    /// The regular editor frame loop advances/stops the preview source.
+    /// </summary>
+    internal static void PreviewAudioFile(string assetPath)
+    {
+        if (_echo == null)
+        {
+            Log("✗ Echo audio is unavailable.");
+            return;
+        }
+
+        string resolved = BlueSky.Core.Assets.AssetPathResolver.Resolve(assetPath);
+        if (string.IsNullOrWhiteSpace(resolved) || !File.Exists(resolved))
+        {
+            Log($"✗ Audio file not found: {Path.GetFileName(assetPath)}");
+            return;
+        }
+
+        if (_audioPreviewSource != null)
+        {
+            try { _echo.StopSound(_audioPreviewSource); } catch { /* best effort */ }
+            _audioPreviewSource = null;
+        }
+
+        string clipName = "preview:" + resolved;
+        string displayName = Path.GetFileNameWithoutExtension(resolved);
+        _echo.LoadClip(clipName, resolved);
+        _audioPreviewSource = _echo.PlaySound(
+            clipName,
+            Vector3.Zero,
+            volume: 1.0f,
+            loop: false,
+            channel: BlueSky.Echo.AudioChannel.SFX,
+            is3D: false);
+
+        if (_audioPreviewSource != null)
+        {
+            // A preview is not a game sound: it keeps playing when Play mode pauses or stops.
+            _audioPreviewSource.IgnoresGamePause = true;
+            Log($"▶ Previewing audio: {displayName}");
+        }
+        else
+            Log($"✗ Could not preview audio: {displayName}");
+    }
+
+    /// <summary>
+    /// Where a dropped asset should spawn: project the mouse ray onto the Y=0 plane.
+    /// Falls back to the origin when the ray is parallel or points away from the ground.
+    /// </summary>
+    private static BlueSky.Ramanujan.Vector3 GetViewportDropPosition()
+    {
+        if (_viewport == null || _input == null)
+            return BlueSky.Ramanujan.Vector3.Zero;
+
+        var ray = _viewport.GetRayFromMouse(_input.MousePosition);
+        if (MathF.Abs(ray.Direction.Y) > 1e-4f)
+        {
+            float t = -ray.Origin.Y / ray.Direction.Y;
+            if (t > 0f && t < 1000f)
+            {
+                var p = ray.GetPoint(t);
+                return new BlueSky.Ramanujan.Vector3(p.X, p.Y, p.Z);
+            }
+        }
+
+        return BlueSky.Ramanujan.Vector3.Zero;
+    }
+
+    /// <summary>
+    /// Store project-relative paths (Assets/...) so scenes stay portable and fit
+    /// inside AudioSourceComponent's fixed path buffer. Falls back to the full
+    /// path when the asset lives outside the open project.
+    /// </summary>
+    private static string ToProjectRelativePath(string fullPath)
+    {
+        if (string.IsNullOrEmpty(ProjectManager.CurrentProjectDir))
+            return fullPath;
+
+        try
+        {
+            string relative = Path.GetRelativePath(ProjectManager.CurrentProjectDir, fullPath).Replace('\\', '/');
+            if (!relative.StartsWith("..", StringComparison.Ordinal) && !Path.IsPathRooted(relative))
+                return relative;
+        }
+        catch
+        {
+            // Fall through to the absolute path.
+        }
+
+        return fullPath;
+    }
+
+    /// <summary>
+    /// Spawn a placeable Audio Source entity for an audio clip. The entity is
+    /// wired with a transform, an AudioSourceComponent (PlayOnStart = true) and
+    /// a display name, so EchoSystem starts it when Play mode begins.
+    /// Returns null when the clip cannot be found on disk.
+    /// </summary>
+    internal static Entity? SpawnAudioSourceEntity(World world, string assetPath, BlueSky.Ramanujan.Vector3 position)
+    {
+        if (world == null)
+            return null;
+
+        string resolvedAudio = BlueSky.Core.Assets.AssetPathResolver.Resolve(assetPath);
+        if (string.IsNullOrWhiteSpace(resolvedAudio) || !File.Exists(resolvedAudio))
+            return null;
+
+        var audioEntity = world.CreateEntity();
+        world.AddComponent(audioEntity, new TransformComponent
+        {
+            Position = position,
+            Rotation = BlueSky.Ramanujan.Quaternion.Identity,
+            Scale = BlueSky.Ramanujan.Vector3.One
+        });
+
+        var audioSource = new AudioSourceComponent(ToProjectRelativePath(resolvedAudio), volume: 1.0f, loop: false, is3D: true)
+        {
+            PlayOnStart = true,
+            IsPlaying = false
+        };
+
+        // A Super carries its own output/spatial defaults.
+        if (Path.GetExtension(resolvedAudio).Equals(BlueSky.Echo.EchoSuperAsset.Extension, StringComparison.OrdinalIgnoreCase))
+        {
+            var super = BlueSky.Echo.EchoSuperAsset.Load(resolvedAudio);
+            if (super != null)
+            {
+                audioSource.Volume = super.Output.Gain;
+                audioSource.Loop = super.Output.Loop;
+                audioSource.Is3D = super.Output.Is3D;
+                audioSource.MinDistance = super.Output.MinDistance;
+                audioSource.MaxDistance = super.Output.MaxDistance;
+                audioSource.AttenuationCurve = super.Output.AttenuationCurve;
+            }
+        }
+
+        world.AddComponent(audioEntity, audioSource);
+        world.AddComponent(audioEntity, new NameComponent(Path.GetFileNameWithoutExtension(assetPath)));
+
+        return audioEntity;
+    }
+
     internal static void SpawnDraggedAsset(string assetPath)
+    {
+        if (_world == null) return;
+
+        uint versionBefore = _world.Version;
+        SpawnDraggedAssetCore(assetPath);
+
+        // A drop that added entities or components is a scene edit (Play mode edits are discarded on Stop).
+        if (!_isPlaying && _world.Version != versionBefore)
+            _sceneDirty = true;
+    }
+
+    private static void SpawnDraggedAssetCore(string assetPath)
     {
         if (_world == null) return;
         
         string ext = Path.GetExtension(assetPath).ToLower();
+        
+        // Handle audio clips: spawn a placeable Audio Source entity that plays on Play.
+        if (ext == ".wav" || ext == ".ogg" || ext == ".mp3" || ext == ".flac" ||
+            ext == ".echosource" || ext == ".echosuper")
+        {
+            var audioEntity = SpawnAudioSourceEntity(_world, assetPath, GetViewportDropPosition());
+            if (audioEntity == null)
+            {
+                Log($"✗ Audio file not found: {Path.GetFileName(assetPath)}");
+                return;
+            }
+
+            _selectedEntityId = (uint)audioEntity.Value.Id;
+            _detailsCachedId = uint.MaxValue;
+
+            Log($"✓ Spawned Audio Source: {Path.GetFileName(assetPath)} (3D, plays on Play)");
+            return;
+        }
         
         // Auto-import raw model files (GLB, GLTF, FBX, OBJ) before spawning
         if (ext == ".glb" || ext == ".gltf" || ext == ".fbx" || ext == ".obj")
@@ -455,7 +639,7 @@ partial class Program
             // Find selected entity or create new one
             Entity targetEntity;
             
-            if (_selectedEntityId > 0 && _selectedEntityId < 200)
+            if (_selectedEntityId > 0 && _selectedEntityId < EditorOnlyTagComponent.EditorSystemIdBase)
             {
                 // Use selected entity
                 var entities = _world.GetAllEntities().ToList();
@@ -468,9 +652,9 @@ partial class Program
                     
                     var transform = new TransformComponent
                     {
-                        Position = new BlueSky.Core.Math.Vector3(0, 1, 0),
-                        Rotation = BlueSky.Core.Math.Quaternion.Identity,
-                        Scale = BlueSky.Core.Math.Vector3.One
+                        Position = new BlueSky.Ramanujan.Vector3(0, 1, 0),
+                        Rotation = BlueSky.Ramanujan.Quaternion.Identity,
+                        Scale = BlueSky.Ramanujan.Vector3.One
                     };
                     _world.AddComponent(targetEntity, transform);
                 }
@@ -482,9 +666,9 @@ partial class Program
                 
                 var transform = new TransformComponent
                 {
-                    Position = new BlueSky.Core.Math.Vector3(0, 1, 0),
-                    Rotation = BlueSky.Core.Math.Quaternion.Identity,
-                    Scale = BlueSky.Core.Math.Vector3.One
+                    Position = new BlueSky.Ramanujan.Vector3(0, 1, 0),
+                    Rotation = BlueSky.Ramanujan.Quaternion.Identity,
+                    Scale = BlueSky.Ramanujan.Vector3.One
                 };
                 _world.AddComponent(targetEntity, transform);
             }
@@ -527,23 +711,23 @@ partial class Program
             
             var transform = new TransformComponent
             {
-                Position = new BlueSky.Core.Math.Vector3(0, 0, 0), // Spawn at origin
-                Rotation = BlueSky.Core.Math.Quaternion.Identity,
-                Scale = BlueSky.Core.Math.Vector3.One
+                Position = new BlueSky.Ramanujan.Vector3(0, 0, 0), // Spawn at origin
+                Rotation = BlueSky.Ramanujan.Quaternion.Identity,
+                Scale = BlueSky.Ramanujan.Vector3.One
             };
             _world.AddComponent(entity, transform);
 
             // Spawn meshes without materials (geometry only)
             if (header.Type == BlueSky.Core.Assets.AssetType.SkeletalMesh)
             {
-                var skeletalMesh = new BlueSky.Core.ECS.Builtin.SkeletalMeshComponent(assetPath);
+                var skeletalMesh = new BlueSky.SkyCore.Builtin.SkeletalMeshComponent(assetPath);
 
                 _world.AddComponent(entity, skeletalMesh);
                 Log($"  → Added SkeletalMesh component for {Path.GetFileName(assetPath)}");
             }
             else
             {
-                var staticMesh = new BlueSky.Core.ECS.Builtin.StaticMeshComponent
+                var staticMesh = new BlueSky.SkyCore.Builtin.StaticMeshComponent
                 {
                     MeshAssetId = assetPath
                 };
@@ -586,7 +770,7 @@ partial class Program
 
         // Pack to Prefab
         uint menuId = 9200;
-        bool hasSelection = _selectedEntityId > 0 && _selectedEntityId < 200;
+        bool hasSelection = _selectedEntityId > 0 && _selectedEntityId < EditorOnlyTagComponent.EditorSystemIdBase;
         var itemBg = hasSelection ? EditorTheme.Bg2 : EditorTheme.Bg3;
         var itemText = hasSelection ? EditorTheme.TextPrimary : EditorTheme.TextDisabled;
 
@@ -616,7 +800,7 @@ partial class Program
 
     private static void PackEntityToPrefab()
     {
-        if (_world == null || _selectedEntityId == 0 || _selectedEntityId >= 200) return;
+        if (_world == null || _selectedEntityId == 0 || _selectedEntityId >= EditorOnlyTagComponent.EditorSystemIdBase) return;
 
         if (!_world.TryResolveEntity(_selectedEntityId, out var entity))
         {
@@ -650,8 +834,10 @@ partial class Program
 
         try
         {
-            SceneSerializer.SaveScene(sceneData, savePath);
-            Log($"✓ Prefab saved: {Path.GetFileName(savePath)} (in Assets/)");
+            if (SceneSerializer.SaveScene(sceneData, savePath))
+                Log($"✓ Prefab saved: {Path.GetFileName(savePath)} (in Assets/)");
+            else
+                Log($"❌ Failed to save prefab: could not write {Path.GetFileName(savePath)}");
         }
         catch (Exception ex)
         {
@@ -801,8 +987,15 @@ partial class Program
         }
         
         // Create default script
-        var asset = BlueSky.Core.Assets.TeaScriptAsset.Create(Path.GetFileNameWithoutExtension(scriptPath));
-        asset.SaveToFile(scriptPath);
+        string defaultTemplate =
+            $"// {Path.GetFileNameWithoutExtension(scriptPath)}.tea\n\n" +
+            "func start() {\n" +
+            "    // Called once when the script starts\n" +
+            "}\n\n" +
+            "func update() {\n" +
+            "    // Called every frame\n" +
+            "}\n";
+        File.WriteAllText(scriptPath, defaultTemplate);
         
         Log($"✓ Created TeaScript: {Path.GetFileName(scriptPath)}");
         
@@ -1294,34 +1487,54 @@ partial class Program
     //  SCENE MANAGEMENT
     // ═══════════════════════════════════════════════════════════════════════
 
-    private static void SaveScene()
+    private static void SaveScene() => TrySaveScene();
+
+    /// <summary>
+    /// Saves the current scene to <see cref="_currentScenePath"/>, asking for a path first if the
+    /// scene has none. Returns true only if the file was actually written.
+    /// </summary>
+    private static bool TrySaveScene()
     {
-        if (_world == null) return;
+        if (_world == null) return false;
+
+        // During Play mode the world is being simulated. Stop restores the authored scene,
+        // so saving now would overwrite it with whatever state the simulation reached.
+        if (_isPlaying)
+        {
+            _notificationSystem?.ShowWarning("Stop Play mode before saving the scene");
+            return false;
+        }
 
         if (string.IsNullOrEmpty(_currentScenePath))
-        {
-            SaveSceneAs();
-            return;
-        }
+            return TrySaveSceneAs();
 
         try
         {
             // Auto-save terrain assets before scene serialization
             AutoSaveTerrainAssets();
-            
+
             _terrainSystem?.SaveAllTerrainAssets();
-            var sceneData = BlueSky.Core.Scene.SceneConverter.WorldToSceneData(_world, Path.GetFileNameWithoutExtension(_currentScenePath));
-            BlueSky.Core.Scene.SceneSerializer.SaveScene(sceneData, _currentScenePath);
+            var sceneData = BlueSky.Meridian.SceneConverter.WorldToSceneData(_world, Path.GetFileNameWithoutExtension(_currentScenePath));
+
+            if (!BlueSky.Meridian.SceneSerializer.SaveScene(sceneData, _currentScenePath))
+            {
+                Console.WriteLine($"[Editor] ❌ Failed to write scene file: {_currentScenePath}");
+                _notificationSystem?.ShowError($"Save failed: could not write {Path.GetFileName(_currentScenePath)}");
+                return false;
+            }
+
             _sceneDirty = false;
-            
+
             var fileName = Path.GetFileName(_currentScenePath);
-            Console.WriteLine($"[Editor] ✓ Scene saved: {fileName}");
+            Console.WriteLine($"[Editor] ✓ Scene saved: {_currentScenePath}");
             _notificationSystem?.ShowSuccess($"Saved: {fileName}");
+            return true;
         }
         catch (Exception ex)
         {
             Console.WriteLine($"[Editor] ❌ Failed to save scene: {ex.Message}");
             _notificationSystem?.ShowError($"Save failed: {ex.Message}");
+            return false;
         }
     }
 
@@ -1366,15 +1579,17 @@ partial class Program
         }
     }
 
-    private static void SaveSceneAs()
+    private static void SaveSceneAs() => TrySaveSceneAs();
+
+    private static bool TrySaveSceneAs()
     {
-        if (_world == null) return;
+        if (_world == null) return false;
 
         var projectPath = ProjectManager.CurrentProjectDir;
         if (string.IsNullOrEmpty(projectPath))
         {
             _notificationSystem?.ShowError("No project loaded");
-            return;
+            return false;
         }
 
         var scenesDir = Path.Combine(projectPath, "Scenes");
@@ -1383,93 +1598,89 @@ partial class Program
         var selectedPath = NativeFilePicker.SaveFile(
             "Save BlueSky Scene", scenesDir, "blueskyscene", "BlueSky Scene");
         if (string.IsNullOrWhiteSpace(selectedPath))
-            return;
+            return false; // cancelled
 
+        // Only adopt the new path if the write succeeds, so a failed Save As never
+        // leaves the editor pointing at a file that does not exist.
+        var previousPath = _currentScenePath;
         _currentScenePath = Path.GetFullPath(selectedPath);
-        SaveScene();
+        if (TrySaveScene())
+            return true;
+
+        _currentScenePath = previousPath;
+        return false;
     }
+
+    /// <summary>
+    /// If the scene has unsaved changes, saves it before the world is replaced. Returns false (and says why)
+    /// if the save did not happen, so the caller can stop instead of silently discarding the changes.
+    /// </summary>
+    private static bool EnsureSceneSavedBeforeDiscard(string action)
+    {
+        if (!_sceneDirty) return true;
+        if (TrySaveScene()) return true;
+
+        _notificationSystem?.ShowWarning($"{action} cancelled - the current scene has unsaved changes");
+        return false;
+    }
+
+    private static bool IsSceneFile(string path) =>
+        path.EndsWith(".blueskyscene", StringComparison.OrdinalIgnoreCase) ||
+        path.EndsWith(".bsscene", StringComparison.OrdinalIgnoreCase);
 
     private static void LoadScene()
     {
         if (_world == null) return;
 
-        if (_sceneDirty)
+        if (_isPlaying)
         {
-            SaveScene();
-            if (_sceneDirty) return;
+            _notificationSystem?.ShowWarning("Stop Play mode before opening a scene");
+            return;
         }
+
+        if (!EnsureSceneSavedBeforeDiscard("Open Scene")) return;
 
         var projectPath = ProjectManager.CurrentProjectDir;
-        if (string.IsNullOrEmpty(projectPath))
+        if (!string.IsNullOrEmpty(projectPath))
+            Directory.CreateDirectory(Path.Combine(projectPath, "Scenes")); // so Save As and Open have a home
+
+        // Platform-native open dialog (NSOpenPanel / Win32 / zenity).
+        var selectedFiles = ShowOpenFileDialog();
+        if (selectedFiles == null || selectedFiles.Length == 0)
+            return; // cancelled
+
+        var selectedPath = selectedFiles[0];
+        if (!IsSceneFile(selectedPath))
         {
-            _notificationSystem?.ShowError("No project loaded");
+            _notificationSystem?.ShowError("Not a scene file - choose a .blueskyscene or .bsscene file");
             return;
         }
 
-        var scenesDir = Path.Combine(projectPath, "Scenes");
-        if (!Directory.Exists(scenesDir))
-        {
-            _notificationSystem?.ShowWarning("No Scenes folder found");
-            Directory.CreateDirectory(scenesDir);
-            return;
-        }
-
-        var sceneFiles = Directory.GetFiles(scenesDir, "*.blueskyscene");
-        if (sceneFiles.Length == 0)
-        {
-            _notificationSystem?.ShowInfo("No scenes found - create one first!");
-            return;
-        }
-
-        // Use CocoaWindow's native file dialog if available
-        if (_window is BlueSky.Platform.macOS.CocoaWindow cocoaWindow)
-        {
-            var selectedFiles = cocoaWindow.ShowOpenFileDialog();
-            if (selectedFiles != null && selectedFiles.Length > 0)
-            {
-                var selectedPath = selectedFiles[0];
-                
-                // Verify it's a .blueskyscene file
-                if (selectedPath.EndsWith(".blueskyscene", StringComparison.OrdinalIgnoreCase))
-                {
-                    LoadSceneFromPath(selectedPath);
-                }
-                else
-                {
-                    _notificationSystem?.ShowError("Invalid file type - must be .blueskyscene");
-                }
-            }
-        }
-        else
-        {
-            // Fallback: Load most recent scene
-            var mostRecent = sceneFiles.OrderByDescending(File.GetLastWriteTime).First();
-            var fileName = Path.GetFileName(mostRecent);
-            LoadSceneFromPath(mostRecent);
-            _notificationSystem?.ShowInfo($"Loaded most recent: {fileName}");
-        }
+        LoadSceneFromPath(selectedPath);
     }
 
     private static void LoadSceneFromPath(string path)
     {
         if (_world == null) return;
 
-        if (_sceneDirty)
+        if (_isPlaying)
         {
-            SaveScene();
-            if (_sceneDirty) return;
+            _notificationSystem?.ShowWarning("Stop Play mode before opening a scene");
+            return;
         }
+
+        if (!EnsureSceneSavedBeforeDiscard("Open Scene")) return;
 
         try
         {
-            var sceneData = BlueSky.Core.Scene.SceneSerializer.LoadScene(path);
+            var sceneData = BlueSky.Meridian.SceneSerializer.LoadScene(path);
             if (sceneData == null)
             {
                 _notificationSystem?.ShowError("Failed to load scene");
                 return;
             }
 
-            BlueSky.Core.Scene.SceneConverter.SceneDataToWorld(sceneData, _world, clearWorld: true);
+            BlueSky.Meridian.SceneConverter.SceneDataToWorld(sceneData, _world, clearWorld: true);
             _terrainSystem?.Clear();
             _terrainSystem?.LoadTerrainAssetsForWorld();
             
@@ -1493,11 +1704,7 @@ partial class Program
     {
         if (_world == null) return;
 
-        if (_sceneDirty)
-        {
-            SaveScene();
-            if (_sceneDirty) return;
-        }
+        if (!EnsureSceneSavedBeforeDiscard("New Scene")) return;
 
         // Clear the world
         var allQuery = _world.CreateQuery().Build();

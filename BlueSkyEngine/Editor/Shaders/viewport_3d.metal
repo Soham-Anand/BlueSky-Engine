@@ -228,7 +228,8 @@ struct GridFragOut {
 
 fragment GridFragOut fs_grid(GridVaryings in [[stage_in]],
                             constant ViewUniforms& u [[buffer(10)]],
-                        depth2d<float> shadowMap [[texture(1)]])
+                        depth2d<float> shadowMap [[texture(1)]],
+                        sampler shadowSamp [[sampler(1)]])
 {
     // Ray-plane intersection: Y = 0
     float3 ray = in.farPoint - in.nearPoint;
@@ -326,7 +327,7 @@ fragment GridFragOut fs_grid(GridVaryings in [[stage_in]],
     float2 shadowUV = projCoords.xy * 0.5 + 0.5;
     shadowUV.y = 1.0 - shadowUV.y;
     
-    constexpr sampler shadowSampler(coord::normalized, filter::linear, address::clamp_to_edge, compare_func::less);
+    // Bound compare sampler from the RHI (slot 1) — no baked constexpr.
     float shadow = 1.0;
     
     if (shadowUV.x >= 0.0 && shadowUV.x <= 1.0 && shadowUV.y >= 0.0 && shadowUV.y <= 1.0 && projCoords.z >= 0.0 && projCoords.z <= 1.0) {
@@ -337,7 +338,7 @@ fragment GridFragOut fs_grid(GridVaryings in [[stage_in]],
         for (int x = -1; x <= 1; ++x) {
             for (int y = -1; y <= 1; ++y) {
                 float2 offset = float2(x, y) / float2(shadowMap.get_width(), shadowMap.get_height());
-                shadowSum += shadowMap.sample_compare(shadowSampler, shadowUV + offset, currentDepth);
+                shadowSum += shadowMap.sample_compare(shadowSamp, shadowUV + offset, currentDepth);
             }
         }
         shadow = shadowSum / 9.0;
@@ -526,7 +527,8 @@ float computeHorizonAO(float3 N, float3 R) {
 // Derives specular occlusion from the diffuse AO term. Rougher surfaces get
 // more occlusion; smooth mirrors are mostly unaffected by cavity darkening.
 float specularOcclusionFromAO(float NdotV, float ao, float roughness) {
-    return saturate(pow(NdotV + ao, exp2(-16.0 * roughness - 1.0)) - 1.0 + ao);
+    // max(): negative AO (bad authoring) + NdotV would pow(negative) = NaN.
+    return saturate(pow(max(NdotV + ao, 0.0), exp2(-16.0 * roughness - 1.0)) - 1.0 + ao);
 }
 
 // ── Multi-scatter Energy Compensation (Fdez-Aguera 2019) ────────────────────
@@ -536,7 +538,8 @@ float3 multiscatterCompensation(float3 F0, float2 AB) {
     float3 FssEss = F0 * AB.x + AB.y;
     float  Ems    = 1.0 - (AB.x + AB.y);
     float3 Favg   = F0 + (1.0 - F0) / 21.0;
-    return FssEss + Ems * FssEss * Favg / (1.0 - Favg * Ems);
+    // max(): white metal (F0=1) with zero direct response divides 0/0 = NaN.
+    return FssEss + Ems * FssEss * Favg / max(1.0 - Favg * Ems, float3(1e-4));
 }
 
 // Optimized PBR BRDF
@@ -644,6 +647,8 @@ fragment float4 fs_mesh(MeshVaryings in [[stage_in]],
                         texture2d<float> detailNormal [[texture(7)]],
                         texture2d<float> gradeLUT [[texture(8)]],
                         texture2d<float> bentTex [[texture(9)]],
+                        sampler surfSamp [[sampler(2)]],
+                        sampler shadowSamp [[sampler(1)]],
                         constant float4* sh [[buffer(16)]],
                         constant float& skyPreset [[buffer(17)]])
 {
@@ -656,12 +661,11 @@ fragment float4 fs_mesh(MeshVaryings in [[stage_in]],
     // ── Surface Properties (global constant — historic orange clay) ──────────
     // Bit layout mirrors StrataFeature: 1=AO 4=Detail 8=Wrap 16=Toksvig
     // 32=Bump 1024=ScreenDoor 2048=AlbedoMap. Unset bits cost nothing.
-    constexpr sampler surfSampler(coord::normalized, filter::linear,
-                                  mip_filter::linear, address::repeat);
+    // Bound linear sampler from the RHI (slot 2) — no baked constexpr.
     uint feat = (uint)surface.custom1.x;
     float3 albedo   = surface.baseColor.rgb;
     if ((feat & 2048u) != 0u)
-        albedo *= albedoTex.sample(surfSampler, in.uv).rgb;
+        albedo *= albedoTex.sample(surfSamp, in.uv).rgb;
     float  metallic = clamp(surface.metallic, 0.0, 1.0);
     float  roughness = max(0.04, surface.roughness);
     float  ao        = surface.ao;
@@ -710,7 +714,7 @@ fragment float4 fs_mesh(MeshVaryings in [[stage_in]],
 
     // Baked AO + Toksvig variance from the RMA texture (R=rough G=metal B=AO A=variance).
     if ((feat & (1u | 16u)) != 0u) {
-        float4 rma = rmaTex.sample(surfSampler, in.uv);
+        float4 rma = rmaTex.sample(surfSamp, in.uv);
         if ((feat & 1u) != 0u)
             ao = rma.b;
         if ((feat & 16u) != 0u)
@@ -732,11 +736,11 @@ fragment float4 fs_mesh(MeshVaryings in [[stage_in]],
     if ((feat & (4u | 32u)) != 0u) {
         float2 dUV = in.uv * detailTile;
         if ((feat & 32u) != 0u) {
-            float h = detailAlbedo.sample(surfSampler, dUV).a;
+            float h = detailAlbedo.sample(surfSamp, dUV).a;
             float2 poff = (V.xy / max(V.z, 0.3)) * (h - 0.5) * 0.06;
             dUV += poff;
         }
-        float3 dn = detailNormal.sample(surfSampler, dUV).rgb * 2.0 - 1.0;
+        float3 dn = detailNormal.sample(surfSamp, dUV).rgb * 2.0 - 1.0;
         float dFade = saturate(1.0 - length(in.worldPos - view.cameraPos.xyz) / 40.0);
         N = normalize(float3(N.xy + dn.xy * dFade, N.z));
     }
@@ -749,8 +753,8 @@ fragment float4 fs_mesh(MeshVaryings in [[stage_in]],
 // Light direction (sun) - sunDirection already points TOWARD the sun
 float3 L = normalize(view.sunDirection.xyz);
     
-    // Half vector for specular
-    float3 H = normalize(L + V);
+    // Half vector for specular (+eps: exact backlight L==-V gives 0/0=NaN)
+    float3 H = normalize(L + V + float3(1e-6));
     
     // ── Dot Products ───────────────────────────────────────────────────────────
     float NdotL = max(dot(N, L), 0.0);
@@ -774,19 +778,28 @@ float3 L = normalize(view.sunDirection.xyz);
     half3 F = hF0 + (1.0h - hF0) * ft5;
     
     // ── GGX NDF ────────────────────────────────────────────────────────────────
-    half hAlpha = half(roughness * roughness);
-    half hAlpha2 = hAlpha * hAlpha;
+    // Pit/cone fix: D is computed in float and clamped. In half precision,
+    // mirror paint (roughness 0.04) at normal incidence gives
+    // denom² ≈ 6.5e-12 → D ≈ 1.25e5 > half max (65504) → inf → NaN through
+    // the tonemap/LUT = tiny black pit with a white halo. 20000 stays
+    // blinding-white at the core but finite, so the tonemapper rolls off.
+    float fAlpha = roughness * roughness;
+    float fAlpha2 = fAlpha * fAlpha;
+    half hAlpha = half(fAlpha);
     half hNdotH = half(NdotH);
-    half hDenom = hNdotH * hNdotH * (hAlpha2 - 1.0h) + 1.0h;
-    half D = hAlpha2 * half(INV_PI) / (hDenom * hDenom);
+    float fDenom = NdotH * NdotH * (fAlpha2 - 1.0) + 1.0;
+    half D = half(min(fAlpha2 * float(INV_PI) / max(fDenom * fDenom, 1e-12), 20000.0));
     
     // ── Visibility (Hammon 2017 — replaces Smith G + 4NLV denominator) ──────────
+    // Pit fix: floor 0.02 (not 0.001) — 0.5/0.001 = 500× vis times clamped
+    // D (20000) still reaches 1e7 = half inf. See loop path + combine clamp.
     half hNdotL = half(NdotL);
     half hNdotV = half(NdotV);
-    half vis = 0.5h / max(mix(2.0h * hNdotL * hNdotV, hNdotL + hNdotV, hAlpha), half(0.001));
+    half vis = 0.5h / max(mix(2.0h * hNdotL * hNdotV, hNdotL + hNdotV, hAlpha), half(0.02));
     
     // ── Combined Specular + Diffuse BRDF ───────────────────────────────────────
-    half3 specular = D * F * vis;
+    // Pit fix: cap specular — D(20000) × F(1) × vis(25) still overflows half.
+    half3 specular = min(D * F * vis, half3(30000.0));
     half3 kD = (1.0h - F) * (1.0h - half(metallic));
     half3 hAlbedo = half3(albedo);
     half3 diffuse = kD * hAlbedo * half(INV_PI);
@@ -928,22 +941,18 @@ float3 L = normalize(view.sunDirection.xyz);
             }
         }
         
-        float3 lH = normalize(V + Ll);
-        half lNdotH = half(max(dot(N, lH), 0.0));
+        float3 lH = normalize(V + Ll + float3(1e-6));
         half lVdotH = half(max(dot(V, lH), 0.0));
         
-        // Fast Fresnel (manual pow5)
+        // Fast Fresnel (manual pow5) — kept for the diffuse term below.
         half lft = 1.0h - lVdotH; half lft2 = lft * lft; half lft5 = lft2 * lft2 * lft;
         half3 lF = hF0 + (1.0h - hF0) * lft5;
-        // GGX + Hammon visibility
-        half lDenom = lNdotH * lNdotH * (hAlpha2 - 1.0h) + 1.0h;
-        half lD = hAlpha2 * half(INV_PI) / (lDenom * lDenom);
-        half lVis = 0.5h / max(mix(2.0h * lNdotL * hNdotV, lNdotL + hNdotV, hAlpha), half(0.001));
-        
-        half3 lSpec = lD * lF * lVis;
+        // No GGX specular lobe here by design: sharp loop-light glints are
+        // unwanted (clearcoat carries car reflections), and lD×lF×lVis could
+        // exceed half range. Diffuse-only loop lighting + IBL ambient.
         half3 lkD = (1.0h - lF) * (1.0h - half(metallic));
         half3 lRad = half3(float3(light.color)) * half(light.intensity) * atten;
-        directLight += (lkD * hAlbedo * half(INV_PI) + lSpec) * lRad * lNdotL;
+        directLight += lkD * hAlbedo * half(INV_PI) * lRad * lNdotL;
     }
     
     // ── Environment Reflections (half precision IBL) ────────────────────────────
@@ -955,7 +964,7 @@ float3 L = normalize(view.sunDirection.xyz);
     // the irradiance lookup only — specular keeps the geometric normal.
     float3 shadeN = N;
     if ((feat & 2u) != 0u) {
-        float3 bent = bentTex.sample(surfSampler, in.uv).rgb * 2.0 - 1.0;
+        float3 bent = bentTex.sample(surfSamp, in.uv).rgb * 2.0 - 1.0;
         if (length_squared(bent) > 1e-6) shadeN = normalize(bent);
     }
     half3 irradiance = half3(SHEval(shadeN, sh));
@@ -1000,9 +1009,7 @@ float3 L = normalize(view.sunDirection.xyz);
         shadowUV.y >= 0.0 && shadowUV.y <= 1.0 && 
         projCoords.z >= 0.0 && projCoords.z <= 1.0) {
         
-        constexpr sampler shadowSampler(coord::normalized, filter::linear, 
-                                       address::clamp_to_edge, compare_func::less);
-        
+        // Bound compare sampler from the RHI (slot 1).
         // Adaptive bias based on surface angle (prevents shadow acne)
         float bias = max(0.008 * (1.0 - NdotL), 0.002);
         float currentDepth = projCoords.z - bias;
@@ -1018,7 +1025,7 @@ float3 L = normalize(view.sunDirection.xyz);
         const float2 taps[4] = { float2(-0.5,-0.5), float2(0.5,-0.5), float2(-0.5,0.5), float2(0.5,0.5) };
         float shadowSum = 0.0;
         for (int i = 0; i < 4; ++i) {
-            shadowSum += shadowMap.sample_compare(shadowSampler, shadowUV + rot * taps[i] * texelSize * 2.0, currentDepth);
+            shadowSum += shadowMap.sample_compare(shadowSamp, shadowUV + rot * taps[i] * texelSize * 2.0, currentDepth);
         }
         shadow = shadowSum * 0.25;
         
@@ -1035,8 +1042,27 @@ float3 L = normalize(view.sunDirection.xyz);
         return float4(shadow, shadow, shadow, 1.0);
     }
     
-    // Combine all lighting components (half → float at composition boundary)
-    float3 finalColor = float3(ambient) + float3(directLight + sss + translucency) * shadow + float3(rimLight);
+    // Combine all lighting components (half → float at composition boundary).
+    // Pit fix: cap the half-space sum — any inf here becomes a black pit with
+    // a white halo after PBRNeutral/LUT. 30000 is already pure white.
+    half3 litSum = min(directLight + sss + translucency, half3(30000.0));
+    float3 finalColor = float3(ambient) + float3(litSum) * shadow + float3(rimLight);
+
+    // ── Prism Analytical Height Fog + Henyey-Greenstein Mie Sun In-Scattering ──
+    // Zero-branch, single-pass atmospheric depth for outdoor scenes (attenuated in studio preset).
+    float outdoorWeight = saturate(1.0 - skyPreset);
+    if (outdoorWeight > 0.001) {
+        float3 camToFrag = in.worldPos - view.cameraPos.xyz;
+        float viewDist = length(camToFrag);
+        float3 viewRay = camToFrag / max(viewDist, 1e-4);
+        float heightFalloff = exp(-max(0.0, in.worldPos.y) * 0.025);
+        float fogOpticalDepth = max(0.0, viewDist - 12.0) * 0.0018 * heightFalloff * outdoorWeight;
+        float fogFactor = 1.0 - exp(-fogOpticalDepth);
+        float sunCos = saturate(dot(viewRay, L));
+        float mieScatter = pow(sunCos, 6.0) * 0.45;
+        float3 fogHorizon = mix(float3(0.58, 0.78, 0.96), float3(1.0, 0.88, 0.68), mieScatter);
+        finalColor = mix(finalColor, fogHorizon, saturate(fogFactor * 0.75));
+    }
     
     // Exposure from lighting settings
     finalColor *= lightSettings.exposure;
@@ -1049,13 +1075,217 @@ float3 L = normalize(view.sunDirection.xyz);
 
     // ── Display-referred grade LUT + interlaced gradient noise dither ─────────
     // Dither is absolutely last: ±0.5 LSB in display space kills banding.
-    finalColor = LUTSample(finalColor, gradeLUT, surfSampler);
+    finalColor = LUTSample(finalColor, gradeLUT, surfSamp);
     float ign = fract(52.9829189 * fract(dot(floor(in.position.xy), float2(0.06711056, 0.00583715))));
     finalColor += (ign - 0.5) / 255.0;
     
     // ── Output Alpha ───────────────────────────────────────────────────────────
     // Opaque pipeline ignores it (blend off); transparent pipeline blends it.
     return float4(finalColor, surface.alpha);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// VECTRA — billboard particles (CPU sim, GPU quads). Sway is done here by
+// seed + time (free, smoother than any CPU timestep). Smoke shading: radial
+// soft falloff x 2-octave noise erosion, vertical light gradient, one
+// sun-facing term, near-fade so a puff can never become a fullscreen quad.
+// Output is sRGB-encoded like the mesh path (grade LUT intentionally skipped:
+// smoke is unlit-ish; matching it exactly costs a fetch for zero visible win).
+// ═════════════════════════════════════════════════════════════════════════════
+
+struct VectraVertexIn {
+    float2 corner [[attribute(0)]];
+    float3 center [[attribute(1)]];
+    float4 color  [[attribute(2)]];
+    float4 params [[attribute(3)]]; // x=size, y=age01, z=seed, w=alpha
+};
+
+struct VectraVaryings {
+    float4 position [[position]];
+    float2 uv;
+    float4 color;
+    float  age01;
+    float  seed;
+    float3 worldPos;
+};
+
+struct VectraDepthUniforms {
+    float4x4 inverseProjection;
+    float4 parameters;
+};
+
+vertex VectraVaryings vs_vectra(VectraVertexIn in [[stage_in]],
+                                constant ViewUniforms& view [[buffer(10)]])
+{
+    VectraVaryings out;
+    float2 corner = in.corner;
+    float3 center = in.center;
+    float ph = in.params.z * 6.2831853;
+    // Quadratic age envelope keeps the nozzle anchored at the source while
+    // upper plume puffs swirl on decorrelated per-seed frequencies.
+    float swayAmp = in.params.y * in.params.y * 0.48;
+    float freq = 0.85 + fract(in.params.z * 5.13) * 0.65;
+    center.x += sin(view.time * freq + ph) * swayAmp;
+    center.z += cos(view.time * (freq * 0.88) + ph * 1.7) * swayAmp;
+    float3 right = float3(view.view[0][0], view.view[1][0], view.view[2][0]);
+    float3 up    = float3(view.view[0][1], view.view[1][1], view.view[2][1]);
+    float3 world = center + (right * corner.x + up * corner.y) * (in.params.x * 0.5);
+    out.worldPos = world;
+    out.position = view.viewProj * float4(world, 1.0);
+    out.uv = corner * 0.5 + 0.5;
+    out.color = in.color;
+    out.age01 = in.params.y;
+    out.seed = in.params.z;
+    return out;
+}
+
+// Fast, zero-loop volumetric smoke shader for Apple M4 TBDR:
+// - Uses [[early_fragment_tests]] and zero discard_fragment() calls so hardware
+//   Early-Z / HSR stays active across all translucent particle tiles.
+// - Reads pre-baked 4-channel cumulus data from sprite.rgba (R=cavity AO,
+//   G=4-octave Perlin-Worley billow detail, B=turbulent wisp field, A=7-lobe
+//   density) in a single non-dependent fetch — zero per-pixel noise hash loops!
+[[early_fragment_tests]]
+fragment float4 fs_smoke(VectraVaryings in [[stage_in]],
+                         constant ViewUniforms& view [[buffer(10)]],
+                         constant VectraDepthUniforms& depthUniforms [[buffer(11)]],
+                         texture2d<float> sprite [[texture(0)]],
+                         texture2d<float> lightMapA [[texture(1)]],
+                         texture2d<float> lightMapB [[texture(2)]],
+                         depth2d<float> sceneDepth [[texture(3)]],
+                         sampler sprSampB [[sampler(0)]])
+{
+    // 1. Early circular corner exit (skips texture fetches on outer 36% of quad).
+    float2 c = in.uv - 0.5;
+    float gd2 = dot(c, c) * 4.0;
+    if (gd2 >= 0.85)
+        return float4(0.0);
+    float gd = sqrt(gd2);
+
+    // 2. Seed-driven rotation + subtle anisotropic aspect + lifetime roll.
+    float baseAngle = fract(in.seed * 7.31) * 6.2831853;
+    float spinAngle = (fract(in.seed * 7.7) - 0.5) * in.age01 * 2.2;
+    float totalAngle = baseAngle + spinAngle;
+    float ca = cos(totalAngle), sa = sin(totalAngle);
+    float2 q = float2(c.x * ca + c.y * sa, -c.x * sa + c.y * ca);
+
+    float sm = 0.06 + 0.14 * fract(in.seed * 3.7);
+    q.x *= 1.0 + sm * 0.28;
+    q.y *= 1.0 - sm * 0.18;
+
+    float r = max(gd, length(q) * 2.0);
+    if (r >= 0.90)
+        return float4(0.0);
+
+    // 3. Analytical 2-harmonic curl swirl (zero hash loops, non-dependent UV
+    // so M4 hardware prefetches sprite + lightMapA + lightMapB in parallel).
+    float warpMask = 1.0 - smoothstep(0.22, 0.78, r);
+    float tFlow = view.time * 0.65 + in.age01 * 2.1 + in.seed * 6.2831853;
+    float2 swirl = float2(
+        sin(q.y * 7.5 + tFlow) + 0.45 * cos(q.x * 13.0 - tFlow * 1.3),
+        cos(q.x * 7.5 - tFlow * 0.9) - 0.45 * sin(q.y * 13.0 + tFlow * 1.1)
+    ) * (0.042 * warpMask);
+
+    float2 suv = clamp(q * 0.86 + swirl + 0.5, 0.03, 0.97);
+    float4 tex = sprite.sample(sprSampB, suv);
+    float3 occA = lightMapA.sample(sprSampB, suv).rgb;
+    float3 occB = lightMapB.sample(sprSampB, suv).rgb;
+
+    // 4. Unpack pre-baked cumulus channels (custom PNGs have R=G=B=1, which
+    // gracefully defaults to neutral detail/cavity).
+    float cavityAO    = tex.r;
+    float detailNoise = tex.g;
+    float wispNoise   = tex.b;
+
+    // Quartic C2 radial window + Perlin-Worley billow edge erosion.
+    float radialWindow = 1.0 - smoothstep(0.28, 0.88, r);
+    radialWindow *= radialWindow;
+
+    float ageDissolve = smoothstep(0.22, 1.0, in.age01);
+    float erosion = mix(0.04, 0.42, ageDissolve) * (1.0 - (detailNoise * 0.65 + wispNoise * 0.35) * 0.78);
+    float sculptedDensity = tex.a * (0.68 + 0.46 * detailNoise);
+    float rawDensity = smoothstep(erosion, 0.84, sculptedDensity) * radialWindow;
+
+    // Beer-Lambert optical thickness: rich volumetric core, feather-soft rim.
+    float a = (1.0 - exp(-rawDensity * 2.65)) * radialWindow * in.color.a;
+    if (a < 0.002)
+        return float4(0.0);
+
+    // 5. High-contrast 3D Cumulus Self-Shadowing + Rotated 6-Way Lightmaps.
+    float3 camRight = float3(view.view[0][0], view.view[1][0], view.view[2][0]);
+    float3 camUp    = float3(view.view[0][1], view.view[1][1], view.view[2][1]);
+    float3 camFwd   = float3(view.view[0][2], view.view[1][2], view.view[2][2]);
+
+    float3 lightDir = normalize(view.sunDirection.xyz + float3(0.0, 1e-5, 0.0));
+    float2 lightViewXY = float2(dot(lightDir, camRight), dot(lightDir, camUp));
+    float2 lightSpriteXY = float2(
+        lightViewXY.x * ca + lightViewXY.y * sa,
+       -lightViewXY.x * sa + lightViewXY.y * ca
+    );
+    float lightSpriteZ = dot(lightDir, -camFwd);
+    float3 spriteLight = normalize(float3(lightSpriteXY, lightSpriteZ) + float3(0.0, 0.0, 1e-5));
+    float3 absLight = abs(spriteLight);
+    float occX = spriteLight.x >= 0.0 ? occA.r : occA.g;
+    float occY = spriteLight.y >= 0.0 ? occA.b : occB.r;
+    float occZ = spriteLight.z >= 0.0 ? occB.g : occB.b;
+    float directionalOcclusion = dot(float3(occX, occY, occZ), absLight) /
+        max(absLight.x + absLight.y + absLight.z, 1e-4);
+
+    // Reconstruct 3D cauliflower lobe normal from lightmap gradient + baked detail.
+    float2 gradSprite = float2(occA.g - occA.r, occB.r - occA.b) + float2(detailNoise - 0.5, wispNoise - 0.5) * 0.45;
+    float2 gradView = float2(
+        gradSprite.x * ca - gradSprite.y * sa,
+        gradSprite.x * sa + gradSprite.y * ca
+    );
+    float2 puffXY = c * 1.40 + gradView * 0.85;
+    float puffZ = sqrt(max(0.06, 1.0 - dot(puffXY, puffXY)));
+    float3 puffNormal = normalize(camRight * puffXY.x - camUp * puffXY.y - camFwd * puffZ);
+    float billowWrap = saturate(dot(puffNormal, lightDir) * 0.55 + 0.45);
+
+    // Beer-Powder dual scattering + deep crevice self-occlusion so individual
+    // cauliflower lobes stand out with crisp sunlit crowns and dark folds.
+    float beer = exp(-directionalOcclusion * 2.15);
+    float powder = 1.0 - 0.52 * exp(-rawDensity * 3.4);
+    float creaseRelief = mix(0.48, 1.08, cavityAO);
+    float directLit = saturate(beer * powder * billowWrap * creaseRelief);
+
+    // Henyey-Greenstein forward scattering for backlit silver-lined rims.
+    float3 vdir = normalize(in.worldPos - view.cameraPos.xyz);
+    float cosTheta = dot(vdir, lightDir);
+    const float g = 0.38;
+    float hgDenom = max(1.0 + g * g - 2.0 * g * cosTheta, 0.05);
+    float hg = (1.0 - g * g) / (4.0 * 3.14159265 * hgDenom * sqrt(hgDenom));
+    float rimScatter = saturate(hg * 1.85) * (1.0 - rawDensity * 0.60) * beer;
+
+    // Plume thermal & height gradient: dense charcoal soot at nozzle base,
+    // expanding into sunlit warm crowns and cool sky-shaded valleys above.
+    float3 young = in.color.rgb * float3(0.56, 0.53, 0.52);
+    float3 old   = in.color.rgb * float3(1.10, 1.12, 1.16);
+    float3 base  = mix(young, old, smoothstep(0.02, 0.65, in.age01));
+
+    float3 shadowAmb = float3(0.36, 0.40, 0.48) * mix(0.75, 1.0, cavityAO);
+    float3 sunHighlight = float3(1.18, 1.10, 1.00);
+    float heightGrad = mix(0.76, 1.10, smoothstep(-0.42, 0.42, -c.y));
+    float3 lighting = mix(shadowAmb, sunHighlight, directLit) + sunHighlight * (rimScatter * 0.28);
+    float3 col = base * lighting * heightGrad;
+
+    // Camera near-fade + curved depth-buffer soft-particle intersection fade.
+    float dist = length(in.worldPos - view.cameraPos.xyz);
+    a *= smoothstep(1.6, 4.8, dist);
+    uint depthWidth = sceneDepth.get_width();
+    uint depthHeight = sceneDepth.get_height();
+    uint2 depthPixel = min(uint2(in.position.xy), uint2(depthWidth - 1, depthHeight - 1));
+    float deviceDepth = sceneDepth.read(depthPixel);
+    float4 sceneView = depthUniforms.inverseProjection * float4(0.0, 0.0, deviceDepth, 1.0);
+    float sceneZ = abs(sceneView.z / max(abs(sceneView.w), 1e-6));
+    float particleZ = abs((view.view * float4(in.worldPos, 1.0)).z);
+    float puffDepthOffset = puffZ * 0.35;
+    float softFade = smoothstep(0.0, max(depthUniforms.parameters.x, 1e-4), (sceneZ - (particleZ - puffDepthOffset)));
+    a *= softFade;
+
+    float ign = fract(52.9829189 * fract(dot(floor(in.position.xy), float2(0.06711056, 0.00583715))));
+    a = saturate(a + (ign - 0.5) * (1.0 / 255.0));
+    return float4(LinearToSRGB(col), a);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

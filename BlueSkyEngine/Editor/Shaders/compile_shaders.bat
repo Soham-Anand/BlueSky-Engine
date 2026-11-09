@@ -83,7 +83,17 @@ REM ============================================================================
 REM UI Shaders (simple_ui.hlsl)
 REM ============================================================================
 
-echo [7/8] Compiling UI shaders...
+echo [7/9] Compiling Vectra smoke shaders...
+fxc.exe /nologo /T %SM_VS% /E vs_vectra /Fo vs_vectra.cso %HLSL_VIEWPORT%
+if %ERRORLEVEL% NEQ 0 set /a ERRORS+=1
+fxc.exe /nologo /T %SM_PS% /E fs_smoke /Fo fs_smoke.cso %HLSL_VIEWPORT%
+if %ERRORLEVEL% NEQ 0 set /a ERRORS+=1
+
+REM ============================================================================
+REM UI Shaders (simple_ui.hlsl)
+REM ============================================================================
+
+echo [8/9] Compiling UI shaders...
 fxc.exe /nologo /T %SM_VS% /E vs_ui /Fo vs_ui.cso %HLSL_UI%
 if %ERRORLEVEL% NEQ 0 set /a ERRORS+=1
 fxc.exe /nologo /T %SM_PS% /E fs_ui /Fo fs_ui.cso %HLSL_UI%
@@ -92,7 +102,7 @@ if %ERRORLEVEL% NEQ 0 set /a ERRORS+=1
 REM ============================================================================
 REM Polaris edge-aware upscaler (SM 4.0 baseline)
 REM ============================================================================
-echo [8/8] Compiling Polaris upscaler shaders...
+echo [9/9] Compiling Polaris upscaler shaders...
 set HLSL_POLARIS=..\..\Rendering\Shaders\PolarisUpscale.hlsl
 fxc.exe /nologo /T vs_4_0 /E VSMain /Fo vs_PolarisUpscale.cso %HLSL_POLARIS%
 if %ERRORLEVEL% NEQ 0 set /a ERRORS+=1
@@ -118,6 +128,7 @@ echo   vs_mesh.cso, fs_mesh.cso         - PBR mesh rendering
 echo   vs_shadow.cso, fs_shadow.cso     - Shadow map pass
 echo   vs_gizmo.cso, fs_gizmo.cso       - Editor gizmos
 echo   fs_wireframe.cso                 - Wireframe overlay
+echo   vs_vectra.cso, fs_smoke.cso      - Vectra smoke particles
 echo   vs_ui.cso, fs_ui.cso             - UI rendering
 echo   vs_PolarisUpscale.cso, ps_PolarisUpscale.cso - Polaris upscaler
 echo.

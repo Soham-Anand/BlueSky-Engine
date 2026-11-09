@@ -1,6 +1,6 @@
 using System.Numerics;
-using BlueSky.Platform;
-using BlueSky.Platform.Input;
+using BlueSky.Aegis;
+using BlueSky.Aegis.Input;
 
 namespace BlueSky.Core.Gameplay;
 

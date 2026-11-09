@@ -119,6 +119,7 @@ public class BlueAsset
     {
         try
         {
+            path = AssetPathResolver.Resolve(path);
             if (!File.Exists(path))
             {
                 return null;
@@ -190,6 +191,7 @@ public class BlueAsset
     {
         try
         {
+            path = AssetPathResolver.Resolve(path);
             if (!File.Exists(path)) return null;
 
             using var fs = new FileStream(path, FileMode.Open, FileAccess.Read);

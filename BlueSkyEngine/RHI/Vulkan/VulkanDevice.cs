@@ -1,9 +1,9 @@
 using System;
 using System.Runtime.InteropServices;
 using System.Text;
-using BlueSky.Platform;
+using BlueSky.Aegis;
 
-namespace BlueSky.Rendering.RHI.Vulkan;
+namespace BlueSky.BSR.RHI.Vulkan;
 
 /// <summary>
 /// Full Vulkan RHI device implementation.
@@ -366,6 +366,16 @@ public sealed class VulkanDevice : IRHIDevice
     public IRHITexture CreateTexture(TextureDesc desc)
     {
         return new VulkanTexture(this, desc);
+    }
+
+    public IRHISampler CreateSampler(SamplerDesc desc)
+    {
+        return new VulkanSampler(this, desc);
+    }
+
+    public void GenerateMipmaps(IRHITexture texture)
+    {
+        throw new NotSupportedException("[Vulkan] GenerateMipmaps is not implemented yet — create textures with MipLevels = 1.");
     }
 
     public IRHISwapchain CreateSwapchain(IWindow window, PresentMode presentMode = PresentMode.Vsync)

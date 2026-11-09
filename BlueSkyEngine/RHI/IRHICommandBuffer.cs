@@ -1,6 +1,6 @@
 using System.Numerics;
 
-namespace BlueSky.Rendering.RHI;
+namespace BlueSky.BSR.RHI;
 
 public interface IRHICommandBuffer : IDisposable
 {
@@ -13,12 +13,21 @@ public interface IRHICommandBuffer : IDisposable
     void SetPipeline(IRHIPipeline pipeline);
     void SetViewport(Viewport viewport);
     void SetScissor(Scissor scissor);
+    /// <summary>
+    /// Depth bias (polygon offset) for the active pass — the shadow-acne fix.
+    /// Metal implements via setDepthBias; Vulkan/DirectX11 throw until wired.
+    /// Must be called inside a render pass, after SetPipeline.
+    /// </summary>
+    void SetDepthBias(float constantBias, float slopeScale, float clamp);
     
     // Resource binding (traditional slot-based)
     void SetVertexBuffer(IRHIBuffer buffer, uint binding = 0, ulong offset = 0);
     void SetIndexBuffer(IRHIBuffer buffer, IndexType indexType, ulong offset = 0);
     void SetUniformBuffer(IRHIBuffer buffer, uint binding, uint set = 0);
     void SetTexture(IRHITexture texture, uint binding, uint set = 0);
+    void SetSampler(IRHISampler sampler, uint binding, uint set = 0);
+    /// <summary>Copies an entire same-sized, same-format texture outside a render pass.</summary>
+    void CopyTexture(IRHITexture source, IRHITexture destination);
     void SetStorageBuffer(IRHIBuffer buffer, uint binding, uint set = 0);
     void SetStorageTexture(IRHITexture texture, uint binding, uint set = 0);
     

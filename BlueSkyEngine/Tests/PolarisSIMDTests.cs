@@ -1,8 +1,8 @@
 using System;
 using System.Numerics;
 using System.Runtime.Intrinsics.X86;
-using BlueSky.Rendering.RayTracing;
-using BlueSky.Rendering.RayTracing.Polaris;
+using BlueSky.BSR.RayTracing;
+using BlueSky.BSR.RayTracing.Polaris;
 
 namespace BlueSky.Tests;
 
@@ -22,8 +22,8 @@ public static class PolarisSIMDTests
 
     private static bool TestAVXHardwareSupport()
     {
-        bool supported = Avx.IsSupported;
-        Console.WriteLine($"  ✓ AVX SIMD Hardware Detection: (Supported={supported}) PASSED");
+        bool supported = AVXMath.HasAVX;
+        Console.WriteLine($"  ✓ Ramanujan 8-Wide SIMD Hardware Detection: (Supported={supported}, Backend='{BlueSky.Ramanujan.RamanujanSimd.ActiveBackendName}') PASSED");
         return true; // Test passes regardless of platform capabilities
     }
 
@@ -67,12 +67,6 @@ public static class PolarisSIMDTests
     {
         try
         {
-            if (!Avx.IsSupported)
-            {
-                Console.WriteLine("  ✓ 8-Wide AVX Ray Packet Intersect: SKIPPED (ARM64 / Non-AVX Platform)");
-                return true;
-            }
-
             var triangles = new Triangle[1]
             {
                 new Triangle

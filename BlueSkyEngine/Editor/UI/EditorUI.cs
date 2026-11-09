@@ -28,6 +28,34 @@ public class EditorUI
         public float CornerRadius;     // Corner radius for rounded rects
         public bool GradientVertical;  // true = top-to-bottom, false = left-to-right
         public Vector4? ClipRect;      // Optional clip rect (x, y, width, height) for scissoring
+        public Vector2 P1;             // TriangleFilled: second vertex
+        public Vector2 P2;             // TriangleFilled: third vertex
+    }
+
+    /// <summary>Vector icon kinds drawn from rect/circle/triangle/line primitives.</summary>
+    public enum UIIcon
+    {
+        None,
+        Play,
+        Pause,
+        Stop,
+        Plus,
+        Minus,
+        Check,
+        X,
+        Search,
+        Eye,
+        ChevronRight,
+        ChevronLeft,
+        ChevronDown,
+        Dot,
+        Import,
+        Move,
+        Rotate,
+        Scale,
+        Save,
+        Folder,
+        Settings,
     }
 
     public enum DrawCommandType
@@ -40,7 +68,8 @@ public class EditorUI
         Line,
         GradientRectFilled,
         RoundedRectFilled,
-        RoundedGradientRectFilled
+        RoundedGradientRectFilled,
+        TriangleFilled
     }
 
     private readonly List<DrawCommand> _drawCommands = new();
@@ -182,13 +211,13 @@ public class EditorUI
             float trackWidth = 6f;
             float trackX = x + width - trackWidth;
             
-            // Scrollbar track background
+            // Scrollbar track background (overlay-style: transparent, thumb floats)
             _drawCommands.Add(new DrawCommand
             {
                 Type = DrawCommandType.RectFilled,
                 Position = new Vector2(trackX, y),
                 Size = new Vector2(trackWidth, height),
-                Color = new Vector4(0.035f, 0.038f, 0.044f, 0.85f)
+                Color = new Vector4(0f, 0f, 0f, 0f)
             });
             
             // Scrollbar thumb
@@ -198,16 +227,17 @@ public class EditorUI
             
             bool isThumbHovered = IsHovering(trackX, thumbY, trackWidth, thumbHeight);
             bool isThumbActive = _draggingScrollbar == id;
-            var thumbColor = isThumbActive ? new Vector4(0.6f, 0.6f, 0.7f, 0.95f) :
-                             isThumbHovered ? new Vector4(0.5f, 0.5f, 0.6f, 0.9f) :
-                             new Vector4(0.4f, 0.4f, 0.45f, 0.8f);
+            var thumbColor = isThumbActive ? EditorTheme.ScrollbarThumbHot :
+                             isThumbHovered ? EditorTheme.ScrollbarThumbHover :
+                             EditorTheme.ScrollbarThumb;
             
             _drawCommands.Add(new DrawCommand
             {
-                Type = DrawCommandType.RectFilled,
+                Type = DrawCommandType.RoundedRectFilled,
                 Position = new Vector2(trackX, thumbY),
                 Size = new Vector2(trackWidth, thumbHeight),
-                Color = thumbColor
+                Color = thumbColor,
+                CornerRadius = trackWidth * 0.5f
             });
             
             // Scrollbar drag interaction
@@ -300,7 +330,7 @@ public class EditorUI
 
     public bool Button(string text, float width, float height)
     {
-        return Button(text, width, height, new Vector4(0.2f, 0.2f, 0.22f, 1.0f), new Vector4(0.3f, 0.4f, 0.5f, 1.0f));
+        return Button(text, width, height, EditorTheme.ToolbarBtnNormal, EditorTheme.ToolbarBtnHover);
     }
 
     public bool Button(string text, float width, float height, Vector4 normalColor, Vector4 hoverColor)
@@ -341,11 +371,11 @@ public class EditorUI
             Type = DrawCommandType.Rect,
             Position = pos,
             Size = size,
-            Color = new Vector4(0.1f, 0.1f, 0.1f, 1.0f),
+            Color = EditorTheme.Border0,
             ClipRect = _activeClipRect
         });
 
-        TextInRect(pos.X, pos.Y, size.X, size.Y, text, new Vector4(0.9f, 0.9f, 0.95f, 1.0f), TextAlign.Center);
+        TextInRect(pos.X, pos.Y, size.X, size.Y, text, EditorTheme.InputText, TextAlign.Center);
 
         _cursorPos.Y += height + 5;
 
@@ -386,35 +416,58 @@ public class EditorUI
             value = min + (relativeX / width) * (max - min);
         }
 
-        // Draw slider track
+        float pct = hasRange ? Math.Clamp((value - min) / (max - min), 0f, 1f) : 0f;
+        float r = MathF.Min(EditorTheme.InputRadius, height * 0.45f);
+
+        // Draw recessed rounded slider track
         _drawCommands.Add(new DrawCommand
         {
-            Type = DrawCommandType.RectFilled,
+            Type = SharpCorners ? DrawCommandType.RectFilled : DrawCommandType.RoundedRectFilled,
             Position = pos,
             Size = size,
-            Color = new Vector4(0.032f, 0.035f, 0.040f, 1.0f),
+            Color = EditorTheme.SliderTrack,
+            CornerRadius = r,
             ClipRect = _activeClipRect
         });
 
         // Draw filled portion
-        float fillWidth = hasRange
-            ? Math.Clamp((value - min) / (max - min), 0f, 1f) * width
-            : 0f;
-        if (fillWidth > 2)
+        float fillWidth = pct * width;
+        if (fillWidth > 2f)
         {
             _drawCommands.Add(new DrawCommand
             {
-                Type = DrawCommandType.RectFilled,
+                Type = SharpCorners ? DrawCommandType.RectFilled : DrawCommandType.RoundedRectFilled,
                 Position = pos,
-                Size = new Vector2(fillWidth, height),
-                Color = isActive ? new Vector4(0.28f, 0.64f, 1.00f, 1.0f) : new Vector4(0.18f, 0.56f, 0.95f, 1.0f),
+                Size = new Vector2(MathF.Max(height * 0.5f, fillWidth), height),
+                Color = isActive ? EditorTheme.SliderFillHot : (isHot ? EditorTheme.AccentHover : EditorTheme.SliderFill),
+                CornerRadius = r,
                 ClipRect = _activeClipRect
             });
         }
-        
+
+        // Subtle track border
+        _drawCommands.Add(new DrawCommand
+        {
+            Type = DrawCommandType.Rect,
+            Position = pos,
+            Size = size,
+            Color = isActive || isHot ? EditorTheme.Accent : EditorTheme.Border1,
+            ClipRect = _activeClipRect
+        });
+
+        // Glowing thumb handle
+        if (width >= 24f && height >= 8f)
+        {
+            float thumbX = Math.Clamp(pos.X + fillWidth, pos.X + 4f, pos.X + width - 4f);
+            float thumbY = pos.Y + height * 0.5f;
+            Circle(thumbX, thumbY, MathF.Min(height * 0.42f, 5.5f),
+                isActive ? EditorTheme.TextPrimary : (isHot ? EditorTheme.AccentCyan : EditorTheme.WithAlpha(EditorTheme.TextPrimary, 0.9f)),
+                filled: true);
+        }
+
         // Value text
         string valText = value.ToString("0.00");
-        TextInRect(pos.X, pos.Y, width, height, valText, new Vector4(1f, 1f, 1f, 0.8f), TextAlign.Center);
+        TextInRect(pos.X, pos.Y, width, height, valText, EditorTheme.TextPrimary, TextAlign.Center);
 
         _cursorPos.Y += height + 10;
 
@@ -457,14 +510,16 @@ public class EditorUI
             }
         }
 
-        Vector4 color = isFocused ? new Vector4(0.25f, 0.4f, 0.6f, 1.0f) : new Vector4(0.15f, 0.15f, 0.16f, 1.0f);
+        Vector4 color = isFocused ? EditorTheme.InputFocusBg : (isHot ? EditorTheme.Bg3 : EditorTheme.InputBg);
+        float r = MathF.Min(EditorTheme.InputRadius, height * 0.35f);
 
         _drawCommands.Add(new DrawCommand
         {
-            Type = DrawCommandType.RectFilled,
+            Type = SharpCorners ? DrawCommandType.RectFilled : DrawCommandType.RoundedRectFilled,
             Position = pos,
             Size = size,
             Color = color,
+            CornerRadius = r,
             ClipRect = _activeClipRect
         });
 
@@ -473,9 +528,21 @@ public class EditorUI
             Type = DrawCommandType.Rect,
             Position = pos,
             Size = size,
-            Color = new Vector4(0.3f, 0.3f, 0.35f, 1.0f),
+            Color = isFocused ? EditorTheme.Accent : (isHot ? EditorTheme.Border2 : EditorTheme.InputBorder),
             ClipRect = _activeClipRect
         });
+
+        if (isFocused)
+        {
+            _drawCommands.Add(new DrawCommand
+            {
+                Type = DrawCommandType.RectFilled,
+                Position = new Vector2(pos.X + 2f, pos.Y + size.Y - 2f),
+                Size = new Vector2(MathF.Max(0f, size.X - 4f), 2f),
+                Color = EditorTheme.Accent,
+                ClipRect = _activeClipRect
+            });
+        }
 
         // Calculate text clipping or simple render (we have no clipping, so just draw text)
         string displayText = text;
@@ -485,7 +552,7 @@ public class EditorUI
         }
 
         TextInRect(pos.X + 10, pos.Y, MathF.Max(0f, width - 20f), height, displayText,
-            new Vector4(0.9f, 0.9f, 0.95f, 1.0f), TextAlign.Left);
+            EditorTheme.InputText, TextAlign.Left);
 
         _cursorPos.Y += height + 10;
 
@@ -639,7 +706,7 @@ public class EditorUI
                 Position = pos,
                 Size = size,
                 Color = bgColor,
-                CornerRadius = MathF.Min(8f, height * 0.35f),
+                CornerRadius = MathF.Min(EditorTheme.ButtonRadius, height * 0.35f),
                 ClipRect = _activeClipRect
             });
         }
@@ -657,7 +724,7 @@ public class EditorUI
 
         var edgeColor = isHot || isActive
             ? new Vector4(pressedColor.X, pressedColor.Y, pressedColor.Z, Math.Max(0.65f, pressedColor.W))
-            : new Vector4(0.145f, 0.155f, 0.172f, 1.0f);
+            : EditorTheme.Border1;
 
         _drawCommands.Add(new DrawCommand
         {
@@ -700,16 +767,18 @@ public class EditorUI
         else if (isHot)
             color = hoverColor;
         
-        // Shadow removed to fix rendering bleeding artifact
-        
-        _drawCommands.Add(new DrawCommand
+        if (color.W > 0.001f)
         {
-            Type = DrawCommandType.RectFilled,
-            Position = new Vector2(x, y),
-            Size = new Vector2(width, height),
-            Color = color,
-            ClipRect = _activeClipRect
-        });
+            _drawCommands.Add(new DrawCommand
+            {
+                Type = SharpCorners ? DrawCommandType.RectFilled : DrawCommandType.RoundedRectFilled,
+                Position = new Vector2(x, y),
+                Size = new Vector2(width, height),
+                Color = color,
+                CornerRadius = MathF.Min(EditorTheme.CardRadius, height * 0.25f),
+                ClipRect = _activeClipRect
+            });
+        }
         
         return clicked;
     }
@@ -726,6 +795,24 @@ public class EditorUI
         });
     }
 
+    /// <summary>
+    /// Sliding toggle switch. Returns true when clicked (caller flips the value).
+    /// Track tinted by accent when on; knob slides left/right.
+    /// </summary>
+    public bool ToggleSwitch(float x, float y, float w, float h, bool value, Vector4 accent, uint id)
+    {
+        bool clicked = ButtonEx(x, y, w, h, "",
+            value ? EditorTheme.WithAlpha(accent, 0.38f) : EditorTheme.Bg3,
+            value ? EditorTheme.WithAlpha(accent, 0.55f) : EditorTheme.Bg2,
+            EditorTheme.AccentDim, new Vector4(0, 0, 0, 0),
+            EditorTheme.TextPrimary, id);
+        float r = h * 0.5f - 3f;
+        if (r < 1f) r = 1f;
+        float kx = value ? x + w - r - 3f : x + 3f + r;
+        Circle(kx, y + h * 0.5f, r, value ? accent : EditorTheme.TextDisabled, true);
+        return clicked;
+    }
+
     public void Line(float x1, float y1, float x2, float y2, Vector4 color)
     {
         _drawCommands.Add(new DrawCommand
@@ -736,6 +823,150 @@ public class EditorUI
             Color = color,
             ClipRect = _activeClipRect
         });
+    }
+
+    public void FilledTriangle(Vector2 p0, Vector2 p1, Vector2 p2, Vector4 color)
+    {
+        _drawCommands.Add(new DrawCommand
+        {
+            Type = DrawCommandType.TriangleFilled,
+            Position = p0,
+            P1 = p1,
+            P2 = p2,
+            Color = color,
+            ClipRect = _activeClipRect
+        });
+    }
+
+    private void FilledBar(float x, float y, float w, float h, Vector4 color)
+    {
+        _drawCommands.Add(new DrawCommand
+        {
+            Type = DrawCommandType.RectFilled,
+            Position = new Vector2(x, y),
+            Size = new Vector2(w, h),
+            Color = color,
+            ClipRect = _activeClipRect
+        });
+    }
+
+    /// <summary>
+    /// Vector icon drawn from fill/line primitives (no atlas dependency).
+    /// (x, y) is the top-left of a size×size box; strokes scale with size.
+    /// </summary>
+    public void Icon(UIIcon kind, float x, float y, float size, Vector4 color)
+    {
+        if (kind == UIIcon.None || size <= 0f) return;
+        float pad = size * 0.22f;
+        float x0 = x + pad, x1 = x + size - pad;
+        float y0 = y + pad, y1 = y + size - pad;
+        float cx = x + size * 0.5f, cy = y + size * 0.5f;
+        float bar = Math.Max(1.5f, size * 0.14f);
+        switch (kind)
+        {
+            case UIIcon.Play:
+                FilledTriangle(new Vector2(x0, y0), new Vector2(x0, y1), new Vector2(x1, cy), color);
+                break;
+            case UIIcon.Pause:
+                FilledBar(cx - bar * 1.1f, y0, bar, y1 - y0, color);
+                FilledBar(cx + bar * 0.1f, y0, bar, y1 - y0, color);
+                break;
+            case UIIcon.Stop:
+                FilledBar(x0, y0, x1 - x0, y1 - y0, color);
+                break;
+            case UIIcon.Plus:
+                FilledBar(cx - bar * 0.5f, y0, bar, y1 - y0, color);
+                FilledBar(x0, cy - bar * 0.5f, x1 - x0, bar, color);
+                break;
+            case UIIcon.Minus:
+                FilledBar(x0, cy - bar * 0.5f, x1 - x0, bar, color);
+                break;
+            case UIIcon.Check:
+                Line(x0, cy, cx - bar * 0.2f, y1, color);
+                Line(cx - bar * 0.2f, y1, x1, y0, color);
+                break;
+            case UIIcon.X:
+                Line(x0, y0, x1, y1, color);
+                Line(x0, y1, x1, y0, color);
+                break;
+            case UIIcon.Search:
+                Circle(cx - size * 0.08f, cy - size * 0.08f, size * 0.24f, color, filled: false);
+                Line(cx + size * 0.10f, cy + size * 0.10f, x1, y1, color);
+                break;
+            case UIIcon.Eye:
+                Circle(cx, cy, size * 0.26f, color, filled: false);
+                Circle(cx, cy, size * 0.09f, color, filled: true);
+                break;
+            case UIIcon.ChevronRight:
+                Line(x0 + bar, y0, x1 - bar * 0.4f, cy, color);
+                Line(x1 - bar * 0.4f, cy, x0 + bar, y1, color);
+                break;
+            case UIIcon.ChevronLeft:
+                Line(x1 - bar, y0, x0 + bar * 0.4f, cy, color);
+                Line(x0 + bar * 0.4f, cy, x1 - bar, y1, color);
+                break;
+            case UIIcon.ChevronDown:
+                Line(x0, y0 + bar, cx, y1 - bar * 0.4f, color);
+                Line(cx, y1 - bar * 0.4f, x1, y0 + bar, color);
+                break;
+            case UIIcon.Dot:
+                Circle(cx, cy, size * 0.16f, color, filled: true);
+                break;
+            case UIIcon.Import:
+                FilledBar(cx - bar * 0.5f, y0, bar, (y1 - y0) * 0.62f, color);
+                Line(cx - size * 0.20f, y0 + (y1 - y0) * 0.42f, cx, y1 - bar * 0.2f, color);
+                Line(cx + size * 0.20f, y0 + (y1 - y0) * 0.42f, cx, y1 - bar * 0.2f, color);
+                FilledBar(x0, y1 - bar, x1 - x0, bar, color);
+                break;
+            case UIIcon.Move:
+                // Bold cross-arrows: thick bars + filled heads, readable at 16px.
+                FilledBar(cx - bar * 0.6f, cy - bar * 2.6f, bar * 1.2f, bar * 5.2f, color);
+                FilledBar(cx - bar * 2.6f, cy - bar * 0.6f, bar * 5.2f, bar * 1.2f, color);
+                FilledTriangle(new Vector2(x0, cy), new Vector2(x0 + bar * 1.8f, cy - bar * 1.1f),
+                    new Vector2(x0 + bar * 1.8f, cy + bar * 1.1f), color);
+                FilledTriangle(new Vector2(x1, cy), new Vector2(x1 - bar * 1.8f, cy - bar * 1.1f),
+                    new Vector2(x1 - bar * 1.8f, cy + bar * 1.1f), color);
+                FilledTriangle(new Vector2(cx, y0), new Vector2(cx - bar * 1.1f, y0 + bar * 1.8f),
+                    new Vector2(cx + bar * 1.1f, y0 + bar * 1.8f), color);
+                FilledTriangle(new Vector2(cx, y1), new Vector2(cx - bar * 1.1f, y1 - bar * 1.8f),
+                    new Vector2(cx + bar * 1.1f, y1 - bar * 1.8f), color);
+                break;
+            case UIIcon.Rotate:
+                Circle(cx, cy, size * 0.24f, color, filled: false);
+                FilledTriangle(new Vector2(cx + size * 0.24f, y0),
+                    new Vector2(cx + size * 0.24f, y0 + bar * 2.2f),
+                    new Vector2(cx + size * 0.02f, y0 + bar * 1.1f), color);
+                break;
+            case UIIcon.Scale:
+                Line(x0, y0, x1, y0, color);
+                Line(x0, y1, x1, y1, color);
+                Line(x0, y0, x0, y1, color);
+                Line(x1, y0, x1, y1, color);
+                FilledBar(x1 - bar * 1.6f, y1 - bar * 1.6f, bar * 1.6f, bar * 1.6f, color);
+                break;
+            case UIIcon.Save:
+                // Chunky down-arrow into a tray: unmistakable at 16px.
+                FilledTriangle(new Vector2(cx, y0 + size * 0.44f),
+                    new Vector2(cx - size * 0.20f, y0 + size * 0.20f),
+                    new Vector2(cx + size * 0.20f, y0 + size * 0.20f), color);
+                FilledBar(cx - bar * 0.7f, y0, bar * 1.4f, size * 0.30f, color);
+                FilledBar(x0, y1 - bar * 1.6f, x1 - x0, bar * 1.6f, color);
+                Line(x0, y0 + size * 0.52f, x0, y1 - bar * 1.6f, color);
+                Line(x1, y0 + size * 0.52f, x1, y1 - bar * 1.6f, color);
+                break;
+            case UIIcon.Folder:
+                FilledBar(x0, y0 + bar * 0.5f, (x1 - x0) * 0.42f, bar * 1.2f, color);
+                FilledBar(x0, y0 + bar * 1.5f, x1 - x0, (y1 - y0) - bar * 1.5f, color);
+                break;
+            case UIIcon.Settings:
+                Circle(cx, cy, size * 0.24f, color, filled: false);
+                Circle(cx, cy, size * 0.10f, color, filled: true);
+                FilledBar(cx - bar * 0.5f, y0, bar, bar * 1.3f, color);
+                FilledBar(cx - bar * 0.5f, y1 - bar * 1.3f, bar, bar * 1.3f, color);
+                FilledBar(x0, cy - bar * 0.5f, bar * 1.3f, bar, color);
+                FilledBar(x1 - bar * 1.3f, cy - bar * 0.5f, bar * 1.3f, bar, color);
+                break;
+        }
     }
 
     private bool IsMouseOver(Vector2 pos, Vector2 size)

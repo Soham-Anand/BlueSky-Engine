@@ -1,6 +1,6 @@
 using System;
 using System.Numerics;
-using BlueSky.Rendering.Strata;
+using BlueSky.BSR.Strata;
 
 namespace BlueSky.Tests;
 

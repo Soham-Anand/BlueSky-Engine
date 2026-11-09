@@ -1,7 +1,7 @@
-using BlueSky.Platform;
+using BlueSky.Aegis;
 using System.Runtime.InteropServices;
 
-namespace BlueSky.Rendering.RHI.DirectX11;
+namespace BlueSky.BSR.RHI.DirectX11;
 
 /// <summary>
 /// Direct3D 11 raster backend. The native feature level is retained for
@@ -11,6 +11,7 @@ internal class D3D11Device : IRHIDevice
 {
     private IntPtr _device;
     private IntPtr _deviceContext;
+    private IntPtr _linearClampSampler;
     private D3D11FeatureLevel _featureLevel;
     private RHICapabilities _capabilities;
     private bool _disposed;
@@ -33,6 +34,9 @@ internal class D3D11Device : IRHIDevice
         }
 
         InitializeDevice();
+        _linearClampSampler = CreateSamplerState(
+            D3D11Interop.D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+            D3D11Interop.D3D11_TEXTURE_ADDRESS_CLAMP);
         PrintCapabilityReport();
     }
 
@@ -179,6 +183,16 @@ internal class D3D11Device : IRHIDevice
         return new D3D11Texture(_device, desc);
     }
 
+    public IRHISampler CreateSampler(SamplerDesc desc)
+    {
+        return new D3D11Sampler(this, desc);
+    }
+
+    public void GenerateMipmaps(IRHITexture texture)
+    {
+        throw new NotSupportedException("[DX11] GenerateMipmaps is not implemented yet — create textures with MipLevels = 1.");
+    }
+
     public IRHIPipeline CreateGraphicsPipeline(GraphicsPipelineDesc desc)
     {
         Console.WriteLine($"[DX11:DEV] CreateGraphicsPipeline '{desc.DebugName}' VS={desc.VertexShader.Bytecode?.Length ?? 0}b PS={desc.FragmentShader.Bytecode?.Length ?? 0}b attrs={desc.VertexLayout.Attributes?.Length ?? 0} bindings={desc.VertexLayout.Bindings?.Length ?? 0} topo={desc.Topology}");
@@ -236,7 +250,7 @@ internal class D3D11Device : IRHIDevice
 
     public IRHICommandBuffer CreateCommandBuffer()
     {
-        return new D3D11CommandBuffer(_device, _deviceContext);
+        return new D3D11CommandBuffer(_device, _deviceContext, _linearClampSampler);
     }
 
     public void Submit(IRHICommandBuffer commandBuffer)
@@ -443,6 +457,18 @@ internal class D3D11Device : IRHIDevice
             {
                 var attr = layout.Attributes[i];
                 string name = i < semanticNames.Length ? semanticNames[i] : $"ATTR{i}";
+                bool perInstance = false;
+                if (layout.Bindings != null)
+                {
+                    for (int bindingIndex = 0; bindingIndex < layout.Bindings.Length; bindingIndex++)
+                    {
+                        if (layout.Bindings[bindingIndex].Binding == attr.Binding)
+                        {
+                            perInstance = layout.Bindings[bindingIndex].PerInstance;
+                            break;
+                        }
+                    }
+                }
                 IntPtr pName = Marshal.StringToHGlobalAnsi(name);
                 allocatedStrings.Add(pName);
 
@@ -453,8 +479,8 @@ internal class D3D11Device : IRHIDevice
                     Format = D3D11Interop.ToDXGIFormat(attr.Format),
                     InputSlot = attr.Binding,
                     AlignedByteOffset = attr.Offset,
-                    InputSlotClass = 0, // PER_VERTEX_DATA
-                    InstanceDataStepRate = 0
+                    InputSlotClass = perInstance ? 1u : 0u, // PER_INSTANCE_DATA / PER_VERTEX_DATA
+                    InstanceDataStepRate = perInstance ? 1u : 0u
                 };
             }
 
@@ -592,6 +618,13 @@ internal class D3D11Device : IRHIDevice
     /// <summary>Creates a sampler state for texture filtering.</summary>
     internal IntPtr CreateSamplerState(uint filter, uint addressMode, uint maxAnisotropy = 1)
     {
+        return CreateSamplerStateWithComparison(filter, addressMode,
+            D3D11Interop.D3D11_COMPARISON_NEVER, maxAnisotropy);
+    }
+
+    /// <summary>Creates a sampler state with an explicit comparison func.</summary>
+    internal IntPtr CreateSamplerStateWithComparison(uint filter, uint addressMode, uint comparisonFunc, uint maxAnisotropy = 1)
+    {
         if (_device == IntPtr.Zero) return IntPtr.Zero;
 
         var desc = new D3D11Interop.D3D11_SAMPLER_DESC
@@ -602,7 +635,7 @@ internal class D3D11Device : IRHIDevice
             AddressW = addressMode,
             MipLODBias = 0f,
             MaxAnisotropy = maxAnisotropy,
-            ComparisonFunc = D3D11Interop.D3D11_COMPARISON_NEVER,
+            ComparisonFunc = comparisonFunc,
             BorderColor0 = 0, BorderColor1 = 0, BorderColor2 = 0, BorderColor3 = 0,
             MinLOD = 0,
             MaxLOD = float.MaxValue
@@ -627,6 +660,12 @@ internal class D3D11Device : IRHIDevice
     public void Dispose()
     {
         if (_disposed) return;
+
+        if (_linearClampSampler != IntPtr.Zero)
+        {
+            Marshal.Release(_linearClampSampler);
+            _linearClampSampler = IntPtr.Zero;
+        }
 
         if (_deviceContext != IntPtr.Zero)
         {

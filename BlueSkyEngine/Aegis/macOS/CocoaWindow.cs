@@ -1,0 +1,899 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Numerics;
+using static BlueSky.Aegis.macOS.CocoaInterop;
+
+namespace BlueSky.Aegis.macOS;
+
+/// <summary>
+/// macOS window implementation using Cocoa (NSWindow/NSView).
+/// </summary>
+public class CocoaWindow : IWindow
+{
+    // NSApp has one event queue for every window, so exactly one window pumps
+    // it and routes each event to the window it belongs to.
+    private static readonly List<CocoaWindow> s_windows = new();
+    private static bool s_pumping;
+
+    private IntPtr _nsWindow;
+    private IntPtr _nsView;
+    private bool _disposed;
+    private bool _isClosing;
+    private readonly Stopwatch _stopwatch;
+    private CocoaInput? _registeredInput;
+    
+    private string _title;
+    private Vector2 _size;
+    private Vector2 _position;
+    private bool _isVisible;
+    private bool _isFocused = false;
+    private bool _cursorCaptured;
+    private bool _fullscreenRequested;
+    private bool _fullscreenApplied;
+    
+    public CocoaWindow(WindowOptions options)
+    {
+        _stopwatch = Stopwatch.StartNew();
+        _title = options.Title;
+        _size = new Vector2(options.Width, options.Height);
+        _position = new Vector2(options.X, options.Y);
+        _fullscreenRequested = options.Fullscreen;
+
+        // Set activation policy so the app can become active
+        var nsApp = GetSharedApplication();
+        var setActivationPolicySel = GetSelector("setActivationPolicy:");
+        SetActivationPolicy(nsApp, setActivationPolicySel, 0); // NSApplicationActivationPolicyRegular = 0
+
+        TrySetApplicationIcon(nsApp);
+
+        // Create NSWindow
+        _nsWindow = CreateNSWindow(options);
+
+        // Create NSView for rendering
+        _nsView = CreateContentView();
+
+        s_windows.Add(this);
+
+        // DON'T create CAMetalLayer - let bgfx create it!
+        // bgfx will create and configure the layer itself when we pass the NSView
+
+        if (options.StartVisible)
+            Show();
+    }
+    
+    [System.Runtime.InteropServices.DllImport("/usr/lib/libobjc.A.dylib", EntryPoint = "objc_msgSend")]
+    private static extern void SetActivationPolicy(IntPtr receiver, IntPtr selector, long policy);
+    
+    public string Title
+    {
+        get => _title;
+        set
+        {
+            _title = value;
+            if (_nsWindow != IntPtr.Zero)
+            {
+                var nsString = CreateNSString(value);
+                var setTitleSel = GetSelector("setTitle:");
+                objc_msgSend_void_ptr(_nsWindow, setTitleSel, nsString);
+            }
+        }
+    }
+    
+    public Vector2 Size
+    {
+        get => _size;
+        set
+        {
+            _size = value;
+            if (_nsWindow != IntPtr.Zero)
+            {
+                var frameSel = GetSelector("frame");
+                var frame = objc_msgSend_CGRect(_nsWindow, frameSel);
+                frame.Size = new CGSize(value.X, value.Y);
+                
+                var setFrameSel = GetSelector("setFrame:display:");
+                objc_msgSend_void_rect(_nsWindow, setFrameSel, frame);
+            }
+        }
+    }
+    
+    public Vector2 Position
+    {
+        get => _position;
+        set
+        {
+            _position = value;
+            if (_nsWindow != IntPtr.Zero)
+            {
+                var frameSel = GetSelector("frame");
+                var frame = objc_msgSend_CGRect(_nsWindow, frameSel);
+                frame.Origin = new CGPoint(value.X, value.Y);
+                
+                var setFrameSel = GetSelector("setFrameOrigin:");
+                objc_msgSend_void_rect(_nsWindow, setFrameSel, frame);
+            }
+        }
+    }
+    
+    public Vector2 FramebufferSize
+    {
+        get
+        {
+            if (_nsWindow != IntPtr.Zero)
+            {
+                var backingScaleFactorSel = GetSelector("backingScaleFactor");
+                var scale = objc_msgSend_double(_nsWindow, backingScaleFactorSel);
+                return new Vector2(_size.X * (float)scale, _size.Y * (float)scale);
+            }
+            return _size;
+        }
+    }
+    
+    /// <summary>
+    /// Registers a CocoaInput so that the event loop can forward mouse/keyboard events.
+    /// </summary>
+    internal void RegisterInput(CocoaInput input) => _registeredInput = input;
+    
+    public bool IsVisible => _isVisible;
+    
+    public bool IsFocused => _isFocused;
+    
+    public bool IsClosing => _isClosing;
+    
+    public double Time => _stopwatch.Elapsed.TotalSeconds;
+    
+    public event Action<Vector2>? Resize;
+    public event Action<Vector2>? FramebufferResize;
+    // IWindow contract: subscribed externally (EditorApp), raised when the backend wires them.
+#pragma warning disable CS0067
+    public event Action? FocusGained;
+    public event Action? FocusLost;
+#pragma warning restore CS0067
+    public event Action? Closing;
+    public event Action<double>? Update;
+    public event Action<double>? Render;
+#pragma warning disable CS0067 // subscribed in EditorApp; invoked by the ObjC backend
+    public event Action<string[]>? FilesDropped;
+#pragma warning restore CS0067
+
+    public string[]? ShowOpenFileDialog()
+    {
+        try
+        {
+            // Create NSOpenPanel
+            var openPanelClass = GetClass("NSOpenPanel");
+            var openPanel = objc_msgSend(openPanelClass, GetSelector("openPanel"));
+
+            if (openPanel == IntPtr.Zero)
+            {
+                Console.WriteLine("[CocoaWindow] Failed to create NSOpenPanel");
+                return null;
+            }
+
+            // Configure panel
+            var setCanChooseFilesSel = GetSelector("setCanChooseFiles:");
+            objc_msgSend_void_bool(openPanel, setCanChooseFilesSel, true);
+
+            var setCanChooseDirectoriesSel = GetSelector("setCanChooseDirectories:");
+            objc_msgSend_void_bool(openPanel, setCanChooseDirectoriesSel, false);
+
+            var setAllowsMultipleSelectionSel = GetSelector("setAllowsMultipleSelection:");
+            objc_msgSend_void_bool(openPanel, setAllowsMultipleSelectionSel, true);
+
+            // Run modal
+            var runModalSel = GetSelector("runModal");
+            var result = objc_msgSend_int(openPanel, runModalSel);
+
+            if (result == 1) // NSModalResponseOK
+            {
+                var urlsSel = GetSelector("URLs");
+                var urls = objc_msgSend(openPanel, urlsSel);
+
+                if (urls != IntPtr.Zero)
+                {
+                    var countSel = GetSelector("count");
+                    var count = objc_msgSend_int(urls, countSel);
+
+                    var filePaths = new List<string>();
+                    for (int i = 0; i < count; i++)
+                    {
+                        var objectAtIndexSel = GetSelector("objectAtIndex:");
+                        var urlObj = objc_msgSend_ptr_int(urls, objectAtIndexSel, i);
+                        var pathSel = GetSelector("path");
+                        var pathPtr = objc_msgSend_ptr(urlObj, pathSel);
+                        var path = NSStringToCSharpString(pathPtr);
+                        filePaths.Add(path);
+                    }
+
+                    return filePaths.ToArray();
+                }
+            }
+
+            return null;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[CocoaWindow] Error showing file dialog: {ex.Message}");
+            return null;
+        }
+    }
+
+    private static string NSStringToCSharpString(IntPtr nsString)
+    {
+        if (nsString == IntPtr.Zero) return "";
+
+        var utf8Sel = GetSelector("UTF8String");
+        var utf8Ptr = objc_msgSend(nsString, utf8Sel);
+        return Marshal.PtrToStringUTF8(utf8Ptr) ?? "";
+    }
+
+    [DllImport("/usr/lib/libobjc.A.dylib", EntryPoint = "objc_msgSend")]
+    private static extern void objc_msgSend_void_bool(IntPtr receiver, IntPtr selector, bool value);
+
+    [DllImport("/usr/lib/libobjc.A.dylib", EntryPoint = "objc_msgSend")]
+    private static extern int objc_msgSend_int(IntPtr receiver, IntPtr selector);
+
+    [DllImport("/usr/lib/libobjc.A.dylib", EntryPoint = "objc_msgSend")]
+    private static extern int objc_msgSend_int(IntPtr receiver, IntPtr selector, int index);
+
+    [DllImport("/usr/lib/libobjc.A.dylib", EntryPoint = "objc_msgSend")]
+    private static extern IntPtr objc_msgSend_ptr(IntPtr receiver, IntPtr selector);
+
+    [DllImport("/usr/lib/libobjc.A.dylib", EntryPoint = "objc_msgSend")]
+    private static extern IntPtr objc_msgSend_ptr_int(IntPtr receiver, IntPtr selector, int arg);
+
+    [DllImport("/usr/lib/libobjc.A.dylib", EntryPoint = "objc_msgSend")]
+    private static extern IntPtr objc_msgSend_ptr_ptr(IntPtr receiver, IntPtr selector, IntPtr arg);
+
+    [DllImport("/usr/lib/libobjc.A.dylib", EntryPoint = "objc_msgSend")]
+    private static extern IntPtr objc_msgSend_ptr_ptr_ulong(IntPtr receiver, IntPtr selector, IntPtr bytes, ulong length);
+
+    private static void TrySetApplicationIcon(IntPtr nsApp)
+    {
+        try
+        {
+            string[] candidates = new[]
+            {
+                System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "AppIcon.png"),
+                System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Assets", "AppIcon.png"),
+                System.IO.Path.Combine(System.IO.Directory.GetCurrentDirectory(), "Assets", "AppIcon.png"),
+                System.IO.Path.Combine(System.IO.Directory.GetCurrentDirectory(), "Assets", "BlueSkyEngineIcon.png"),
+                System.IO.Path.Combine(System.IO.Directory.GetCurrentDirectory(), "BlueSkyEngineIcon.png"),
+                System.IO.Path.Combine(System.IO.Directory.GetCurrentDirectory(), "AppIcon.png")
+            };
+            string? iconPath = System.Array.Find(candidates, System.IO.File.Exists);
+            if (iconPath != null)
+            {
+                byte[] bytes = System.IO.File.ReadAllBytes(iconPath);
+                var nsDataClass = GetClass("NSData");
+                var allocSel = GetSelector("alloc");
+                var initWithBytesSel = GetSelector("initWithBytes:length:");
+                unsafe
+                {
+                    fixed (byte* p = bytes)
+                    {
+                        var nsData = objc_msgSend(nsDataClass, allocSel);
+                        nsData = objc_msgSend_ptr_ptr_ulong(nsData, initWithBytesSel, (IntPtr)p, (ulong)bytes.Length);
+                        if (nsData != IntPtr.Zero)
+                        {
+                            var nsImageClass = GetClass("NSImage");
+                            var nsImage = objc_msgSend(nsImageClass, allocSel);
+                            var initWithDataSel = GetSelector("initWithData:");
+                            nsImage = objc_msgSend_ret_ptr(nsImage, initWithDataSel, nsData);
+                            if (nsImage != IntPtr.Zero)
+                            {
+                                var setIconSel = GetSelector("setApplicationIconImage:");
+                                objc_msgSend_void_ptr(nsApp, setIconSel, nsImage);
+                                Release(nsImage);
+                                Console.WriteLine($"[CocoaWindow] Set macOS application dock icon from {System.IO.Path.GetFileName(iconPath)}");
+                            }
+                            Release(nsData);
+                        }
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[CocoaWindow] Note: Could not set application dock icon: {ex.Message}");
+        }
+    }
+    
+    public void Show()
+    {
+        if (_nsWindow != IntPtr.Zero)
+        {
+            // Activate the application
+            var nsApp = GetSharedApplication();
+            var activateIgnoringOtherAppsSel = GetSelector("activateIgnoringOtherApps:");
+            SetBool(nsApp, activateIgnoringOtherAppsSel, true);
+
+            // Make window key and bring to front
+            var makeKeyAndOrderFrontSel = GetSelector("makeKeyAndOrderFront:");
+            objc_msgSend_void_ptr(_nsWindow, makeKeyAndOrderFrontSel, IntPtr.Zero);
+
+            // Enable drag and drop on existing content view
+            try
+            {
+                var contentViewSel = GetSelector("contentView");
+                var contentView = objc_msgSend(_nsWindow, contentViewSel);
+                
+                // Register for file URLs
+                var fileType = CreateNSString("public.file-url");
+                var registerForDraggedTypesSel = GetSelector("registerForDraggedTypes:");
+                var arrayWithObjectSel = GetSelector("arrayWithObject:");
+                var nsArray = objc_msgSend_ptr_ptr(GetClass("NSArray"), arrayWithObjectSel, fileType);
+                objc_msgSend_void_ptr(contentView, registerForDraggedTypesSel, nsArray);
+                
+                Console.WriteLine("[CocoaWindow] Drag and drop enabled on content view");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[CocoaWindow] Failed to enable drag and drop: {ex.Message}");
+            }
+
+            if (_fullscreenRequested && !_fullscreenApplied)
+            {
+                objc_msgSend_void_ptr(_nsWindow, GetSelector("toggleFullScreen:"), IntPtr.Zero);
+                _fullscreenApplied = true;
+            }
+
+            _isVisible = true;
+            _isClosing = false;
+
+            Console.WriteLine("[CocoaWindow] Window shown and activated");
+        }
+    }
+    
+    [System.Runtime.InteropServices.DllImport("/usr/lib/libobjc.A.dylib", EntryPoint = "objc_msgSend")]
+    private static extern void SetBool(IntPtr receiver, IntPtr selector, bool value);
+
+    public void Hide()
+    {
+        if (_nsWindow != IntPtr.Zero)
+        {
+            var orderOutSel = GetSelector("orderOut:");
+            objc_msgSend_void_ptr(_nsWindow, orderOutSel, IntPtr.Zero);
+            _isVisible = false;
+        }
+    }
+    
+    public void Close()
+    {
+        _isClosing = true;
+        _isVisible = false;
+        Closing?.Invoke();
+    }
+    
+    public void ProcessEvents()
+    {
+        if (s_pumping)
+            return;
+
+        s_pumping = true;
+        try
+        {
+            var windows = s_windows.ToArray();
+            foreach (var window in windows)
+                window.PollResize();
+
+            // A window closed with the red traffic light becomes invisible;
+            // notify its owner once. Hidden windows are not closed.
+            var isVisibleSel = GetSelector("isVisible");
+            foreach (var window in windows)
+            {
+                if (window._isVisible && window._nsWindow != IntPtr.Zero &&
+                    !objc_msgSend_bool(window._nsWindow, isVisibleSel))
+                {
+                    window.Close();
+                }
+            }
+
+            PumpNativeEvents(windows);
+
+            // Trigger update and render every frame for the window that owns
+            // the main loop. Additional windows render themselves.
+            Update?.Invoke(1.0 / 60.0);
+            Render?.Invoke(1.0 / 60.0);
+        }
+        finally
+        {
+            s_pumping = false;
+        }
+    }
+
+    private void PollResize()
+    {
+        if (_nsWindow == IntPtr.Zero)
+            return;
+
+        var contentViewSelLocal = GetSelector("contentView");
+        var contentViewLocal = objc_msgSend(_nsWindow, contentViewSelLocal);
+        var boundsSelLocal = GetSelector("bounds");
+        var viewBounds = objc_msgSend_CGRect(contentViewLocal, boundsSelLocal);
+
+        var newSize = new Vector2((float)viewBounds.Size.Width, (float)viewBounds.Size.Height);
+        if (Math.Abs(_size.X - newSize.X) <= 0.1f && Math.Abs(_size.Y - newSize.Y) <= 0.1f)
+            return;
+
+        if (newSize.X <= 0 || newSize.Y <= 0)
+            return;
+
+        _size = newSize;
+
+        var backingScaleFactorSel = GetSelector("backingScaleFactor");
+        var scale = objc_msgSend_double(_nsWindow, backingScaleFactorSel);
+        var fbSize = new Vector2((float)(viewBounds.Size.Width * scale), (float)(viewBounds.Size.Height * scale));
+
+        Resize?.Invoke(_size);
+        FramebufferResize?.Invoke(fbSize);
+    }
+
+    private static CocoaWindow? FindByNativeWindow(IntPtr nsWindow, CocoaWindow[] windows)
+    {
+        if (nsWindow == IntPtr.Zero)
+            return null;
+
+        foreach (var window in windows)
+        {
+            if (window._nsWindow == nsWindow)
+                return window;
+        }
+
+        return null;
+    }
+
+    private static void PumpNativeEvents(CocoaWindow[] windows)
+    {
+        if (windows.Length == 0)
+            return;
+
+        var nsApp = windows[0].GetSharedApplication();
+        var untilDateSel = GetSelector("distantPast");
+        var distantPast = objc_msgSend(GetClass("NSDate"), untilDateSel);
+
+        var nextEventSel = GetSelector("nextEventMatchingMask:untilDate:inMode:dequeue:");
+        var defaultRunLoopMode = windows[0].GetNSDefaultRunLoopMode();
+
+        var typeSel           = GetSelector("type");
+        var windowSel         = GetSelector("window");
+        var keyWindowSel      = GetSelector("keyWindow");
+        var locationSel       = GetSelector("locationInWindow");
+        var sendEventSel      = GetSelector("sendEvent:");
+        var updateWindowsSel  = GetSelector("updateWindows");
+        var modifierFlagsSel  = GetSelector("modifierFlags");
+        var charactersSel     = GetSelector("characters");
+        var utf8Sel           = GetSelector("UTF8String");
+        var keyCodeSel        = GetSelector("keyCode");
+
+        while (true)
+        {
+            var evt = NextEventMatchingMask(nsApp, nextEventSel, ulong.MaxValue, distantPast, defaultRunLoopMode, true);
+            if (evt == IntPtr.Zero)
+                break;
+
+            var eventType = objc_msgSend_ulong(evt, typeSel);
+            bool consumedKeyEvent = false;
+
+            // Keyboard goes to the key window; mouse goes to the window under
+            // the pointer (NSEvent.window). Everything else is unhandled here.
+            CocoaWindow? target = null;
+            if (eventType == 10 || eventType == 11)
+            {
+                var keyWindow = objc_msgSend(nsApp, keyWindowSel);
+                target = FindByNativeWindow(keyWindow, windows);
+            }
+            else
+            {
+                var eventWindow = objc_msgSend(evt, windowSel);
+                target = FindByNativeWindow(eventWindow, windows);
+            }
+
+            // ── Keyboard ──────────────────────────────────────────────────
+            if (eventType == 10 || eventType == 11)
+            {
+                var modifiers = objc_msgSend_ulong(evt, modifierFlagsSel);
+                var characters = objc_msgSend(evt, charactersSel);
+                ushort keyCode = CocoaInterop.objc_msgSend_ushort(evt, keyCodeSel);
+
+                if (characters != IntPtr.Zero)
+                {
+                    var utf8Ptr = objc_msgSend(characters, utf8Sel);
+                    var keyString = Marshal.PtrToStringUTF8(utf8Ptr);
+
+                    if ((modifiers & 1048576) != 0 && keyString == "q")
+                    {
+                        if (windows.Length > 0)
+                            windows[0].Close();
+                        break;
+                    }
+                }
+
+                var modKeys = Input.ModifierKeys.None;
+                if ((modifiers & 131072) != 0) modKeys |= Input.ModifierKeys.Shift;     // NSShiftKeyMask
+                if ((modifiers & 262144) != 0) modKeys |= Input.ModifierKeys.Control;   // NSControlKeyMask
+                if ((modifiers & 524288) != 0) modKeys |= Input.ModifierKeys.Alt;       // NSAlternateKeyMask
+                if ((modifiers & 1048576) != 0) modKeys |= Input.ModifierKeys.Super;    // NSCommandKeyMask
+
+                if (target?._registeredInput != null)
+                {
+                    var input = target._registeredInput;
+                    var key = target.MapMacKeyCode(keyCode);
+                    if (key != Input.KeyCode.Unknown)
+                    {
+                        if (eventType == 10)
+                            input.OnKeyDown(key, modKeys);
+                        else
+                            input.OnKeyUp(key, modKeys);
+                        consumedKeyEvent = true;
+                    }
+
+                    // keycode 51 is Backspace on Mac (auto-release for text input)
+                    if (keyCode == 51 && eventType == 10)
+                    {
+                        input.OnKeyDown(Input.KeyCode.Backspace, modKeys);
+                        input.OnKeyUp(Input.KeyCode.Backspace, modKeys);
+                        consumedKeyEvent = true;
+                    }
+
+                    if (eventType == 10 && characters != IntPtr.Zero)
+                    {
+                        var utf8Ptr = objc_msgSend(characters, utf8Sel);
+                        var keyString = Marshal.PtrToStringUTF8(utf8Ptr);
+                        if (!string.IsNullOrEmpty(keyString))
+                        {
+                            foreach (char c in keyString)
+                            {
+                                if (!char.IsControl(c) || c == ' ')
+                                    input.OnCharInput(c);
+                            }
+                            consumedKeyEvent = true;
+                        }
+                    }
+                }
+            }
+
+            // ── Mouse ─────────────────────────────────────────────────────
+            if (target?._registeredInput != null)
+            {
+                var input = target._registeredInput;
+                var loc = objc_msgSend_CGPoint(evt, locationSel);
+
+                var deltaXSel = GetSelector("deltaX");
+                var deltaYSel = GetSelector("deltaY");
+                float dx = (float)objc_msgSend_double(evt, deltaXSel);
+                float dy = (float)objc_msgSend_double(evt, deltaYSel);
+                var delta = new Vector2(dx, dy);
+
+                var contentHeight = (double)target._size.Y;
+                var mousePos = new Vector2((float)loc.X, (float)(contentHeight - loc.Y));
+
+                switch (eventType)
+                {
+                    case 1:
+                        if (!target._cursorCaptured) input.OnMouseMove(mousePos, delta);
+                        input.OnMouseDown(Input.MouseButton.Left);
+                        break;
+                    case 2:
+                        if (!target._cursorCaptured) input.OnMouseMove(mousePos, delta);
+                        input.OnMouseUp(Input.MouseButton.Left);
+                        break;
+                    case 3:
+                        if (!target._cursorCaptured) input.OnMouseMove(mousePos, delta);
+                        input.OnMouseDown(Input.MouseButton.Right);
+                        break;
+                    case 4:
+                        if (!target._cursorCaptured) input.OnMouseMove(mousePos, delta);
+                        input.OnMouseUp(Input.MouseButton.Right);
+                        break;
+                    case 5:
+                    case 6:
+                    case 7:
+                    case 27:
+                        if (target._cursorCaptured)
+                            input.OnMouseDelta(delta);
+                        else
+                            input.OnMouseMove(mousePos, delta);
+                        break;
+                }
+            }
+
+            if (!consumedKeyEvent)
+                objc_msgSend_void_ptr(nsApp, sendEventSel, evt);
+
+            objc_msgSend_void(nsApp, updateWindowsSel);
+        }
+    }
+    
+    [System.Runtime.InteropServices.DllImport("/usr/lib/libobjc.A.dylib", EntryPoint = "objc_msgSend")]
+    private static extern IntPtr NextEventMatchingMask(IntPtr receiver, IntPtr selector, ulong mask, IntPtr date, IntPtr mode, bool dequeue);
+    
+    [System.Runtime.InteropServices.DllImport("/usr/lib/libobjc.A.dylib", EntryPoint = "objc_msgSend")]
+    private static extern CGPoint objc_msgSend_CGPoint(IntPtr receiver, IntPtr selector);
+    
+    public IntPtr GetNativeHandle() => _nsWindow;  // Return NSWindow for bgfx (not NSView!)
+
+    // Map macOS keycodes to our KeyCode enum
+    private Input.KeyCode MapMacKeyCode(ushort keyCode)
+    {
+        // macOS keycodes: https://developer.apple.com/library/archive/documentation/mac/pdf/MacintoshToolboxEssentials.pdf (page 164)
+        switch (keyCode)
+        {
+            case 0: return Input.KeyCode.A;
+            case 1: return Input.KeyCode.S;
+            case 2: return Input.KeyCode.D;
+            case 3: return Input.KeyCode.F;
+            case 11: return Input.KeyCode.B;      // B key (benchmark hotkey with Cmd)
+            case 6: return Input.KeyCode.Z;       // Z key for undo
+            case 12: return Input.KeyCode.Q;
+            case 13: return Input.KeyCode.W;
+            case 14: return Input.KeyCode.E;
+            case 15: return Input.KeyCode.R;
+            case 35: return Input.KeyCode.P;      // P key for command palette
+            case 34: return Input.KeyCode.I;      // I key for import
+            case 36: return Input.KeyCode.Enter;  // Enter/Return
+            case 49: return Input.KeyCode.Space;
+            case 53: return Input.KeyCode.Escape; // Escape
+            case 56: return Input.KeyCode.LeftShift;
+            case 59: return Input.KeyCode.LeftControl;
+            // Function keys (macOS virtual keycodes; reached via Fn on MacBooks)
+            case 122: return Input.KeyCode.F1;
+            case 120: return Input.KeyCode.F2;
+            case 99: return Input.KeyCode.F3;
+            case 118: return Input.KeyCode.F4;
+            case 96: return Input.KeyCode.F5;
+            case 97: return Input.KeyCode.F6;
+            case 98: return Input.KeyCode.F7;
+            case 100: return Input.KeyCode.F8;
+            case 101: return Input.KeyCode.F9;
+            case 109: return Input.KeyCode.F10;
+            case 103: return Input.KeyCode.F11;
+            case 111: return Input.KeyCode.F12;
+            case 123: return Input.KeyCode.Left;  // Left arrow
+            case 124: return Input.KeyCode.Right; // Right arrow
+            case 125: return Input.KeyCode.Down;  // Down arrow
+            case 126: return Input.KeyCode.Up;    // Up arrow
+            default: return Input.KeyCode.Unknown;
+        }
+    }
+
+    public void SetCursorVisible(bool visible)
+    {
+        // Use NSCursor hide/unhide for macOS
+        var nscursorClass = GetClass("NSCursor");
+        if (visible)
+        {
+            var unhideSel = GetSelector("unhide");
+            objc_msgSend_void(nscursorClass, unhideSel);
+        }
+        else
+        {
+            var hideSel = GetSelector("hide");
+            objc_msgSend_void(nscursorClass, hideSel);
+        }
+    }
+
+    [DllImport("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")]
+    private static extern int CGAssociateMouseAndMouseCursorPosition(int connected);
+
+    public void SetCursorCaptured(bool captured)
+    {
+        _cursorCaptured = captured;
+        CGAssociateMouseAndMouseCursorPosition(captured ? 0 : 1);
+    }
+
+    private IntPtr CreateNSWindow(WindowOptions options)
+    {
+        uint styleMask = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable;
+        if (options.Resizable)
+            styleMask |= NSWindowStyleMaskResizable;
+        
+        var rect = new CGRect(0, 0, options.Width, options.Height);
+        
+        var windowClass = GetClass("NSWindow");
+        var allocSel = GetSelector("alloc");
+        var window = objc_msgSend(windowClass, allocSel);
+        
+        var initSel = GetSelector("initWithContentRect:styleMask:backing:defer:");
+        window = objc_msgSend_ptr_rect_uint_uint_bool(
+            window, initSel, rect, styleMask, NSBackingStoreBuffered, false);
+        
+        if (window == IntPtr.Zero)
+            throw new Exception("Failed to create NSWindow");
+
+        // This class frees the window in Dispose(). Turn off AppKit's release-on-close so the window is not freed twice.
+        objc_msgSend_void_bool(window, GetSelector("setReleasedWhenClosed:"), false);
+        
+        // Set title
+        var nsString = CreateNSString(options.Title);
+        var setTitleSel = GetSelector("setTitle:");
+        objc_msgSend_void_ptr(window, setTitleSel, nsString);
+        
+        // Make window opaque (not transparent!)
+        var setOpaquesel = GetSelector("setOpaque:");
+        objc_msgSend_void_bool(window, setOpaquesel, true);
+        
+        // Note: Don't set background color - let the CAMetalLayer show through
+        
+        // Center the window if requested; otherwise honor its explicit position.
+        if (options.X == -1 || options.Y == -1)
+        {
+            var centerSel = GetSelector("center");
+            objc_msgSend_void(window, centerSel);
+        }
+        else
+        {
+            var frameSel = GetSelector("frame");
+            var frame = objc_msgSend_CGRect(window, frameSel);
+            frame.Origin = new CGPoint(options.X, options.Y);
+            objc_msgSend_void_rect(window, GetSelector("setFrameOrigin:"), frame);
+        }
+
+        var positionedFrame = objc_msgSend_CGRect(window, GetSelector("frame"));
+        _position = new Vector2((float)positionedFrame.Origin.X, (float)positionedFrame.Origin.Y);
+        
+        // NSWindow is retained by default; we need to release when closing later
+        
+        // ** CRITICAL FIX **
+        // By default, NSWindow ignores mouse movement unless a button is held down! 
+        // We MUST explicitly enable MouseMoved events to allow UI hover states and normal hit-testing!
+        var acceptsMouseSel = GetSelector("setAcceptsMouseMovedEvents:");
+        objc_msgSend_void_bool(window, acceptsMouseSel, true);
+        
+        Console.WriteLine("[CocoaWindow] NSWindow created with title bar and opaque background");
+        
+        return window;
+    }
+    
+    private IntPtr CreateContentView()
+    {
+        // Create NSView
+        var nsViewClass = GetClass("NSView");
+        var allocSel = GetSelector("alloc");
+        var initSel = GetSelector("init");
+        
+        var view = objc_msgSend(nsViewClass, allocSel);
+        view = objc_msgSend(view, initSel);
+        
+        if (view == IntPtr.Zero)
+            throw new Exception("Failed to create NSView");
+        
+        // Set view frame to match window's pure content bounds (ignores title bar height)
+        var contentViewSel = GetSelector("contentView");
+        var windowContentView = objc_msgSend(_nsWindow, contentViewSel);
+        var boundsSel = GetSelector("bounds");
+        var viewFrame = objc_msgSend_CGRect(windowContentView, boundsSel);
+        
+        // Update our _size to reflect actual content size (without titlebar)
+        _size = new Vector2((float)viewFrame.Size.Width, (float)viewFrame.Size.Height);
+        
+        var setFrameSel = GetSelector("setFrame:");
+        objc_msgSend_void_rect(view, setFrameSel, viewFrame);
+        
+        Console.WriteLine($"[CocoaWindow] View created with frame: {viewFrame.Size.Width}x{viewFrame.Size.Height}");
+        
+        // Create CAMetalLayer
+        var metalLayerClass = GetClass("CAMetalLayer");
+        var layer = objc_msgSend(objc_msgSend(metalLayerClass, allocSel), initSel);
+        
+        if (layer == IntPtr.Zero)
+            throw new Exception("Failed to create CAMetalLayer");
+        
+        Console.WriteLine($"[CocoaWindow] Created CAMetalLayer: {layer}");
+        
+        // Configure the layer
+        var frameSel = GetSelector("frame");
+        viewFrame = objc_msgSend_CGRect(view, frameSel);
+        
+        // Set pixel format
+        var setPixelFormatSel = GetSelector("setPixelFormat:");
+        objc_msgSend_void_ulong(layer, setPixelFormatSel, MTLPixelFormatBGRA8Unorm);
+        
+        // Set the layer's frame to match the view
+        var setLayerFrameSel = GetSelector("setFrame:");
+        objc_msgSend_void_rect(layer, setLayerFrameSel, viewFrame);
+
+        // Set contentsScale for Retina before sizing the drawable: the drawable
+        // is measured in pixels, so it must be points × backing scale.
+        var backingScaleFactorSel = GetSelector("backingScaleFactor");
+        var scale = objc_msgSend_double(_nsWindow, backingScaleFactorSel);
+        var setContentsScaleSel = GetSelector("setContentsScale:");
+        objc_msgSend_void_double(layer, setContentsScaleSel, scale);
+
+        // Set drawableSize to match the framebuffer, not the point size.
+        unsafe
+        {
+            var setDrawableSizeSel = GetSelector("setDrawableSize:");
+            CGSize size = new CGSize(viewFrame.Size.Width * scale, viewFrame.Size.Height * scale);
+            objc_msgSend_void_CGSize(layer, setDrawableSizeSel, size);
+        }
+        
+        // Make layer opaque
+        var setOpaqueSel = GetSelector("setOpaque:");
+        objc_msgSend_void_bool(layer, setOpaqueSel, true);
+        
+        Console.WriteLine($"[CocoaWindow] Configured CAMetalLayer: frame={viewFrame.Size.Width}x{viewFrame.Size.Height}, scale={scale}");
+        
+        // CRITICAL: Enable layer-backed rendering FIRST
+        var setWantsLayerSel = GetSelector("setWantsLayer:");
+        objc_msgSend_void_bool(view, setWantsLayerSel, true);
+        
+        // THEN replace the automatically created layer with our CAMetalLayer
+        var setLayerSel = GetSelector("setLayer:");
+        objc_msgSend_void_ptr(view, setLayerSel, layer);
+        
+        // CRITICAL: Tell the view to use layer-backed drawing
+        var setLayerContentsRedrawPolicySel = GetSelector("setLayerContentsRedrawPolicy:");
+        objc_msgSend_void_int(view, setLayerContentsRedrawPolicySel, 2); // NSViewLayerContentsRedrawDuringViewResize
+        
+        Console.WriteLine($"[CocoaWindow] Set layer and enabled wantsLayer");
+        
+        // Retain the layer since we're holding a reference
+        Retain(layer);
+        
+        // Set the view as the window's contentView
+        var setContentViewSel = GetSelector("setContentView:");
+        objc_msgSend_void_ptr(_nsWindow, setContentViewSel, view);
+        
+        // Force display update
+        var displaySel = GetSelector("display");
+        objc_msgSend_void(_nsWindow, displaySel);
+        
+        Console.WriteLine($"[CocoaWindow] View set as window's contentView and display called");
+        
+        return Retain(view);
+    }
+    
+    private IntPtr GetSharedApplication()
+    {
+        var nsAppClass = GetClass("NSApplication");
+        var sharedAppSel = GetSelector("sharedApplication");
+        return objc_msgSend_ptr(nsAppClass, sharedAppSel);
+    }
+
+    private IntPtr GetNSDefaultRunLoopMode()
+    {
+        return CreateNSString("kCFRunLoopDefaultMode");
+    }
+    
+    // Returns an autoreleased NSString. The autorelease pool owns it, so callers must not release it.
+    private IntPtr CreateNSString(string str)
+    {
+        var nsStringClass = GetClass("NSString");
+        var stringWithUTF8Sel = GetSelector("stringWithUTF8String:");
+        
+        var utf8Ptr = Marshal.StringToHGlobalAnsi(str);
+        try
+        {
+            return objc_msgSend_ret_ptr(nsStringClass, stringWithUTF8Sel, utf8Ptr);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(utf8Ptr);
+        }
+    }
+    
+    public void Dispose()
+    {
+        if (_disposed) return;
+        s_windows.Remove(this);
+        
+        if (_nsView != IntPtr.Zero)
+        {
+            Release(_nsView);
+            _nsView = IntPtr.Zero;
+        }
+        
+        if (_nsWindow != IntPtr.Zero)
+        {
+            var closeSel = GetSelector("close");
+            objc_msgSend_void(_nsWindow, closeSel);
+            Release(_nsWindow);
+            _nsWindow = IntPtr.Zero;
+        }
+        
+        _disposed = true;
+    }
+}

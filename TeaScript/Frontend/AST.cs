@@ -70,6 +70,26 @@ public class WhileStatement : Statement
     }
 }
 
+public class ForStatement : Statement
+{
+    public Statement? Initializer { get; }
+    public Expression? Condition { get; }
+    public Expression? Increment { get; }
+    public List<Statement> Body { get; }
+
+    public ForStatement(Statement? initializer, Expression? condition, Expression? increment, List<Statement> body)
+    {
+        Initializer = initializer;
+        Condition = condition;
+        Increment = increment;
+        Body = body;
+    }
+}
+
+public class BreakStatement : Statement { }
+
+public class ContinueStatement : Statement { }
+
 public class ExpressionStatement : Statement
 {
     public Expression Expression { get; }

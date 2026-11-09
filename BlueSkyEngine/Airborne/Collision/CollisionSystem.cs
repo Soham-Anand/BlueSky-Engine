@@ -144,8 +144,9 @@ public class CollisionSystem
             case (ShapeType.Capsule, ShapeType.Capsule):
                 return CapsuleCapsuleCollision((CapsuleCollider)a, (CapsuleCollider)b, out manifold);
             default:
-                // Fallback to AABB
-                manifold.Normal = Vector3.Normalize(a.Position - b.Position);
+                // Fallback to AABB (guard coincident centers against NaN)
+                var diff = a.Position - b.Position;
+                manifold.Normal = diff.LengthSquared() > 1e-6f ? Vector3.Normalize(diff) : Vector3.UnitY;
                 manifold.Penetration = 0.01f;
                 return true;
         }
@@ -378,10 +379,13 @@ public class SpatialHash
     
     private (int, int, int) WorldToCell(Vector3 position)
     {
+        float safeX = float.IsFinite(position.X) ? Math.Clamp(position.X, -1e6f, 1e6f) : 0f;
+        float safeY = float.IsFinite(position.Y) ? Math.Clamp(position.Y, -1e6f, 1e6f) : 0f;
+        float safeZ = float.IsFinite(position.Z) ? Math.Clamp(position.Z, -1e6f, 1e6f) : 0f;
         return (
-            (int)Math.Floor(position.X / _cellSize),
-            (int)Math.Floor(position.Y / _cellSize),
-            (int)Math.Floor(position.Z / _cellSize)
+            (int)Math.Floor(safeX / _cellSize),
+            (int)Math.Floor(safeY / _cellSize),
+            (int)Math.Floor(safeZ / _cellSize)
         );
     }
 }

@@ -1,6 +1,6 @@
 using System;
 using System.Numerics;
-using BlueSky.Core.ECS;
+using BlueSky.SkyCore;
 
 namespace BlueSky.Airborne;
 

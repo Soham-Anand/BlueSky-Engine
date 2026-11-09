@@ -28,9 +28,10 @@ using System;
 using System.Collections.Generic;
 using System.Numerics;
 using BlueSky.Core.Assets;
+using BlueSky.SkyCore;
 using BlueSky.Editor.UI;
-using BlueSky.Rendering;
-using BlueSky.Rendering.RHI;
+using BlueSky.BSR;
+using BlueSky.BSR.RHI;
 
 namespace BlueSky.Editor;
 
@@ -46,8 +47,8 @@ public class StaticMeshEditor
     private bool _isDirty = false;
     
     // ── Viewport Hijacking ────────────────────────────────────────────────
-    private Core.ECS.Entity _previewEntity;
-    private Core.ECS.World? _lastWorld;
+    private SkyCore.Entity _previewEntity;
+    private World? _lastWorld;
     private bool _hasSpawnedPreview = false;
     
     // ── Preview Renderer (mini-viewport in right panel) ──────────────────
@@ -76,7 +77,6 @@ public class StaticMeshEditor
     // ── Collision Settings ───────────────────────────────────────────────
     private CollisionType _collisionType = CollisionType.ConvexHull;
     private bool _generateCollision = true;
-    private float _collisionComplexity = 0.5f; // 0=simple, 1=complex
     
     // ── Mesh Statistics (cached from asset metadata) ────────────────────
     private int _vertexCount = 0;
@@ -112,7 +112,7 @@ public class StaticMeshEditor
     /// Open the static mesh editor with an asset file.
     /// Validates asset type and loads metadata with robust error handling.
     /// </summary>
-    public void Open(string assetPath, Core.ECS.World world, Rendering.Viewport viewport, IRHIDevice rhi)
+    public void Open(string assetPath, World world, BlueSky.BSR.Viewport viewport, IRHIDevice rhi)
     {
         try
         {
@@ -172,22 +172,22 @@ public class StaticMeshEditor
     /// <summary>
     /// Initialize the preview renderer for the right panel.
     /// </summary>
-    private void InitializePreviewRenderer(Core.ECS.World world, Rendering.Viewport viewport)
+    private void InitializePreviewRenderer(World world, BlueSky.BSR.Viewport viewport)
     {
         if (_rhi == null) return;
         
         try
         {
             // Create preview texture (render target)
-            _previewTexture = _rhi.CreateTexture(new BlueSky.Rendering.RHI.TextureDesc
+            _previewTexture = _rhi.CreateTexture(new BlueSky.BSR.RHI.TextureDesc
             {
                 Width = _previewWidth,
                 Height = _previewHeight,
                 Depth = 1,
                 MipLevels = 1,
                 ArrayLayers = 1,
-                Format = BlueSky.Rendering.RHI.TextureFormat.RGBA8Unorm,
-                Usage = BlueSky.Rendering.RHI.TextureUsage.RenderTarget | BlueSky.Rendering.RHI.TextureUsage.Sampled,
+                Format = BlueSky.BSR.RHI.TextureFormat.RGBA8Unorm,
+                Usage = BlueSky.BSR.RHI.TextureUsage.RenderTarget | BlueSky.BSR.RHI.TextureUsage.Sampled,
                 DebugName = "StaticMeshPreview"
             });
             
@@ -205,7 +205,7 @@ public class StaticMeshEditor
     /// <summary>
     /// Position camera to frame the mesh based on its bounding box.
     /// </summary>
-    private void PositionCamera(Rendering.Viewport viewport)
+    private void PositionCamera(BlueSky.BSR.Viewport viewport)
     {
         try
         {
@@ -225,7 +225,7 @@ public class StaticMeshEditor
             
             // Position camera at a 3/4 front-above angle for a clean preview shot
             // Offset: slightly right, above center, in front
-            var cameraPos = new Core.Math.Vector3(
+            var cameraPos = new Ramanujan.Vector3(
                 center.X + diagonal * 0.4f,   // slightly right
                 center.Y + diagonal * 0.35f,  // above center
                 center.Z + distance           // in front
@@ -236,7 +236,7 @@ public class StaticMeshEditor
             cameraTransform.SetPosition(cameraPos);
             
             // Look at center of mesh
-            cameraTransform.LookAt(new Core.Math.Vector3(center.X, center.Y, center.Z), Core.Math.Vector3.Up);
+            cameraTransform.LookAt(new Ramanujan.Vector3(center.X, center.Y, center.Z), Ramanujan.Vector3.Up);
             
             Console.WriteLine($"[StaticMeshEditor] Camera framed: diagonal={diagonal:F2}, distance={distance:F2}");
             Console.WriteLine($"[StaticMeshEditor] Mesh bounds: {_boundsMin} to {_boundsMax}, size: {size}");
@@ -252,25 +252,25 @@ public class StaticMeshEditor
     /// Does NOT destroy the existing scene — spawns the preview entity alongside it
     /// and lets camera framing handle the visual isolation.
     /// </summary>
-    private void SpawnPreviewMesh(Core.ECS.World world, Rendering.Viewport viewport)
+    private void SpawnPreviewMesh(World world, BlueSky.BSR.Viewport viewport)
     {
         if (_currentAsset == null) return;
         
         if (_hasSpawnedPreview)
         {
             // Update existing preview entity
-            if (world.HasComponent<Core.ECS.Builtin.StaticMeshComponent>(_previewEntity))
+            if (world.HasComponent<SkyCore.Builtin.StaticMeshComponent>(_previewEntity))
             {
-                ref var meshComp = ref world.GetComponent<Core.ECS.Builtin.StaticMeshComponent>(_previewEntity);
+                ref var meshComp = ref world.GetComponent<SkyCore.Builtin.StaticMeshComponent>(_previewEntity);
                 meshComp.MeshAssetId = _assetPath;
                 
                 // Reset transform
-                if (world.HasComponent<Core.ECS.Builtin.TransformComponent>(_previewEntity))
+                if (world.HasComponent<SkyCore.Builtin.TransformComponent>(_previewEntity))
                 {
-                    ref var transform = ref world.GetComponent<Core.ECS.Builtin.TransformComponent>(_previewEntity);
-                    transform.Position = new Core.Math.Vector3(0, 0, 0);
-                    transform.Rotation = Core.Math.Quaternion.Identity;
-                    transform.Scale = new Core.Math.Vector3(1, 1, 1);
+                    ref var transform = ref world.GetComponent<SkyCore.Builtin.TransformComponent>(_previewEntity);
+                    transform.Position = new Ramanujan.Vector3(0, 0, 0);
+                    transform.Rotation = Ramanujan.Quaternion.Identity;
+                    transform.Scale = new Ramanujan.Vector3(1, 1, 1);
                 }
                 
                 Console.WriteLine($"[StaticMeshEditor] Updated preview mesh: {_currentAsset!.AssetName}");
@@ -283,20 +283,21 @@ public class StaticMeshEditor
         {
             // Create preview entity with the mesh (no scene destruction!)
             _previewEntity = world.CreateEntity();
+            world.AddComponent(_previewEntity, new SkyCore.Builtin.EditorOnlyTagComponent(1));
             
             // Add transform component (centered at origin)
-            var transform = new Core.ECS.Builtin.TransformComponent
+            var transform = new SkyCore.Builtin.TransformComponent
             {
-                Position = new Core.Math.Vector3(0, 0, 0),
-                Rotation = Core.Math.Quaternion.Identity,
-                Scale = new Core.Math.Vector3(1, 1, 1)
+                Position = new Ramanujan.Vector3(0, 0, 0),
+                Rotation = Ramanujan.Quaternion.Identity,
+                Scale = new Ramanujan.Vector3(1, 1, 1)
             };
             world.AddComponent(_previewEntity, transform);
             
             // Add static mesh component — use the FILE PATH, not the GUID!
             // ViewportRenderer demand-loads meshes by path, not by GUID.
             // (geometry only — material system removed)
-            var meshComp = new Core.ECS.Builtin.StaticMeshComponent
+            var meshComp = new SkyCore.Builtin.StaticMeshComponent
             {
                 MeshAssetId = _assetPath
             };
@@ -322,7 +323,7 @@ public class StaticMeshEditor
     /// Clear all entities from the scene for isolated preview.
     /// CRITICAL: Preserves the camera entity to prevent viewport crashes.
     /// </summary>
-    private void ClearScene(Core.ECS.World world, Rendering.Viewport viewport)
+    private void ClearScene(World world, BlueSky.BSR.Viewport viewport)
     {
         try
         {
@@ -330,7 +331,7 @@ public class StaticMeshEditor
             var cameraEntity = viewport.GetCameraEntity();
             
             // Get all entities
-            var entities = new List<Core.ECS.Entity>(world.GetAllEntities());
+            var entities = new List<SkyCore.Entity>(world.GetAllEntities());
             
             int destroyedCount = 0;
             
@@ -355,7 +356,7 @@ public class StaticMeshEditor
     /// <summary>
     /// Close the editor and clean up preview entity.
     /// </summary>
-    public void Close(Core.ECS.World world)
+    public void Close(World world)
     {
         if (_hasSpawnedPreview && _previewEntity.Id != 0)
         {
@@ -630,49 +631,6 @@ public class StaticMeshEditor
             case 2: RenderInfoTabModern(ui, contentX, contentY, contentW, contentH); break;
         }
     }
-    
-    /// <summary>
-    private void RenderTabBar(EditorUI ui, float x, float y, float width, float height)
-    {
-        string[] tabs = { "LODs", "Collision", "Info" };
-        float tabW = width / tabs.Length;
-        
-        for (int i = 0; i < tabs.Length; i++)
-        {
-            float tx = x + i * tabW;
-            bool isSelected = _selectedTab == i;
-            
-            var bgColor = isSelected ? new Vector4(0.3f, 0.4f, 0.5f, 1) : new Vector4(0.2f, 0.2f, 0.22f, 1);
-            var hoverColor = isSelected ? new Vector4(0.35f, 0.45f, 0.55f, 1) : new Vector4(0.25f, 0.25f, 0.27f, 1);
-            
-            if (ui.ButtonEx(tx, y, tabW - 2, height, tabs[i],
-                bgColor, hoverColor, bgColor,
-                new Vector4(0, 0, 0, 0.3f),
-                new Vector4(0.9f, 0.9f, 0.9f, 1)))
-            {
-                _selectedTab = i;
-            }
-            
-            if (isSelected)
-            {
-                ui.Panel(tx, y + height - 3, tabW - 2, 3, new Vector4(0.4f, 0.7f, 1.0f, 1));
-            }
-        }
-    }
-    
-    private void RenderLeftPanel(EditorUI ui, float x, float y, float width, float height)
-    {
-        ui.RoundedPanel(x, y, width, height, new Vector4(0.18f, 0.18f, 0.2f, 1), 6f);
-        
-        switch (_selectedTab)
-        {
-            case 0: RenderLODsTab(ui, x + 10, y + 10, width - 20, height - 20); break;
-            case 1: RenderCollisionTab(ui, x + 10, y + 10, width - 20, height - 20); break;
-            case 2: RenderInfoTab(ui, x + 10, y + 10, width - 20, height - 20); break;
-        }
-    }
-    
-    
     
     /// <summary>
     /// Render LODs tab with modern visual distance indicators.
@@ -1092,219 +1050,6 @@ public class StaticMeshEditor
         ui.Text(System.IO.Path.GetFileName(_assetPath), new Vector4(0.5f, 0.5f, 0.5f, 0.8f));
     }
     
-    private void RenderLODsTab(EditorUI ui, float x, float y, float width, float height)
-    {
-        float rowY = y;
-        
-        ui.SetCursor(x, rowY);
-        ui.Text("Level of Detail Settings", new Vector4(0.9f, 0.9f, 0.9f, 1));
-        rowY += 30;
-        
-        ui.SetCursor(x, rowY);
-        ui.Text($"LOD Count: {_lodSettings.LODCount}", new Vector4(0.8f, 0.8f, 0.8f, 1));
-        rowY += 25;
-        
-        float sliderWidth = Math.Max(120, Math.Min(260, width - 24));
-        ui.SetCursor(x, rowY);
-        ui.Text($"LOD 0 Distance: {_lodSettings.LOD0Distance:F1}m", new Vector4(0.7f, 0.7f, 0.7f, 1));
-        ui.SetCursor(x, rowY + 17);
-        if (ui.Slider(ref _lodSettings.LOD0Distance, 1f, 150f, sliderWidth, 14f))
-            _isDirty = true;
-        float priorLod1 = _lodSettings.LOD1Distance;
-        _lodSettings.LOD1Distance = Math.Max(_lodSettings.LOD1Distance, _lodSettings.LOD0Distance + 1f);
-        if (_lodSettings.LOD1Distance != priorLod1) _isDirty = true;
-        rowY += 48;
-
-        ui.SetCursor(x, rowY);
-        ui.Text($"LOD 1 Distance: {_lodSettings.LOD1Distance:F1}m", new Vector4(0.7f, 0.7f, 0.7f, 1));
-        ui.SetCursor(x, rowY + 17);
-        if (ui.Slider(ref _lodSettings.LOD1Distance, _lodSettings.LOD0Distance + 1f, 300f, sliderWidth, 14f))
-            _isDirty = true;
-        float priorLod2 = _lodSettings.LOD2Distance;
-        _lodSettings.LOD2Distance = Math.Max(_lodSettings.LOD2Distance, _lodSettings.LOD1Distance + 1f);
-        if (_lodSettings.LOD2Distance != priorLod2) _isDirty = true;
-        rowY += 48;
-
-        ui.SetCursor(x, rowY);
-        ui.Text($"LOD 2 Distance: {_lodSettings.LOD2Distance:F1}m", new Vector4(0.7f, 0.7f, 0.7f, 1));
-        ui.SetCursor(x, rowY + 17);
-        if (ui.Slider(ref _lodSettings.LOD2Distance, _lodSettings.LOD1Distance + 1f, 500f, sliderWidth, 14f))
-            _isDirty = true;
-        rowY += 48;
-        
-        // Preset buttons
-        ui.SetCursor(x, rowY);
-        ui.Text("Presets:", new Vector4(0.8f, 0.8f, 0.8f, 1));
-        rowY += 25;
-        
-        if (ui.ButtonEx(x, rowY, 80, 30, "Low",
-            new Vector4(0.3f, 0.3f, 0.35f, 1),
-            new Vector4(0.35f, 0.35f, 0.4f, 1),
-            new Vector4(0.25f, 0.25f, 0.3f, 1),
-            new Vector4(0, 0, 0, 0.3f),
-            new Vector4(0.9f, 0.9f, 0.9f, 1)))
-        {
-            ApplyLODPreset(LODPresets.Low);
-        }
-        
-        if (ui.ButtonEx(x + 90, rowY, 80, 30, "Medium",
-            new Vector4(0.3f, 0.3f, 0.35f, 1),
-            new Vector4(0.35f, 0.35f, 0.4f, 1),
-            new Vector4(0.25f, 0.25f, 0.3f, 1),
-            new Vector4(0, 0, 0, 0.3f),
-            new Vector4(0.9f, 0.9f, 0.9f, 1)))
-        {
-            ApplyLODPreset(LODPresets.Medium);
-        }
-        
-        if (ui.ButtonEx(x + 180, rowY, 80, 30, "High",
-            new Vector4(0.3f, 0.3f, 0.35f, 1),
-            new Vector4(0.35f, 0.35f, 0.4f, 1),
-            new Vector4(0.25f, 0.25f, 0.3f, 1),
-            new Vector4(0, 0, 0, 0.3f),
-            new Vector4(0.9f, 0.9f, 0.9f, 1)))
-        {
-            ApplyLODPreset(LODPresets.High);
-        }
-    }
-    
-    private void RenderCollisionTab(EditorUI ui, float x, float y, float width, float height)
-    {
-        float rowY = y;
-        
-        ui.SetCursor(x, rowY);
-        ui.Text("Collision Settings", new Vector4(0.9f, 0.9f, 0.9f, 1));
-        rowY += 30;
-        
-        ui.SetCursor(x, rowY);
-        ui.Text($"Type: {_collisionType}", new Vector4(0.8f, 0.8f, 0.8f, 1));
-        rowY += 25;
-        
-        // Collision type buttons
-        string[] collisionTypes = { "None", "Box", "Sphere", "Convex", "Mesh" };
-        CollisionType[] types = { CollisionType.None, CollisionType.BoundingBox, CollisionType.BoundingSphere, CollisionType.ConvexHull, CollisionType.TriangleMesh };
-        
-        for (int i = 0; i < collisionTypes.Length; i++)
-        {
-            bool isSelected = _collisionType == types[i];
-            var bgColor = isSelected ? new Vector4(0.3f, 0.5f, 0.4f, 1) : new Vector4(0.25f, 0.25f, 0.27f, 1);
-            
-            if (ui.ButtonEx(x, rowY, 100, 30, collisionTypes[i],
-                bgColor,
-                new Vector4(0.3f, 0.3f, 0.32f, 1),
-                new Vector4(0.2f, 0.2f, 0.22f, 1),
-                new Vector4(0, 0, 0, 0.3f),
-                new Vector4(0.9f, 0.9f, 0.9f, 1)))
-            {
-                _collisionType = types[i];
-                _isDirty = true;
-            }
-            
-            rowY += 35;
-        }
-        
-        rowY += 10;
-        ui.SetCursor(x, rowY);
-        ui.Text($"Generate Collision: {(_generateCollision ? "Yes" : "No")}", new Vector4(0.7f, 0.7f, 0.7f, 1));
-        rowY += 25;
-        
-        ui.SetCursor(x, rowY);
-        ui.Text($"Complexity: {_collisionComplexity:F2}", new Vector4(0.7f, 0.7f, 0.7f, 1));
-    }
-    
-    private void RenderInfoTab(EditorUI ui, float x, float y, float width, float height)
-    {
-        float rowY = y;
-        
-        ui.SetCursor(x, rowY);
-        ui.Text("Mesh Statistics", new Vector4(0.9f, 0.9f, 0.9f, 1));
-        rowY += 30;
-        
-        ui.SetCursor(x, rowY);
-        ui.Text($"Vertices: {_vertexCount:N0}", new Vector4(0.8f, 0.8f, 0.8f, 1));
-        rowY += 25;
-        
-        ui.SetCursor(x, rowY);
-        ui.Text($"Triangles: {_triangleCount:N0}", new Vector4(0.8f, 0.8f, 0.8f, 1));
-        rowY += 25;
-        
-        ui.SetCursor(x, rowY);
-        ui.Text("Bounding Box:", new Vector4(0.9f, 0.9f, 0.9f, 1));
-        rowY += 25;
-        
-        ui.SetCursor(x, rowY);
-        ui.Text($"Min: ({_boundsMin.X:F2}, {_boundsMin.Y:F2}, {_boundsMin.Z:F2})", new Vector4(0.7f, 0.7f, 0.7f, 1));
-        rowY += 20;
-        
-        ui.SetCursor(x, rowY);
-        ui.Text($"Max: ({_boundsMax.X:F2}, {_boundsMax.Y:F2}, {_boundsMax.Z:F2})", new Vector4(0.7f, 0.7f, 0.7f, 1));
-        rowY += 25;
-        
-        Vector3 size = _boundsMax - _boundsMin;
-        ui.SetCursor(x, rowY);
-        ui.Text($"Size: ({size.X:F2}, {size.Y:F2}, {size.Z:F2})", new Vector4(0.7f, 0.7f, 0.7f, 1));
-        rowY += 30;
-        
-        ui.SetCursor(x, rowY);
-        ui.Text($"Asset Path:", new Vector4(0.9f, 0.9f, 0.9f, 1));
-        rowY += 20;
-        
-        ui.SetCursor(x, rowY);
-        ui.Text(System.IO.Path.GetFileName(_assetPath), new Vector4(0.6f, 0.6f, 0.6f, 1));
-    }
-    
-    private void RenderPreviewPanel(EditorUI ui, float x, float y, float width, float height)
-    {
-        ui.RoundedPanel(x, y, width, height, new Vector4(0.1f, 0.1f, 0.12f, 1), 6f);
-        
-        // Header
-        ui.SetCursor(x + 10, y + 10);
-        ui.Text("3D Preview", new Vector4(0.8f, 0.8f, 0.8f, 1));
-        
-        // Render the 3D preview texture if available
-        float previewY = y + 40;
-        float previewH = height - 180;
-        float previewW = width - 20;
-        float previewX = x + 10;
-        
-        PreviewRect = new Vector4(previewX, previewY, previewW, previewH);
-        
-        // Leave the area empty so Program.cs can composite the BSR render target here
-        ui.Panel(previewX, previewY, previewW, previewH, new Vector4(0.05f, 0.05f, 0.07f, 1));
-        
-        // Stats below preview
-        float infoY = previewY + previewH + 20;
-        
-        ui.SetCursor(x + 10, infoY);
-        ui.Text($"Vertices: {_vertexCount:N0}", new Vector4(0.7f, 0.7f, 0.7f, 1));
-        
-        ui.SetCursor(x + 10, infoY + 25);
-        ui.Text($"Triangles: {_triangleCount:N0}", new Vector4(0.7f, 0.7f, 0.7f, 1));
-        
-        infoY += 60;
-        
-        // Bounding box info
-        ui.SetCursor(x + 10, infoY);
-        ui.Text("Bounding Box:", new Vector4(0.8f, 0.8f, 0.8f, 1));
-        
-        Vector3 size = _boundsMax - _boundsMin;
-        ui.SetCursor(x + 10, infoY + 25);
-        ui.Text($"Size: {size.X:F2} × {size.Y:F2} × {size.Z:F2}", new Vector4(0.6f, 0.6f, 0.6f, 1));
-        
-        ui.SetCursor(x + 10, infoY + 45);
-        ui.Text($"Center: {((_boundsMin + _boundsMax) * 0.5f).X:F2}, {((_boundsMin + _boundsMax) * 0.5f).Y:F2}, {((_boundsMin + _boundsMax) * 0.5f).Z:F2}", new Vector4(0.6f, 0.6f, 0.6f, 1));
-        
-        // Camera controls hint
-        ui.SetCursor(x + 10, y + height - 60);
-        ui.Text("Camera Controls:", new Vector4(0.7f, 0.7f, 0.7f, 1));
-        
-        ui.SetCursor(x + 10, y + height - 40);
-        ui.Text("• Right-click + drag to rotate", new Vector4(0.5f, 0.5f, 0.5f, 1));
-        
-        ui.SetCursor(x + 10, y + height - 20);
-        ui.Text("• Scroll to zoom", new Vector4(0.5f, 0.5f, 0.5f, 1));
-    }
-    
     /// <summary>
     /// Apply LOD preset to current settings.
     /// </summary>
@@ -1405,15 +1150,15 @@ public class StaticMeshEditor
         }
         
         // Update camera if preview entity exists
-        if (_hasSpawnedPreview && _lastWorld != null && _lastWorld.HasComponent<Core.ECS.Builtin.TransformComponent>(_previewEntity))
+        if (_hasSpawnedPreview && _lastWorld != null && _lastWorld.HasComponent<SkyCore.Builtin.TransformComponent>(_previewEntity))
         {
-            ref var transform = ref _lastWorld.GetComponent<Core.ECS.Builtin.TransformComponent>(_previewEntity);
+            ref var transform = ref _lastWorld.GetComponent<SkyCore.Builtin.TransformComponent>(_previewEntity);
             
             // Apply rotation if auto-rotate is enabled
             if (_autoRotate)
             {
                 float yawDegrees = _previewRotation * (180f / MathF.PI); // Convert radians to degrees
-                transform.Rotation = Core.Math.Quaternion.Euler(0, yawDegrees, 0);
+                transform.Rotation = Ramanujan.Quaternion.Euler(0, yawDegrees, 0);
             }
         }
     }

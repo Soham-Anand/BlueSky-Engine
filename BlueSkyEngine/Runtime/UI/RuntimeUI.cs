@@ -1,7 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Numerics;
-using BlueSky.Rendering.RHI;
+using BlueSky.BSR.RHI;
 using BlueSky.Editor.UI;
 
 namespace BlueSky.Runtime.UI;

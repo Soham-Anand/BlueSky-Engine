@@ -14,6 +14,8 @@
     <PackageReference Include="JoltPhysicsSharp" Version="2.11.2" />
     <PackageReference Include="StbTrueTypeSharp" Version="1.26.12" />
     <PackageReference Include="StbImageSharp" Version="2.30.15" />
+    <PackageReference Include="Miniaudio-CS" Version="1.0.4" />
+    <PackageReference Include="NVorbis" Version="0.10.5" />
   </ItemGroup>
 
   <!-- EOS SDK native libraries -->
@@ -34,7 +36,7 @@
   <ItemGroup>
     <None Remove="Shaders\**\*.air" />
     <None Remove="Editor\Shaders\**\*.air" />
-    <None Remove="Rendering\Shaders\**\*.air" />
+    <None Remove="BSR\Shaders\**\*.air" />
     <None Update="Shaders\**\*">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
@@ -50,25 +52,8 @@
   </ItemGroup>
 
   <Target Name="CompileMetalShaders" BeforeTargets="BeforeBuild" Condition="'$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::OSX)))' == 'true'">
-    <Message Importance="High" Text="Compiling Metal Shaders..." />
-    <!-- Viewport 3D -->
-    <Exec Command="xcrun -sdk macosx metal -c &quot;$(MSBuildProjectDirectory)/Editor/Shaders/viewport_3d.metal&quot; -o &quot;$(MSBuildProjectDirectory)/Editor/Shaders/viewport_3d.air&quot; -std=metal3.0 -O3 -ffast-math -mmacosx-version-min=11.0" />
-    <Exec Command="xcrun -sdk macosx metallib &quot;$(MSBuildProjectDirectory)/Editor/Shaders/viewport_3d.air&quot; -o &quot;$(MSBuildProjectDirectory)/Editor/Shaders/viewport_3d.metallib&quot;" />
-    
-    <!-- Simple UI -->
-    <Exec Command="xcrun -sdk macosx metal -c &quot;$(MSBuildProjectDirectory)/Editor/Shaders/simple_ui.metal&quot; -o &quot;$(MSBuildProjectDirectory)/Editor/Shaders/simple_ui.air&quot; -std=metal3.0 -O3 -ffast-math -mmacosx-version-min=11.0" />
-    <Exec Command="xcrun -sdk macosx metallib &quot;$(MSBuildProjectDirectory)/Editor/Shaders/simple_ui.air&quot; -o &quot;$(MSBuildProjectDirectory)/Editor/Shaders/simple_ui.metallib&quot;" />
-
-    <!-- Horizon Lighting -->
-    <Exec Command="xcrun -sdk macosx metal -c &quot;$(MSBuildProjectDirectory)/Editor/Shaders/horizon_lighting.metal&quot; -o &quot;$(MSBuildProjectDirectory)/Editor/Shaders/horizon_lighting.air&quot; -std=metal3.0 -O3 -ffast-math -mmacosx-version-min=11.0" />
-    <Exec Command="xcrun -sdk macosx metallib &quot;$(MSBuildProjectDirectory)/Editor/Shaders/horizon_lighting.air&quot; -o &quot;$(MSBuildProjectDirectory)/Editor/Shaders/horizon_lighting.metallib&quot;" />
-
-    <!-- Polaris Upscale -->
-    <Exec Command="xcrun -sdk macosx metal -c &quot;$(MSBuildProjectDirectory)/Rendering/Shaders/PolarisUpscale.metal&quot; -o &quot;$(MSBuildProjectDirectory)/Rendering/Shaders/PolarisUpscale.air&quot; -std=metal3.0 -O3 -ffast-math -mmacosx-version-min=11.0" />
-    <Exec Command="xcrun -sdk macosx metallib &quot;$(MSBuildProjectDirectory)/Rendering/Shaders/PolarisUpscale.air&quot; -o &quot;$(MSBuildProjectDirectory)/Editor/Shaders/PolarisUpscale.metallib&quot;" />
-
-    <!-- Cleanup air files -->
-    <Exec Command="rm -f &quot;$(MSBuildProjectDirectory)/Editor/Shaders&quot;/*.air &quot;$(MSBuildProjectDirectory)/Rendering/Shaders&quot;/*.air" />
+    <Message Importance="High" Text="Checking / Compiling Metal Shaders..." />
+    <Exec Command="if xcrun -sdk macosx -f metal &gt;/dev/null 2&gt;&amp;1; then xcrun -sdk macosx metal -c &quot;$(MSBuildProjectDirectory)/Editor/Shaders/viewport_3d.metal&quot; -o &quot;$(MSBuildProjectDirectory)/Editor/Shaders/viewport_3d.air&quot; -std=metal3.0 -O3 -ffast-math -mmacosx-version-min=11.0 &amp;&amp; xcrun -sdk macosx metallib &quot;$(MSBuildProjectDirectory)/Editor/Shaders/viewport_3d.air&quot; -o &quot;$(MSBuildProjectDirectory)/Editor/Shaders/viewport_3d.metallib&quot; &amp;&amp; xcrun -sdk macosx metal -c &quot;$(MSBuildProjectDirectory)/Editor/Shaders/simple_ui.metal&quot; -o &quot;$(MSBuildProjectDirectory)/Editor/Shaders/simple_ui.air&quot; -std=metal3.0 -O3 -ffast-math -mmacosx-version-min=11.0 &amp;&amp; xcrun -sdk macosx metallib &quot;$(MSBuildProjectDirectory)/Editor/Shaders/simple_ui.air&quot; -o &quot;$(MSBuildProjectDirectory)/Editor/Shaders/simple_ui.metallib&quot; &amp;&amp; xcrun -sdk macosx metal -c &quot;$(MSBuildProjectDirectory)/BSR/Shaders/PolarisUpscale.metal&quot; -o &quot;$(MSBuildProjectDirectory)/BSR/Shaders/PolarisUpscale.air&quot; -std=metal3.0 -O3 -ffast-math -mmacosx-version-min=11.0 &amp;&amp; xcrun -sdk macosx metallib &quot;$(MSBuildProjectDirectory)/BSR/Shaders/PolarisUpscale.air&quot; -o &quot;$(MSBuildProjectDirectory)/Editor/Shaders/PolarisUpscale.metallib&quot; &amp;&amp; rm -f &quot;$(MSBuildProjectDirectory)/Editor/Shaders&quot;/*.air &quot;$(MSBuildProjectDirectory)/BSR/Shaders&quot;/*.air; else echo &quot;  [Metal] CLI metal compiler not in PATH — runtime will compile .metal sources via Metal.framework&quot;; fi" />
   </Target>
 
 </Project>

@@ -1,4 +1,4 @@
-namespace BlueSky.Rendering.RHI;
+namespace BlueSky.BSR.RHI;
 
 internal sealed class ValidationSwapchainTexture : IRHITexture, IRHIWrapped<IRHITexture>
 {

@@ -77,7 +77,7 @@ public static class AssetImporterTests
             // SoA mesh geometry: separate position/normal/uv arrays (no parser DTOs).
             var vertices = new[] { new Vector3(0, 0, 0), new Vector3(1, 0, 0), new Vector3(1, 1, 0), new Vector3(0, 1, 0) };
             var indices = new uint[] { 0, 1, 2, 0, 2, 3 };
-            var smooth = BlueSky.Rendering.SmoothingShaders.GenerateSmoothNormals(vertices, indices);
+            var smooth = BlueSky.BSR.SmoothingShaders.GenerateSmoothNormals(vertices, indices);
 
             bool valid = vertices.Length == 4
                 && indices.Length == 6

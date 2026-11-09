@@ -1,6 +1,6 @@
 using System.Runtime.InteropServices;
 
-namespace BlueSky.Rendering.RHI.DirectX11;
+namespace BlueSky.BSR.RHI.DirectX11;
 
 /// <summary>
 /// DirectX 11 texture implementation wrapping ID3D11Texture2D + shader resource view.

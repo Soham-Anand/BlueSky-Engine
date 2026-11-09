@@ -1,6 +1,6 @@
-using static BlueSky.Rendering.RHI.Metal.MetalInterop;
+using static BlueSky.BSR.RHI.Metal.MetalInterop;
 
-namespace BlueSky.Rendering.RHI.Metal;
+namespace BlueSky.BSR.RHI.Metal;
 
 internal class MetalTexture : IRHITexture
 {
@@ -9,6 +9,7 @@ internal class MetalTexture : IRHITexture
     
     public uint Width { get; }
     public uint Height { get; }
+    public uint MipLevels { get; }
     public TextureFormat Format { get; }
     public TextureUsage Usage { get; }
     
@@ -18,6 +19,7 @@ internal class MetalTexture : IRHITexture
     {
         Width = desc.Width;
         Height = desc.Height;
+        MipLevels = Math.Max(1u, desc.MipLevels);
         Format = desc.Format;
         Usage = desc.Usage;
         
@@ -42,10 +44,16 @@ internal class MetalTexture : IRHITexture
         ulong usageFlags = MTLTextureUsageUnknown;
         ulong storageMode = MTLResourceStorageModeShared;
         
-        if (desc.Usage.HasFlag(TextureUsage.DepthStencil))
+        bool isDepthFormat = desc.Format == TextureFormat.Depth32Float || desc.Format == TextureFormat.Depth24Stencil8;
+        if (isDepthFormat)
         {
-            // Depth/stencil textures must be render targets with private storage
-            usageFlags = MTLTextureUsageRenderTarget;
+            // Depth textures can also be sampled (soft particles, shadowing).
+            // Keep them private; blit encoders can copy between private depth
+            // targets without exposing attachment memory to the CPU.
+            if (desc.Usage.HasFlag(TextureUsage.DepthStencil))
+                usageFlags |= MTLTextureUsageRenderTarget;
+            if (desc.Usage.HasFlag(TextureUsage.Sampled))
+                usageFlags |= MTLTextureUsageShaderRead;
             storageMode = MTLResourceStorageModePrivate;
         }
         else if (desc.Usage.HasFlag(TextureUsage.RenderTarget))
@@ -70,6 +78,25 @@ internal class MetalTexture : IRHITexture
         
         var setStorageModeSel = GetSelector("setStorageMode:");
         objc_msgSend_void_ulong(descriptor, setStorageModeSel, storageMode);
+
+        // M5: mip chains + TBDR memoryless attachments.
+        if (MipLevels > 1)
+        {
+            if (isDepthFormat)
+                throw new ArgumentException("Mipmapped depth textures are not supported on Metal.");
+            var setMipLevelsSel = GetSelector("setMipmapLevelCount:");
+            objc_msgSend_void_ulong(descriptor, setMipLevelsSel, MipLevels);
+        }
+        if (desc.Memoryless)
+        {
+            if (desc.Usage.HasFlag(TextureUsage.Sampled) || desc.Usage.HasFlag(TextureUsage.Storage) ||
+                desc.Usage.HasFlag(TextureUsage.TransferSrc) || desc.Usage.HasFlag(TextureUsage.TransferDst))
+                throw new ArgumentException("Memoryless textures cannot be Sampled/Storage/Transfer (tile memory only).");
+            if (MipLevels > 1)
+                throw new ArgumentException("Memoryless textures cannot have mipmaps.");
+            // MTLStorageModeMemoryless = 3
+            objc_msgSend_void_ulong(descriptor, setStorageModeSel, 3);
+        }
         
         // Create texture
         var newTextureSel = GetSelector("newTextureWithDescriptor:");
@@ -87,6 +114,7 @@ internal class MetalTexture : IRHITexture
         _texture = Retain(texture);
         Width = width;
         Height = height;
+        MipLevels = 1;
         Format = format;
         Usage = usage;
     }
